@@ -273,11 +273,24 @@ llama_kv_cache::llama_kv_cache(
     {
         const size_t memory_size_k = size_k_bytes();
         const size_t memory_size_v = size_v_bytes();
+        const size_t memory_size   = memory_size_k + memory_size_v;
+        const size_t n_cells_total = (size_t) kv_size * n_stream;
+
+        const double bytes_per_cell_k = n_cells_total ? (double) memory_size_k / (double) n_cells_total : 0.0;
+        const double bytes_per_cell_v = n_cells_total ? (double) memory_size_v / (double) n_cells_total : 0.0;
+        const double bytes_per_cell   = bytes_per_cell_k + bytes_per_cell_v;
+
+        const double mib_per_1k_cells_k = bytes_per_cell_k * 1000.0 / (1024.0 * 1024.0);
+        const double mib_per_1k_cells_v = bytes_per_cell_v * 1000.0 / (1024.0 * 1024.0);
+        const double mib_per_1k_cells   = bytes_per_cell   * 1000.0 / (1024.0 * 1024.0);
 
         LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u/%u seqs), K (%s): %7.2f MiB, V (%s): %7.2f MiB\n", __func__,
-                (float)(memory_size_k + memory_size_v) / (1024.0f * 1024.0f), kv_size, (int) layers.size(), n_seq_max, n_stream,
+                (float) memory_size / (1024.0f * 1024.0f), kv_size, (int) layers.size(), n_seq_max, n_stream,
                 ggml_type_name(type_k), (float)memory_size_k / (1024.0f * 1024.0f),
                 ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
+
+        LLAMA_LOG_INFO("%s: per cached token = %8.2f KiB, per 1k tokens = %7.2f MiB, total cells = %zu, K = %7.2f MiB/1k, V = %7.2f MiB/1k\n", __func__,
+                bytes_per_cell / 1024.0, mib_per_1k_cells, n_cells_total, mib_per_1k_cells_k, mib_per_1k_cells_v);
     }
 
     const char * LLAMA_ATTN_ROT_DISABLE = getenv("LLAMA_ATTN_ROT_DISABLE");

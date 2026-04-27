@@ -278,6 +278,92 @@ typedef struct {
 static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
 
 //
+// TurboQuant-inspired KV cache quantization
+//
+
+#define QK_TQKV 64
+
+// 2-bit base quantization, one scale per 64-element KV cache block
+typedef struct {
+    uint8_t qs[QK_TQKV/4];
+    ggml_half d;
+} block_tqkv_2_0;
+static_assert(sizeof(block_tqkv_2_0) == sizeof(ggml_half) + QK_TQKV/4, "wrong tqkv_2_0 block size/padding");
+
+// 2-bit base quantization plus a half-density residual sign bit
+typedef struct {
+    uint8_t qs[QK_TQKV/4];
+    uint8_t qh[QK_TQKV/16];
+    ggml_half d;
+} block_tqkv_2_5;
+static_assert(sizeof(block_tqkv_2_5) == sizeof(ggml_half) + QK_TQKV/4 + QK_TQKV/16, "wrong tqkv_2_5 block size/padding");
+
+// 3-bit base quantization
+typedef struct {
+    uint8_t qs[3*QK_TQKV/8];
+    ggml_half d;
+} block_tqkv_3_0;
+static_assert(sizeof(block_tqkv_3_0) == sizeof(ggml_half) + 3*QK_TQKV/8, "wrong tqkv_3_0 block size/padding");
+
+// 3-bit base quantization plus a half-density residual sign bit
+typedef struct {
+    uint8_t qs[3*QK_TQKV/8];
+    uint8_t qh[QK_TQKV/16];
+    ggml_half d;
+} block_tqkv_3_5;
+static_assert(sizeof(block_tqkv_3_5) == sizeof(ggml_half) + 3*QK_TQKV/8 + QK_TQKV/16, "wrong tqkv_3_5 block size/padding");
+
+// 4-bit base quantization
+typedef struct {
+    uint8_t qs[QK_TQKV/2];
+    ggml_half d;
+} block_tqkv_4_0;
+static_assert(sizeof(block_tqkv_4_0) == sizeof(ggml_half) + QK_TQKV/2, "wrong tqkv_4_0 block size/padding");
+
+// Inner-product corrected variants keep one residual sign bit per value.
+typedef struct {
+    uint8_t qs[QK_TQKV/4];
+    uint8_t rs[QK_TQKV/8];
+    ggml_half d;
+    ggml_half dr;
+} block_tqkv_2_0_ip;
+static_assert(sizeof(block_tqkv_2_0_ip) == 2*sizeof(ggml_half) + QK_TQKV/4 + QK_TQKV/8, "wrong tqkv_2_0_ip block size/padding");
+
+typedef struct {
+    uint8_t qs[QK_TQKV/4];
+    uint8_t qh[QK_TQKV/16];
+    uint8_t rs[QK_TQKV/8];
+    ggml_half d;
+    ggml_half dr;
+} block_tqkv_2_5_ip;
+static_assert(sizeof(block_tqkv_2_5_ip) == 2*sizeof(ggml_half) + QK_TQKV/4 + QK_TQKV/16 + QK_TQKV/8, "wrong tqkv_2_5_ip block size/padding");
+
+typedef struct {
+    uint8_t qs[3*QK_TQKV/8];
+    uint8_t rs[QK_TQKV/8];
+    ggml_half d;
+    ggml_half dr;
+} block_tqkv_3_0_ip;
+static_assert(sizeof(block_tqkv_3_0_ip) == 2*sizeof(ggml_half) + 3*QK_TQKV/8 + QK_TQKV/8, "wrong tqkv_3_0_ip block size/padding");
+
+typedef struct {
+    uint8_t qs[3*QK_TQKV/8];
+    uint8_t qh[QK_TQKV/16];
+    uint8_t rs[QK_TQKV/8];
+    ggml_half d;
+    ggml_half dr;
+} block_tqkv_3_5_ip;
+static_assert(sizeof(block_tqkv_3_5_ip) == 2*sizeof(ggml_half) + 3*QK_TQKV/8 + QK_TQKV/16 + QK_TQKV/8, "wrong tqkv_3_5_ip block size/padding");
+
+typedef struct {
+    uint8_t qs[QK_TQKV/2];
+    uint8_t rs[QK_TQKV/8];
+    ggml_half d;
+    ggml_half dr;
+} block_tqkv_4_0_ip;
+static_assert(sizeof(block_tqkv_4_0_ip) == 2*sizeof(ggml_half) + QK_TQKV/2 + QK_TQKV/8, "wrong tqkv_4_0_ip block size/padding");
+
+//
 // Super-block quantization structures
 //
 

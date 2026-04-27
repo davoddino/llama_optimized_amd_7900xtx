@@ -285,11 +285,31 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_BF16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_BF16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQKV_2_0,    GGML_TYPE_TQKV_2_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQKV_2_5,    GGML_TYPE_TQKV_2_5)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQKV_3_0,    GGML_TYPE_TQKV_3_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQKV_3_5,    GGML_TYPE_TQKV_3_5)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQKV_4_0,    GGML_TYPE_TQKV_4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQKV_2_0_IP, GGML_TYPE_TQKV_2_0_IP)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQKV_2_5_IP, GGML_TYPE_TQKV_2_5_IP)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQKV_3_0_IP, GGML_TYPE_TQKV_3_0_IP)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQKV_3_5_IP, GGML_TYPE_TQKV_3_5_IP)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQKV_4_0_IP, GGML_TYPE_TQKV_4_0_IP)
 #else
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQKV_2_0,    GGML_TYPE_TQKV_2_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQKV_2_5,    GGML_TYPE_TQKV_2_5)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQKV_3_0,    GGML_TYPE_TQKV_3_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQKV_3_5,    GGML_TYPE_TQKV_3_5)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQKV_4_0,    GGML_TYPE_TQKV_4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQKV_2_0_IP, GGML_TYPE_TQKV_2_0_IP)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQKV_2_5_IP, GGML_TYPE_TQKV_2_5_IP)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQKV_3_0_IP, GGML_TYPE_TQKV_3_0_IP)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQKV_3_5_IP, GGML_TYPE_TQKV_3_5_IP)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQKV_4_0_IP, GGML_TYPE_TQKV_4_0_IP)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
     GGML_ABORT("fatal error");
@@ -303,6 +323,14 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_WMMA_F16 = 300,
     BEST_FATTN_KERNEL_MMA_F16  = 400,
 };
+
+static bool ggml_cuda_fattn_type_is_tqkv(ggml_type type) {
+    return type == GGML_TYPE_TQKV_2_0    || type == GGML_TYPE_TQKV_2_5 ||
+           type == GGML_TYPE_TQKV_3_0    || type == GGML_TYPE_TQKV_3_5 ||
+           type == GGML_TYPE_TQKV_4_0    || type == GGML_TYPE_TQKV_2_0_IP ||
+           type == GGML_TYPE_TQKV_2_5_IP || type == GGML_TYPE_TQKV_3_0_IP ||
+           type == GGML_TYPE_TQKV_3_5_IP || type == GGML_TYPE_TQKV_4_0_IP;
+}
 
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
@@ -391,6 +419,16 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_BF16:
+        case GGML_TYPE_TQKV_2_0:
+        case GGML_TYPE_TQKV_2_5:
+        case GGML_TYPE_TQKV_3_0:
+        case GGML_TYPE_TQKV_3_5:
+        case GGML_TYPE_TQKV_4_0:
+        case GGML_TYPE_TQKV_2_0_IP:
+        case GGML_TYPE_TQKV_2_5_IP:
+        case GGML_TYPE_TQKV_3_0_IP:
+        case GGML_TYPE_TQKV_3_5_IP:
+        case GGML_TYPE_TQKV_4_0_IP:
             break;
         default:
             return BEST_FATTN_KERNEL_NONE;
@@ -402,6 +440,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+
+    if (ggml_cuda_fattn_type_is_tqkv(K->type) || ggml_cuda_fattn_type_is_tqkv(V->type)) {
+        if (K->type != V->type) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        return can_use_vector_kernel && Q->ne[1] <= 2 ? BEST_FATTN_KERNEL_VEC : BEST_FATTN_KERNEL_TILE;
+    }
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {

@@ -2407,6 +2407,233 @@ void dequantize_row_tq2_0(const block_tq2_0 * GGML_RESTRICT x, float * GGML_REST
     }
 }
 
+// ====================== TurboQuant-inspired KV cache (de)-quantization
+
+static inline void tqkv_set_bit(uint8_t * q, int i, bool v) {
+    if (v) {
+        q[i >> 3] |= (uint8_t) (1u << (i & 7));
+    }
+}
+
+static inline bool tqkv_get_bit(const uint8_t * q, int i) {
+    return (q[i >> 3] >> (i & 7)) & 1u;
+}
+
+static inline void tqkv_set_bits(uint8_t * q, int bit, int nbits, uint8_t v) {
+    for (int i = 0; i < nbits; ++i) {
+        if ((v >> i) & 1u) {
+            tqkv_set_bit(q, bit + i, true);
+        }
+    }
+}
+
+static inline uint8_t tqkv_get_bits(const uint8_t * q, int bit, int nbits) {
+    uint8_t v = 0;
+    for (int i = 0; i < nbits; ++i) {
+        v |= (uint8_t) tqkv_get_bit(q, bit + i) << i;
+    }
+    return v;
+}
+
+static float tqkv_dequant_value_ref(
+        const uint8_t * qs, const uint8_t * qh, const uint8_t * rs,
+        ggml_half d_h, ggml_half dr_h, int bits, bool half_residual, bool ip_residual, int j) {
+    const int levels = 1 << bits;
+    const float center = 0.5f * (float) (levels - 1);
+    const float d = GGML_FP16_TO_FP32(d_h);
+
+    const uint8_t q = tqkv_get_bits(qs, j*bits, bits);
+    float v = ((float) q - center) * d;
+
+    if (half_residual && (j & 1) == 0) {
+        v += (tqkv_get_bit(qh, j >> 1) ? 0.25f : -0.25f) * d;
+    }
+
+    if (ip_residual) {
+        const float dr = GGML_FP16_TO_FP32(dr_h);
+        v += tqkv_get_bit(rs, j) ? dr : -dr;
+    }
+
+    return v;
+}
+
+static void quantize_block_tqkv_ref(
+        const float * GGML_RESTRICT x,
+        uint8_t * GGML_RESTRICT qs, size_t qs_size,
+        uint8_t * GGML_RESTRICT qh, size_t qh_size,
+        uint8_t * GGML_RESTRICT rs, size_t rs_size,
+        ggml_half * GGML_RESTRICT d_out, ggml_half * GGML_RESTRICT dr_out,
+        int bits, bool half_residual, bool ip_residual) {
+    memset(qs, 0, qs_size);
+    if (qh) {
+        memset(qh, 0, qh_size);
+    }
+    if (rs) {
+        memset(rs, 0, rs_size);
+    }
+
+    float amax = 0.0f;
+    for (int j = 0; j < QK_TQKV; ++j) {
+        amax = MAX(amax, fabsf(x[j]));
+    }
+
+    const int levels = 1 << bits;
+    const float center = 0.5f * (float) (levels - 1);
+    const float d = amax > 0.0f ? amax / center : 0.0f;
+    const float id = d ? 1.0f/d : 0.0f;
+
+    float y[QK_TQKV];
+    for (int j = 0; j < QK_TQKV; ++j) {
+        int q = (int) lroundf(x[j]*id + center);
+        q = MAX(0, MIN(levels - 1, q));
+        tqkv_set_bits(qs, j*bits, bits, (uint8_t) q);
+        y[j] = ((float) q - center) * d;
+    }
+
+    if (half_residual) {
+        for (int j = 0; j < QK_TQKV; j += 2) {
+            const float y_pos = y[j] + 0.25f*d;
+            const float y_neg = y[j] - 0.25f*d;
+            const bool use_pos = fabsf(x[j] - y_pos) < fabsf(x[j] - y_neg);
+            tqkv_set_bit(qh, j >> 1, use_pos);
+            y[j] = use_pos ? y_pos : y_neg;
+        }
+    }
+
+    float dr = 0.0f;
+    if (ip_residual) {
+        for (int j = 0; j < QK_TQKV; ++j) {
+            dr += fabsf(x[j] - y[j]);
+        }
+        dr /= QK_TQKV;
+
+        for (int j = 0; j < QK_TQKV; ++j) {
+            tqkv_set_bit(rs, j, x[j] >= y[j]);
+        }
+    }
+
+    *d_out = GGML_FP32_TO_FP16(d);
+    if (dr_out) {
+        *dr_out = GGML_FP32_TO_FP16(dr);
+    }
+}
+
+#define TQKV_FUNCS_BASE(name, block_type, ggml_type, bits) \
+void quantize_row_##name##_ref(const float * GGML_RESTRICT x, block_type * GGML_RESTRICT y, int64_t k) { \
+    assert(k % QK_TQKV == 0); \
+    const int64_t nb = k / QK_TQKV; \
+    for (int64_t i = 0; i < nb; ++i) { \
+        quantize_block_tqkv_ref(x, y[i].qs, sizeof(y[i].qs), NULL, 0, NULL, 0, &y[i].d, NULL, bits, false, false); \
+        x += QK_TQKV; \
+    } \
+} \
+size_t quantize_##name(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) { \
+    (void) quant_weights; \
+    const size_t row_size = ggml_row_size(ggml_type, n_per_row); \
+    quantize_row_##name##_ref(src, dst, (int64_t) nrow*n_per_row); \
+    return nrow * row_size; \
+} \
+void dequantize_row_##name(const block_type * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) { \
+    assert(k % QK_TQKV == 0); \
+    const int64_t nb = k / QK_TQKV; \
+    for (int64_t i = 0; i < nb; ++i) { \
+        for (int j = 0; j < QK_TQKV; ++j) { \
+            *y++ = tqkv_dequant_value_ref(x[i].qs, NULL, NULL, x[i].d, 0, bits, false, false, j); \
+        } \
+    } \
+}
+
+#define TQKV_FUNCS_HALF(name, block_type, ggml_type, bits) \
+void quantize_row_##name##_ref(const float * GGML_RESTRICT x, block_type * GGML_RESTRICT y, int64_t k) { \
+    assert(k % QK_TQKV == 0); \
+    const int64_t nb = k / QK_TQKV; \
+    for (int64_t i = 0; i < nb; ++i) { \
+        quantize_block_tqkv_ref(x, y[i].qs, sizeof(y[i].qs), y[i].qh, sizeof(y[i].qh), NULL, 0, &y[i].d, NULL, bits, true, false); \
+        x += QK_TQKV; \
+    } \
+} \
+size_t quantize_##name(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) { \
+    (void) quant_weights; \
+    const size_t row_size = ggml_row_size(ggml_type, n_per_row); \
+    quantize_row_##name##_ref(src, dst, (int64_t) nrow*n_per_row); \
+    return nrow * row_size; \
+} \
+void dequantize_row_##name(const block_type * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) { \
+    assert(k % QK_TQKV == 0); \
+    const int64_t nb = k / QK_TQKV; \
+    for (int64_t i = 0; i < nb; ++i) { \
+        for (int j = 0; j < QK_TQKV; ++j) { \
+            *y++ = tqkv_dequant_value_ref(x[i].qs, x[i].qh, NULL, x[i].d, 0, bits, true, false, j); \
+        } \
+    } \
+}
+
+#define TQKV_FUNCS_IP(name, block_type, ggml_type, bits) \
+void quantize_row_##name##_ref(const float * GGML_RESTRICT x, block_type * GGML_RESTRICT y, int64_t k) { \
+    assert(k % QK_TQKV == 0); \
+    const int64_t nb = k / QK_TQKV; \
+    for (int64_t i = 0; i < nb; ++i) { \
+        quantize_block_tqkv_ref(x, y[i].qs, sizeof(y[i].qs), NULL, 0, y[i].rs, sizeof(y[i].rs), &y[i].d, &y[i].dr, bits, false, true); \
+        x += QK_TQKV; \
+    } \
+} \
+size_t quantize_##name(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) { \
+    (void) quant_weights; \
+    const size_t row_size = ggml_row_size(ggml_type, n_per_row); \
+    quantize_row_##name##_ref(src, dst, (int64_t) nrow*n_per_row); \
+    return nrow * row_size; \
+} \
+void dequantize_row_##name(const block_type * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) { \
+    assert(k % QK_TQKV == 0); \
+    const int64_t nb = k / QK_TQKV; \
+    for (int64_t i = 0; i < nb; ++i) { \
+        for (int j = 0; j < QK_TQKV; ++j) { \
+            *y++ = tqkv_dequant_value_ref(x[i].qs, NULL, x[i].rs, x[i].d, x[i].dr, bits, false, true, j); \
+        } \
+    } \
+}
+
+#define TQKV_FUNCS_HALF_IP(name, block_type, ggml_type, bits) \
+void quantize_row_##name##_ref(const float * GGML_RESTRICT x, block_type * GGML_RESTRICT y, int64_t k) { \
+    assert(k % QK_TQKV == 0); \
+    const int64_t nb = k / QK_TQKV; \
+    for (int64_t i = 0; i < nb; ++i) { \
+        quantize_block_tqkv_ref(x, y[i].qs, sizeof(y[i].qs), y[i].qh, sizeof(y[i].qh), y[i].rs, sizeof(y[i].rs), &y[i].d, &y[i].dr, bits, true, true); \
+        x += QK_TQKV; \
+    } \
+} \
+size_t quantize_##name(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) { \
+    (void) quant_weights; \
+    const size_t row_size = ggml_row_size(ggml_type, n_per_row); \
+    quantize_row_##name##_ref(src, dst, (int64_t) nrow*n_per_row); \
+    return nrow * row_size; \
+} \
+void dequantize_row_##name(const block_type * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) { \
+    assert(k % QK_TQKV == 0); \
+    const int64_t nb = k / QK_TQKV; \
+    for (int64_t i = 0; i < nb; ++i) { \
+        for (int j = 0; j < QK_TQKV; ++j) { \
+            *y++ = tqkv_dequant_value_ref(x[i].qs, x[i].qh, x[i].rs, x[i].d, x[i].dr, bits, true, true, j); \
+        } \
+    } \
+}
+
+TQKV_FUNCS_BASE   (tqkv_2_0,    block_tqkv_2_0,    GGML_TYPE_TQKV_2_0,    2)
+TQKV_FUNCS_HALF   (tqkv_2_5,    block_tqkv_2_5,    GGML_TYPE_TQKV_2_5,    2)
+TQKV_FUNCS_BASE   (tqkv_3_0,    block_tqkv_3_0,    GGML_TYPE_TQKV_3_0,    3)
+TQKV_FUNCS_HALF   (tqkv_3_5,    block_tqkv_3_5,    GGML_TYPE_TQKV_3_5,    3)
+TQKV_FUNCS_BASE   (tqkv_4_0,    block_tqkv_4_0,    GGML_TYPE_TQKV_4_0,    4)
+TQKV_FUNCS_IP     (tqkv_2_0_ip, block_tqkv_2_0_ip, GGML_TYPE_TQKV_2_0_IP, 2)
+TQKV_FUNCS_HALF_IP(tqkv_2_5_ip, block_tqkv_2_5_ip, GGML_TYPE_TQKV_2_5_IP, 2)
+TQKV_FUNCS_IP     (tqkv_3_0_ip, block_tqkv_3_0_ip, GGML_TYPE_TQKV_3_0_IP, 3)
+TQKV_FUNCS_HALF_IP(tqkv_3_5_ip, block_tqkv_3_5_ip, GGML_TYPE_TQKV_3_5_IP, 3)
+TQKV_FUNCS_IP     (tqkv_4_0_ip, block_tqkv_4_0_ip, GGML_TYPE_TQKV_4_0_IP, 4)
+
+#undef TQKV_FUNCS_BASE
+#undef TQKV_FUNCS_HALF
+#undef TQKV_FUNCS_IP
+#undef TQKV_FUNCS_HALF_IP
+
 // ====================== "True" 2-bit (de)-quantization
 
 void dequantize_row_iq2_xxs(const block_iq2_xxs * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
@@ -5208,6 +5435,14 @@ static bool validate_e_e8m0(uint8_t e, size_t i) {
         } \
     }
 
+#define VALIDATE_ROW_DATA_D_DR_F16_IMPL(type, data, nb) \
+    const type * q = (const type *) (data); \
+    for (size_t i = 0; i < (nb); ++i) { \
+        if (!validate_fp16(q[i].d, i) || !validate_fp16(q[i].dr, i)) { \
+            return false; \
+        } \
+    }
+
 #define VALIDATE_ROW_DATA_DM_F16_IMPL(type, data, nb, d, m) \
     const type * q = (const type *) (data); \
     for (size_t i = 0; i < (nb); ++i) { \
@@ -5427,6 +5662,46 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_TQ2_0:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_tq2_0, data, nb);
+            } break;
+        case GGML_TYPE_TQKV_2_0:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_tqkv_2_0, data, nb);
+            } break;
+        case GGML_TYPE_TQKV_2_5:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_tqkv_2_5, data, nb);
+            } break;
+        case GGML_TYPE_TQKV_3_0:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_tqkv_3_0, data, nb);
+            } break;
+        case GGML_TYPE_TQKV_3_5:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_tqkv_3_5, data, nb);
+            } break;
+        case GGML_TYPE_TQKV_4_0:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_tqkv_4_0, data, nb);
+            } break;
+        case GGML_TYPE_TQKV_2_0_IP:
+            {
+                VALIDATE_ROW_DATA_D_DR_F16_IMPL(block_tqkv_2_0_ip, data, nb);
+            } break;
+        case GGML_TYPE_TQKV_2_5_IP:
+            {
+                VALIDATE_ROW_DATA_D_DR_F16_IMPL(block_tqkv_2_5_ip, data, nb);
+            } break;
+        case GGML_TYPE_TQKV_3_0_IP:
+            {
+                VALIDATE_ROW_DATA_D_DR_F16_IMPL(block_tqkv_3_0_ip, data, nb);
+            } break;
+        case GGML_TYPE_TQKV_3_5_IP:
+            {
+                VALIDATE_ROW_DATA_D_DR_F16_IMPL(block_tqkv_3_5_ip, data, nb);
+            } break;
+        case GGML_TYPE_TQKV_4_0_IP:
+            {
+                VALIDATE_ROW_DATA_D_DR_F16_IMPL(block_tqkv_4_0_ip, data, nb);
             } break;
         case GGML_TYPE_IQ1_S:
             {

@@ -186,6 +186,123 @@ static __device__ void quantize_f32_iq4_nl_block(const float * __restrict__ x, b
     y->d = sumq2 > 0 ? sumqx/sumq2 : d;
 }
 
+static __device__ __forceinline__ void tqkv_set_bit_device(uint8_t * q, int i, bool v) {
+    if (v) {
+        q[i >> 3] |= uint8_t(1u << (i & 7));
+    }
+}
+
+static __device__ __forceinline__ void tqkv_set_bits_device(uint8_t * q, int bit, int nbits, uint8_t v) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        if (i < nbits && ((v >> i) & 1u)) {
+            tqkv_set_bit_device(q, bit + i, true);
+        }
+    }
+}
+
+template<typename block_t, int bits, bool half_residual, bool ip_residual>
+static __device__ void quantize_f32_tqkv_block(const float * __restrict__ x, block_t * __restrict__ y) {
+    for (int i = 0; i < int(sizeof(y->qs)); ++i) {
+        y->qs[i] = 0;
+    }
+    if constexpr (half_residual) {
+        for (int i = 0; i < int(sizeof(y->qh)); ++i) {
+            y->qh[i] = 0;
+        }
+    }
+    if constexpr (ip_residual) {
+        for (int i = 0; i < int(sizeof(y->rs)); ++i) {
+            y->rs[i] = 0;
+        }
+    }
+
+    float amax = 0.0f;
+    for (int j = 0; j < QK_TQKV; ++j) {
+        amax = fmaxf(amax, fabsf(x[j]));
+    }
+
+    constexpr int levels = 1 << bits;
+    constexpr float center = 0.5f * float(levels - 1);
+    const float d = amax > 0.0f ? amax / center : 0.0f;
+    const float id = d ? 1.0f/d : 0.0f;
+
+    float yv[QK_TQKV];
+    for (int j = 0; j < QK_TQKV; ++j) {
+        int q = int(roundf(x[j]*id + center));
+        q = max(0, min(levels - 1, q));
+        tqkv_set_bits_device(y->qs, j*bits, bits, uint8_t(q));
+        yv[j] = (float(q) - center) * d;
+    }
+
+    if constexpr (half_residual) {
+        for (int j = 0; j < QK_TQKV; j += 2) {
+            const float y_pos = yv[j] + 0.25f*d;
+            const float y_neg = yv[j] - 0.25f*d;
+            const bool use_pos = fabsf(x[j] - y_pos) < fabsf(x[j] - y_neg);
+            tqkv_set_bit_device(y->qh, j >> 1, use_pos);
+            yv[j] = use_pos ? y_pos : y_neg;
+        }
+    }
+
+    float dr = 0.0f;
+    if constexpr (ip_residual) {
+        for (int j = 0; j < QK_TQKV; ++j) {
+            dr += fabsf(x[j] - yv[j]);
+        }
+        dr /= QK_TQKV;
+
+        for (int j = 0; j < QK_TQKV; ++j) {
+            tqkv_set_bit_device(y->rs, j, x[j] >= yv[j]);
+        }
+    }
+
+    y->d = d;
+    if constexpr (ip_residual) {
+        y->dr = dr;
+    }
+}
+
+static __device__ void quantize_f32_tqkv_2_0_block(const float * __restrict__ x, block_tqkv_2_0 * __restrict__ y) {
+    quantize_f32_tqkv_block<block_tqkv_2_0, 2, false, false>(x, y);
+}
+
+static __device__ void quantize_f32_tqkv_2_5_block(const float * __restrict__ x, block_tqkv_2_5 * __restrict__ y) {
+    quantize_f32_tqkv_block<block_tqkv_2_5, 2, true, false>(x, y);
+}
+
+static __device__ void quantize_f32_tqkv_3_0_block(const float * __restrict__ x, block_tqkv_3_0 * __restrict__ y) {
+    quantize_f32_tqkv_block<block_tqkv_3_0, 3, false, false>(x, y);
+}
+
+static __device__ void quantize_f32_tqkv_3_5_block(const float * __restrict__ x, block_tqkv_3_5 * __restrict__ y) {
+    quantize_f32_tqkv_block<block_tqkv_3_5, 3, true, false>(x, y);
+}
+
+static __device__ void quantize_f32_tqkv_4_0_block(const float * __restrict__ x, block_tqkv_4_0 * __restrict__ y) {
+    quantize_f32_tqkv_block<block_tqkv_4_0, 4, false, false>(x, y);
+}
+
+static __device__ void quantize_f32_tqkv_2_0_ip_block(const float * __restrict__ x, block_tqkv_2_0_ip * __restrict__ y) {
+    quantize_f32_tqkv_block<block_tqkv_2_0_ip, 2, false, true>(x, y);
+}
+
+static __device__ void quantize_f32_tqkv_2_5_ip_block(const float * __restrict__ x, block_tqkv_2_5_ip * __restrict__ y) {
+    quantize_f32_tqkv_block<block_tqkv_2_5_ip, 2, true, true>(x, y);
+}
+
+static __device__ void quantize_f32_tqkv_3_0_ip_block(const float * __restrict__ x, block_tqkv_3_0_ip * __restrict__ y) {
+    quantize_f32_tqkv_block<block_tqkv_3_0_ip, 3, false, true>(x, y);
+}
+
+static __device__ void quantize_f32_tqkv_3_5_ip_block(const float * __restrict__ x, block_tqkv_3_5_ip * __restrict__ y) {
+    quantize_f32_tqkv_block<block_tqkv_3_5_ip, 3, true, true>(x, y);
+}
+
+static __device__ void quantize_f32_tqkv_4_0_ip_block(const float * __restrict__ x, block_tqkv_4_0_ip * __restrict__ y) {
+    quantize_f32_tqkv_block<block_tqkv_4_0_ip, 4, false, true>(x, y);
+}
+
 // Wrapper functions for cpy.cu compatibility
 static __device__ void cpy_blck_f32_q4_0(const char * cxi, char * cdsti) {
     quantize_f32_q4_0_block((const float *)cxi, (block_q4_0 *)cdsti);
