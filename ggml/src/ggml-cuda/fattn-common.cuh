@@ -646,6 +646,75 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tqkv(
     return sum;
 }
 
+template<int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tqkv_2_0(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_tqkv_2_0 * K_tqkv = (const block_tqkv_2_0 *) K_c;
+    GGML_UNUSED(Q_v);
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+
+        const int i  = int(sizeof(int))*k_KQ;
+        const int ib = i / QK_TQKV;
+        const int j  = i % QK_TQKV;
+
+        const uint8_t q = K_tqkv[ib].qs[j/4];
+
+        const int v = ((q >> 0) & 0x03) |
+                     (((q >> 2) & 0x03) <<  8) |
+                     (((q >> 4) & 0x03) << 16) |
+                     (((q >> 6) & 0x03) << 24);
+
+        const int u = Q_q8[k_KQ_0/nthreads];
+        const int sumi = ggml_cuda_dp4a(v, u, 0);
+
+        const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
+        sum += K_tqkv[ib].d * (sumi*Q_ds.x - (1.5f/QI8_1)*Q_ds.y);
+    }
+
+    return sum;
+}
+
+template<int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tqkv_4_0(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_tqkv_4_0 * K_tqkv = (const block_tqkv_4_0 *) K_c;
+    GGML_UNUSED(Q_v);
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+
+        const int i  = int(sizeof(int))*k_KQ;
+        const int ib = i / QK_TQKV;
+        const int j  = i % QK_TQKV;
+
+        const uint8_t q0 = K_tqkv[ib].qs[j/2 + 0];
+        const uint8_t q1 = K_tqkv[ib].qs[j/2 + 1];
+
+        const int v = ((q0 >> 0) & 0x0F) |
+                     (((q0 >> 4) & 0x0F) <<  8) |
+                     (((q1 >> 0) & 0x0F) << 16) |
+                     (((q1 >> 4) & 0x0F) << 24);
+
+        const int u = Q_q8[k_KQ_0/nthreads];
+        const int sumi = ggml_cuda_dp4a(v, u, 0);
+
+        const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
+        sum += K_tqkv[ib].d * (sumi*Q_ds.x - (7.5f/QI8_1)*Q_ds.y);
+    }
+
+    return sum;
+}
+
 template <typename T, int ne, typename block_t, int bits, bool half_residual, bool ip_residual>
 static __device__ __forceinline__ void dequantize_V_tqkv(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     const block_t * x = (const block_t *) vx;
@@ -653,6 +722,34 @@ static __device__ __forceinline__ void dequantize_V_tqkv(const void * __restrict
 #pragma unroll
     for (int l = 0; l < ne; ++l) {
         ((T *) dst)[l] = ggml_cuda_cast<T>(dequantize_tqkv_value<block_t, bits, half_residual, ip_residual>(x, i0 + l));
+    }
+}
+
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_tqkv_2_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_tqkv_2_0 * x = (const block_tqkv_2_0 *) vx;
+
+#pragma unroll
+    for (int l = 0; l < ne; ++l) {
+        const int64_t i = i0 + l;
+        const int64_t ib = i / QK_TQKV;
+        const int j = i % QK_TQKV;
+        const uint8_t q = (x[ib].qs[j/4] >> (2*(j & 3))) & 0x03;
+        ((T *) dst)[l] = ggml_cuda_cast<T>((float(q) - 1.5f) * x[ib].d);
+    }
+}
+
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_tqkv_4_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_tqkv_4_0 * x = (const block_tqkv_4_0 *) vx;
+
+#pragma unroll
+    for (int l = 0; l < ne; ++l) {
+        const int64_t i = i0 + l;
+        const int64_t ib = i / QK_TQKV;
+        const int j = i % QK_TQKV;
+        const uint8_t q = (x[ib].qs[j/2] >> (4*(j & 1))) & 0x0F;
+        ((T *) dst)[l] = ggml_cuda_cast<T>((float(q) - 7.5f) * x[ib].d);
     }
 }
 
@@ -673,7 +770,7 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     } else if constexpr (type_K == GGML_TYPE_BF16) {
         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_TQKV_2_0) {
-        return vec_dot_fattn_vec_KQ_tqkv<D, nthreads, block_tqkv_2_0, 2, false, false>;
+        return vec_dot_fattn_vec_KQ_tqkv_2_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_TQKV_2_5) {
         return vec_dot_fattn_vec_KQ_tqkv<D, nthreads, block_tqkv_2_5, 2, true, false>;
     } else if constexpr (type_K == GGML_TYPE_TQKV_3_0) {
@@ -681,7 +778,7 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     } else if constexpr (type_K == GGML_TYPE_TQKV_3_5) {
         return vec_dot_fattn_vec_KQ_tqkv<D, nthreads, block_tqkv_3_5, 3, true, false>;
     } else if constexpr (type_K == GGML_TYPE_TQKV_4_0) {
-        return vec_dot_fattn_vec_KQ_tqkv<D, nthreads, block_tqkv_4_0, 4, false, false>;
+        return vec_dot_fattn_vec_KQ_tqkv_4_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_TQKV_2_0_IP) {
         return vec_dot_fattn_vec_KQ_tqkv<D, nthreads, block_tqkv_2_0_ip, 2, false, true>;
     } else if constexpr (type_K == GGML_TYPE_TQKV_2_5_IP) {
@@ -715,7 +812,7 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
     } else if constexpr (type_V == GGML_TYPE_BF16) {
         return dequantize_V_bf16<float, ne>;
     } else if constexpr (type_V == GGML_TYPE_TQKV_2_0) {
-        return dequantize_V_tqkv<T, ne, block_tqkv_2_0, 2, false, false>;
+        return dequantize_V_tqkv_2_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_TQKV_2_5) {
         return dequantize_V_tqkv<T, ne, block_tqkv_2_5, 2, true, false>;
     } else if constexpr (type_V == GGML_TYPE_TQKV_3_0) {
@@ -723,7 +820,7 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
     } else if constexpr (type_V == GGML_TYPE_TQKV_3_5) {
         return dequantize_V_tqkv<T, ne, block_tqkv_3_5, 3, true, false>;
     } else if constexpr (type_V == GGML_TYPE_TQKV_4_0) {
-        return dequantize_V_tqkv<T, ne, block_tqkv_4_0, 4, false, false>;
+        return dequantize_V_tqkv_4_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_TQKV_2_0_IP) {
         return dequantize_V_tqkv<T, ne, block_tqkv_2_0_ip, 2, false, true>;
     } else if constexpr (type_V == GGML_TYPE_TQKV_2_5_IP) {
