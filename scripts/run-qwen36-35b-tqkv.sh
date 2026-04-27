@@ -30,21 +30,40 @@ if [[ ! -f "$MODEL" ]]; then
     fi
 fi
 
-if [[ -x "$LLAMA_DIR/build/bin/llama-server" ]]; then
-    SERVER_BIN="$LLAMA_DIR/build/bin/llama-server"
-elif [[ -x "$LLAMA_DIR/llama-server" ]]; then
-    SERVER_BIN="$LLAMA_DIR/llama-server"
+if [[ -n "${SERVER_BIN:-}" ]]; then
+    if [[ ! -x "$SERVER_BIN" ]]; then
+        echo "SERVER_BIN is set but not executable: $SERVER_BIN" >&2
+        exit 1
+    fi
 else
-    echo "llama-server not found. Build first, then retry." >&2
-    echo "Expected one of:" >&2
-    echo "  $LLAMA_DIR/build/bin/llama-server" >&2
-    echo "  $LLAMA_DIR/llama-server" >&2
-    exit 1
+    SERVER_CANDIDATES=(
+        "$LLAMA_DIR/build-rocm-gfx1100/bin/llama-server"
+        "$LLAMA_DIR/build/bin/llama-server"
+        "$LLAMA_DIR/bin/llama-server"
+        "$LLAMA_DIR/llama-server"
+    )
+
+    SERVER_BIN=""
+    for candidate in "${SERVER_CANDIDATES[@]}"; do
+        if [[ -x "$candidate" ]]; then
+            SERVER_BIN="$candidate"
+            break
+        fi
+    done
+
+    if [[ -z "$SERVER_BIN" ]]; then
+        echo "llama-server not found. Build first, then retry." >&2
+        echo "Expected one of:" >&2
+        printf '  %s\n' "${SERVER_CANDIDATES[@]}" >&2
+        echo "Or set SERVER_BIN=/full/path/to/llama-server." >&2
+        exit 1
+    fi
 fi
 
 echo "Starting TQKV server"
 echo "  model: $MODEL"
 echo "  cache: K=$CACHE_TYPE_K V=$CACHE_TYPE_V"
+echo "  bin:   $SERVER_BIN"
 echo "  url:   http://$HOST:$PORT"
 
 exec "$SERVER_BIN" \
