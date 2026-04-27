@@ -12,10 +12,40 @@ ALIAS="${ALIAS:-qwen3.6-35b}"
 DOWNLOAD_URL="${DOWNLOAD_URL:-https://huggingface.co/unsloth/Qwen3.6-35B-A3B-UD-GGUF/resolve/main/$MODEL_FILE}"
 
 HOST="${HOST:-0.0.0.0}"
-PORT="${TQKV_PORT:-${LLAMA_PORT:-8002}}"
+PORT="${TQKV_PORT:-8002}"
 CTX_SIZE="${CTX_SIZE:-128000}"
-CACHE_TYPE_K="${CACHE_TYPE_K:-tqkv_4_0}"
-CACHE_TYPE_V="${CACHE_TYPE_V:-tqkv_4_0}"
+TQKV_PROFILE="${TQKV_PROFILE:-fast}"
+BATCH_SIZE="${BATCH_SIZE:-2048}"
+UBATCH_SIZE="${UBATCH_SIZE:-512}"
+PROMPT_CACHE_MB="${PROMPT_CACHE_MB:-0}"
+
+case "$TQKV_PROFILE" in
+    fast)
+        CACHE_TYPE_K="tqkv_fast"
+        CACHE_TYPE_V="tqkv_fast"
+        PROFILE_NOTE="DP4A vector path, best speed/quality starting point"
+        ;;
+    compact)
+        CACHE_TYPE_K="tqkv_compact"
+        CACHE_TYPE_V="tqkv_compact"
+        PROFILE_NOTE="2-bit KV, lowest VRAM, quality-risk experiment"
+        ;;
+    quality)
+        CACHE_TYPE_K="tqkv_quality"
+        CACHE_TYPE_V="tqkv_quality"
+        PROFILE_NOTE="inner-product residual KV, slow diagnostic profile"
+        ;;
+    custom)
+        CACHE_TYPE_K="${CACHE_TYPE_K:-tqkv_fast}"
+        CACHE_TYPE_V="${CACHE_TYPE_V:-tqkv_fast}"
+        PROFILE_NOTE="custom cache types from CACHE_TYPE_K/CACHE_TYPE_V"
+        ;;
+    *)
+        echo "Unsupported TQKV_PROFILE=$TQKV_PROFILE" >&2
+        echo "Allowed values: fast, compact, quality, custom" >&2
+        exit 1
+        ;;
+esac
 
 if [[ ! -f "$MODEL" ]]; then
     if [[ "${DOWNLOAD_MODEL:-0}" == "1" ]]; then
@@ -62,7 +92,11 @@ fi
 
 echo "Starting TQKV server"
 echo "  model: $MODEL"
+echo "  profile: $TQKV_PROFILE ($PROFILE_NOTE)"
 echo "  cache: K=$CACHE_TYPE_K V=$CACHE_TYPE_V"
+echo "  ctx:   $CTX_SIZE"
+echo "  batch: $BATCH_SIZE / ubatch $UBATCH_SIZE"
+echo "  prompt cache RAM: ${PROMPT_CACHE_MB} MiB"
 echo "  bin:   $SERVER_BIN"
 echo "  url:   http://$HOST:$PORT"
 
@@ -83,6 +117,9 @@ exec "$SERVER_BIN" \
     --top-k 1 \
     --top-p 1 \
     --ctx-size "$CTX_SIZE" \
+    --batch-size "$BATCH_SIZE" \
+    --ubatch-size "$UBATCH_SIZE" \
+    --cache-ram "$PROMPT_CACHE_MB" \
     --metrics \
     --host "$HOST" \
     --port "$PORT"

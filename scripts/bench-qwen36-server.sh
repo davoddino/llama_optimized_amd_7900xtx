@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BENCH_PORT="${BENCH_PORT:-${TQKV_PORT:-${LLAMA_PORT:-8002}}}"
+BENCH_PORT="${BENCH_PORT:-${TQKV_PORT:-8002}}"
 BASE_URL="${BASE_URL:-http://127.0.0.1:$BENCH_PORT}"
 MODEL="${MODEL:-qwen3.6-35b}"
 PROMPT_TOKENS="${PROMPT_TOKENS:-8192}"
@@ -9,6 +9,7 @@ MAX_TOKENS="${MAX_TOKENS:-256}"
 RUNS="${RUNS:-3}"
 OUT_DIR="${OUT_DIR:-bench-results/server}"
 CACHE_BUST="${CACHE_BUST:-1}"
+PROMPT_CHARS_PER_TOKEN="${PROMPT_CHARS_PER_TOKEN:-3}"
 
 command -v curl >/dev/null 2>&1 || { echo "curl not found" >&2; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "python3 not found" >&2; exit 1; }
@@ -19,6 +20,7 @@ echo "Server benchmark"
 echo "  url:           $BASE_URL"
 echo "  model:         $MODEL"
 echo "  prompt approx: $PROMPT_TOKENS tokens"
+echo "  chars/token:   $PROMPT_CHARS_PER_TOKEN"
 echo "  max tokens:    $MAX_TOKENS"
 echo "  runs:          $RUNS"
 echo "  output dir:    $OUT_DIR"
@@ -30,19 +32,20 @@ for run in $(seq 1 "$RUNS"); do
     body="$(mktemp)"
     response="$OUT_DIR/server-run-${run}-prompt${PROMPT_TOKENS}-gen${MAX_TOKENS}.json"
 
-    python3 - "$body" "$MODEL" "$PROMPT_TOKENS" "$MAX_TOKENS" "$run" "$CACHE_BUST" <<'PY'
+    python3 - "$body" "$MODEL" "$PROMPT_TOKENS" "$MAX_TOKENS" "$run" "$CACHE_BUST" "$PROMPT_CHARS_PER_TOKEN" <<'PY'
 import json
 import sys
 
-path, model, prompt_tokens_s, max_tokens_s, run_s, cache_bust_s = sys.argv[1:]
+path, model, prompt_tokens_s, max_tokens_s, run_s, cache_bust_s, chars_per_token_s = sys.argv[1:]
 prompt_tokens = int(prompt_tokens_s)
 max_tokens = int(max_tokens_s)
 run = int(run_s)
 cache_bust = cache_bust_s != "0"
+chars_per_token = float(chars_per_token_s)
 
 # Rough token budget. Code-like text is intentionally used because the target
 # workload is coding-agent context, not natural-language filler.
-target_chars = max(256, prompt_tokens * 4)
+target_chars = max(256, int(prompt_tokens * chars_per_token))
 unique = f"BENCH_RUN_{run:04d}" if cache_bust else "BENCH_REUSED_PREFIX"
 
 line = (

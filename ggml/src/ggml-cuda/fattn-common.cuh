@@ -674,7 +674,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tqkv_2_0(
         const int sumi = ggml_cuda_dp4a(v, u, 0);
 
         const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
-        sum += K_tqkv[ib].d * (sumi*Q_ds.x - (1.5f/QI8_1)*Q_ds.y);
+        sum += __half2float(K_tqkv[ib].d) * (sumi*Q_ds.x - (1.5f/QI8_1)*Q_ds.y);
     }
 
     return sum;
@@ -697,19 +697,19 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tqkv_4_0(
         const int ib = i / QK_TQKV;
         const int j  = i % QK_TQKV;
 
-        const uint8_t q0 = K_tqkv[ib].qs[j/2 + 0];
-        const uint8_t q1 = K_tqkv[ib].qs[j/2 + 1];
+        uint16_t q;
+        ggml_cuda_memcpy_1<sizeof(uint16_t)>(&q, K_tqkv[ib].qs + j/2);
 
-        const int v = ((q0 >> 0) & 0x0F) |
-                     (((q0 >> 4) & 0x0F) <<  8) |
-                     (((q1 >> 0) & 0x0F) << 16) |
-                     (((q1 >> 4) & 0x0F) << 24);
+        const int v = ((q & 0x000F)      ) |
+                     ((q & 0x00F0) <<  4) |
+                     ((q & 0x0F00) <<  8) |
+                     ((q & 0xF000) << 12);
 
         const int u = Q_q8[k_KQ_0/nthreads];
         const int sumi = ggml_cuda_dp4a(v, u, 0);
 
         const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
-        sum += K_tqkv[ib].d * (sumi*Q_ds.x - (7.5f/QI8_1)*Q_ds.y);
+        sum += __half2float(K_tqkv[ib].d) * (sumi*Q_ds.x - (7.5f/QI8_1)*Q_ds.y);
     }
 
     return sum;
@@ -729,13 +729,45 @@ template <typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_tqkv_2_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     const block_tqkv_2_0 * x = (const block_tqkv_2_0 *) vx;
 
+    static_assert(ne == 2 || ne == 4, "bad ne");
+
+    if constexpr (ne != 4) {
 #pragma unroll
-    for (int l = 0; l < ne; ++l) {
-        const int64_t i = i0 + l;
-        const int64_t ib = i / QK_TQKV;
-        const int j = i % QK_TQKV;
-        const uint8_t q = (x[ib].qs[j/4] >> (2*(j & 3))) & 0x03;
-        ((T *) dst)[l] = ggml_cuda_cast<T>((float(q) - 1.5f) * x[ib].d);
+        for (int l = 0; l < ne; ++l) {
+            const int64_t i = i0 + l;
+            const int64_t ib = i / QK_TQKV;
+            const int j = i % QK_TQKV;
+            const uint8_t q = (x[ib].qs[j/4] >> (2*(j & 3))) & 0x03;
+            ((T *) dst)[l] = ggml_cuda_cast<T>((float(q) - 1.5f) * __half2float(x[ib].d));
+        }
+        return;
+    }
+
+    const int64_t ib = i0 / QK_TQKV;
+    const int j = i0 % QK_TQKV;
+    const uint8_t q = x[ib].qs[j/4];
+    const float d = __half2float(x[ib].d);
+
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+        const half2 d2 = __float2half2_rn(d);
+        ((half2 *) dst)[0] = d2 * make_half2(float((q >> 0) & 0x03) - 1.5f,
+                                             float((q >> 2) & 0x03) - 1.5f);
+        if constexpr (ne == 4) {
+            ((half2 *) dst)[1] = d2 * make_half2(float((q >> 4) & 0x03) - 1.5f,
+                                                 float((q >> 6) & 0x03) - 1.5f);
+        }
+    } else
+#endif // FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, float>) {
+        ((float *) dst)[0] = (float((q >> 0) & 0x03) - 1.5f) * d;
+        ((float *) dst)[1] = (float((q >> 2) & 0x03) - 1.5f) * d;
+        if constexpr (ne == 4) {
+            ((float *) dst)[2] = (float((q >> 4) & 0x03) - 1.5f) * d;
+            ((float *) dst)[3] = (float((q >> 6) & 0x03) - 1.5f) * d;
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "bad type");
     }
 }
 
@@ -743,13 +775,46 @@ template <typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_tqkv_4_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     const block_tqkv_4_0 * x = (const block_tqkv_4_0 *) vx;
 
+    static_assert(ne == 2 || ne == 4, "bad ne");
+
+    if constexpr (ne != 4) {
 #pragma unroll
-    for (int l = 0; l < ne; ++l) {
-        const int64_t i = i0 + l;
-        const int64_t ib = i / QK_TQKV;
-        const int j = i % QK_TQKV;
-        const uint8_t q = (x[ib].qs[j/2] >> (4*(j & 1))) & 0x0F;
-        ((T *) dst)[l] = ggml_cuda_cast<T>((float(q) - 7.5f) * x[ib].d);
+        for (int l = 0; l < ne; ++l) {
+            const int64_t i = i0 + l;
+            const int64_t ib = i / QK_TQKV;
+            const int j = i % QK_TQKV;
+            const uint8_t q = (x[ib].qs[j/2] >> (4*(j & 1))) & 0x0F;
+            ((T *) dst)[l] = ggml_cuda_cast<T>((float(q) - 7.5f) * __half2float(x[ib].d));
+        }
+        return;
+    }
+
+    const int64_t ib = i0 / QK_TQKV;
+    const int j = i0 % QK_TQKV;
+    uint16_t q;
+    ggml_cuda_memcpy_1<sizeof(uint16_t)>(&q, x[ib].qs + j/2);
+    const float d = __half2float(x[ib].d);
+
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+        const half2 d2 = __float2half2_rn(d);
+        ((half2 *) dst)[0] = d2 * make_half2(float((q >>  0) & 0x0F) - 7.5f,
+                                             float((q >>  4) & 0x0F) - 7.5f);
+        if constexpr (ne == 4) {
+            ((half2 *) dst)[1] = d2 * make_half2(float((q >>  8) & 0x0F) - 7.5f,
+                                                 float((q >> 12) & 0x0F) - 7.5f);
+        }
+    } else
+#endif // FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, float>) {
+        ((float *) dst)[0] = (float((q >>  0) & 0x0F) - 7.5f) * d;
+        ((float *) dst)[1] = (float((q >>  4) & 0x0F) - 7.5f) * d;
+        if constexpr (ne == 4) {
+            ((float *) dst)[2] = (float((q >>  8) & 0x0F) - 7.5f) * d;
+            ((float *) dst)[3] = (float((q >> 12) & 0x0F) - 7.5f) * d;
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "bad type");
     }
 }
 

@@ -404,6 +404,16 @@ const std::vector<ggml_type> kv_cache_types = {
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
+    if (s == "tqkv_fast") {
+        return GGML_TYPE_TQKV_4_0;
+    }
+    if (s == "tqkv_compact") {
+        return GGML_TYPE_TQKV_2_0;
+    }
+    if (s == "tqkv_quality") {
+        return GGML_TYPE_TQKV_3_5_IP;
+    }
+
     for (const auto & type : kv_cache_types) {
         if (ggml_type_name(type) == s) {
             return type;
@@ -417,6 +427,7 @@ static std::string get_all_kv_cache_types() {
     for (const auto & type : kv_cache_types) {
         msg << ggml_type_name(type) << (&type == &kv_cache_types.back() ? "" : ", ");
     }
+    msg << ", tqkv_fast, tqkv_compact, tqkv_quality";
     return msg.str();
 }
 

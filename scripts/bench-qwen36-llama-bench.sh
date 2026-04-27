@@ -13,9 +13,32 @@ CTX_SIZE="${CTX_SIZE:-128000}"
 PROMPT_SIZES="${PROMPT_SIZES:-8192,32768,65536}"
 GEN_TOKENS="${GEN_TOKENS:-256}"
 REPETITIONS="${REPETITIONS:-3}"
-CACHE_TYPE_K="${CACHE_TYPE_K:-tqkv_4_0}"
-CACHE_TYPE_V="${CACHE_TYPE_V:-tqkv_4_0}"
+TQKV_PROFILE="${TQKV_PROFILE:-fast}"
 OUT_FORMAT="${OUT_FORMAT:-md}"
+
+case "$TQKV_PROFILE" in
+    fast)
+        CACHE_TYPE_K="tqkv_fast"
+        CACHE_TYPE_V="tqkv_fast"
+        ;;
+    compact)
+        CACHE_TYPE_K="tqkv_compact"
+        CACHE_TYPE_V="tqkv_compact"
+        ;;
+    quality)
+        CACHE_TYPE_K="tqkv_quality"
+        CACHE_TYPE_V="tqkv_quality"
+        ;;
+    custom)
+        CACHE_TYPE_K="${CACHE_TYPE_K:-tqkv_fast}"
+        CACHE_TYPE_V="${CACHE_TYPE_V:-tqkv_fast}"
+        ;;
+    *)
+        echo "Unsupported TQKV_PROFILE=$TQKV_PROFILE" >&2
+        echo "Allowed values: fast, compact, quality, custom" >&2
+        exit 1
+        ;;
+esac
 
 if [[ ! -f "$MODEL" ]]; then
     echo "Model not found: $MODEL" >&2
@@ -59,6 +82,7 @@ echo "  ctx size:     $CTX_SIZE"
 echo "  prompt sizes: $PROMPT_SIZES"
 echo "  gen tokens:   $GEN_TOKENS"
 echo "  repetitions:  $REPETITIONS"
+echo "  profile:      $TQKV_PROFILE"
 echo "  cache:        K=$CACHE_TYPE_K V=$CACHE_TYPE_V"
 echo
 
