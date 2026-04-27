@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BASE_URL="${BASE_URL:-http://127.0.0.1:8001}"
+BASE_URL="${BASE_URL:-http://127.0.0.1:8002}"
 MODEL="${MODEL:-qwen3.6-35b}"
 PROMPT_TOKENS="${PROMPT_TOKENS:-8192}"
 MAX_TOKENS="${MAX_TOKENS:-256}"

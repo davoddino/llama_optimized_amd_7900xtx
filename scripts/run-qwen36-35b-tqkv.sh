@@ -12,7 +12,7 @@ ALIAS="${ALIAS:-qwen3.6-35b}"
 DOWNLOAD_URL="${DOWNLOAD_URL:-https://huggingface.co/unsloth/Qwen3.6-35B-A3B-UD-GGUF/resolve/main/$MODEL_FILE}"
 
 HOST="${HOST:-0.0.0.0}"
-PORT="${PORT:-8001}"
+PORT="${PORT:-8002}"
 CTX_SIZE="${CTX_SIZE:-128000}"
 CACHE_TYPE_K="${CACHE_TYPE_K:-tqkv_3_5_ip}"
 CACHE_TYPE_V="${CACHE_TYPE_V:-tqkv_3_5_ip}"
