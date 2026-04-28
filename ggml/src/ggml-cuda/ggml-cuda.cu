@@ -91,6 +91,21 @@ static bool ggml_cuda_env_enabled(const char * name) {
     return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
+static int64_t ggml_cuda_env_i64(const char * name, const int64_t default_value) {
+    const char * value = getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return default_value;
+    }
+
+    char * end = nullptr;
+    const int64_t parsed = std::strtoll(value, &end, 10);
+    if (end == value) {
+        return default_value;
+    }
+
+    return parsed;
+}
+
 struct ggml_cuda_rdna3_op_profile_record {
     int64_t calls = 0;
     double  total_ms = 0.0;
@@ -111,6 +126,29 @@ static bool ggml_cuda_rdna3_op_profile_enabled(const int device) {
 static bool ggml_cuda_rdna3_graph_log_enabled(const int device) {
     return ggml_cuda_env_enabled("GGML_CUDA_RDNA3_GRAPH_LOG") &&
         GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[device].cc);
+}
+
+static int64_t ggml_cuda_rdna3_graph_n_tokens(const ggml_cgraph * cgraph) {
+    if (const ggml_tensor * inp_tokens = ggml_graph_get_tensor(cgraph, "inp_tokens")) {
+        return inp_tokens->ne[0];
+    }
+
+    if (const ggml_tensor * inp_embd = ggml_graph_get_tensor(cgraph, "inp_embd")) {
+        return inp_embd->ne[1];
+    }
+
+    if (const ggml_tensor * attn_scale = ggml_graph_get_tensor(cgraph, "attn_scale")) {
+        return attn_scale->ne[2];
+    }
+
+    return -1;
+}
+
+static bool ggml_cuda_rdna3_op_profile_should_run(const ggml_cgraph * cgraph, int64_t * n_tokens) {
+    *n_tokens = ggml_cuda_rdna3_graph_n_tokens(cgraph);
+
+    const int64_t max_tokens = ggml_cuda_env_i64("GGML_CUDA_RDNA3_OP_PROFILE_MAX_TOKENS", -1);
+    return max_tokens < 0 || *n_tokens < 0 || *n_tokens <= max_tokens;
 }
 
 class ggml_cuda_rdna3_op_timer {
@@ -167,7 +205,7 @@ private:
     bool active = false;
 };
 
-static void ggml_cuda_rdna3_op_profile_print(const ggml_cuda_rdna3_op_profile_state & profile) {
+static void ggml_cuda_rdna3_op_profile_print(const ggml_cuda_rdna3_op_profile_state & profile, const int64_t n_tokens) {
     if (profile.records.empty()) {
         GGML_LOG_INFO("rdna3_op_profile: no GPU ops recorded\n");
         return;
@@ -178,7 +216,11 @@ static void ggml_cuda_rdna3_op_profile_print(const ggml_cuda_rdna3_op_profile_st
         return a.second.total_ms > b.second.total_ms;
     });
 
-    GGML_LOG_INFO("rdna3_op_profile: top GPU op costs for this graph evaluation\n");
+    if (n_tokens >= 0) {
+        GGML_LOG_INFO("rdna3_op_profile: top GPU op costs for this graph evaluation (tokens=%" PRId64 ")\n", n_tokens);
+    } else {
+        GGML_LOG_INFO("rdna3_op_profile: top GPU op costs for this graph evaluation (tokens=unknown)\n");
+    }
     GGML_LOG_INFO("rdna3_op_profile: %-9s %-9s %-9s %-9s %s\n", "calls", "total_ms", "avg_ms", "max_ms", "path | op | tensor");
 
     const size_t max_rows = 64;
@@ -4987,6 +5029,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     const void * graph_key = nullptr;
     const bool rdna3_op_profile = ggml_cuda_rdna3_op_profile_enabled(cuda_ctx->device);
     const bool rdna3_graph_log  = ggml_cuda_rdna3_graph_log_enabled(cuda_ctx->device);
+    int64_t rdna3_profile_tokens = -1;
+    const bool rdna3_op_profile_this_eval =
+        rdna3_op_profile && ggml_cuda_rdna3_op_profile_should_run(cgraph, &rdna3_profile_tokens);
 
 #ifdef USE_CUDA_GRAPH
     graph_key = ggml_cuda_graph_get_key(cgraph);
@@ -4997,10 +5042,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (rdna3_graph_log) {
         GGML_LOG_INFO("%s: RDNA3 graph support compiled=1 env_disabled=%d arch_disabled=%d op_profile=%d nodes=%d uid=%" PRIu64 "\n",
                 __func__, ggml_cuda_env_enabled("GGML_CUDA_DISABLE_GRAPHS") ? 1 : 0,
-                graph->disable_due_to_gpu_arch ? 1 : 0, rdna3_op_profile ? 1 : 0, cgraph->n_nodes, cgraph->uid);
+                graph->disable_due_to_gpu_arch ? 1 : 0, rdna3_op_profile_this_eval ? 1 : 0, cgraph->n_nodes, cgraph->uid);
     }
 
-    if (graph->is_enabled() && !rdna3_op_profile) {
+    if (graph->is_enabled() && !rdna3_op_profile_this_eval) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
@@ -5028,8 +5073,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         } else if (rdna3_graph_log) {
             GGML_LOG_INFO("%s: RDNA3 graph disabled for this evaluation: incompatible graph\n", __func__);
         }
-    } else if (rdna3_graph_log && rdna3_op_profile) {
+    } else if (rdna3_graph_log && rdna3_op_profile_this_eval) {
         GGML_LOG_INFO("%s: RDNA3 graph disabled for this evaluation: op profiling uses per-op events\n", __func__);
+    } else if (rdna3_graph_log && rdna3_op_profile) {
+        GGML_LOG_INFO("%s: RDNA3 op profile skipped for this evaluation: tokens=%" PRId64 "\n",
+                __func__, rdna3_profile_tokens);
     }
 #else
     if (rdna3_graph_log) {
@@ -5049,15 +5097,15 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_rdna3_op_profile_state rdna3_profile;
-    if (rdna3_op_profile) {
+    if (rdna3_op_profile_this_eval) {
         ggml_cuda_rdna3_op_profile_current = &rdna3_profile;
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
 
-    if (rdna3_op_profile) {
+    if (rdna3_op_profile_this_eval) {
         ggml_cuda_rdna3_op_profile_current = nullptr;
-        ggml_cuda_rdna3_op_profile_print(rdna3_profile);
+        ggml_cuda_rdna3_op_profile_print(rdna3_profile, rdna3_profile_tokens);
     }
 
     return GGML_STATUS_SUCCESS;

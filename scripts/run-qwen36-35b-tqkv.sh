@@ -23,6 +23,7 @@ KV_UNIFIED="${KV_UNIFIED:-}"
 CACHE_IDLE_SLOTS="${CACHE_IDLE_SLOTS:-}"
 RDNA3_PROFILE_LOG="${RDNA3_PROFILE_LOG:-0}"
 RDNA3_OP_PROFILE="${RDNA3_OP_PROFILE:-0}"
+RDNA3_OP_PROFILE_MAX_TOKENS="${RDNA3_OP_PROFILE_MAX_TOKENS:-}"
 RDNA3_GRAPH_LOG="${RDNA3_GRAPH_LOG:-0}"
 RDNA3_FAIL_ON_HOST_SYNC="${RDNA3_FAIL_ON_HOST_SYNC:-0}"
 RDNA3_DISABLE_QWEN35_TOPK="${RDNA3_DISABLE_QWEN35_TOPK:-0}"
@@ -127,6 +128,10 @@ if [[ "$RDNA3_OP_PROFILE" == "1" ]]; then
     export GGML_CUDA_RDNA3_OP_PROFILE=1
 fi
 
+if [[ -n "$RDNA3_OP_PROFILE_MAX_TOKENS" ]]; then
+    export GGML_CUDA_RDNA3_OP_PROFILE_MAX_TOKENS="$RDNA3_OP_PROFILE_MAX_TOKENS"
+fi
+
 if [[ "$RDNA3_GRAPH_LOG" == "1" ]]; then
     export GGML_CUDA_RDNA3_GRAPH_LOG=1
 fi
@@ -181,6 +186,7 @@ echo "  batch: $BATCH_SIZE / ubatch $UBATCH_SIZE"
 echo "  prompt cache RAM: ${PROMPT_CACHE_MB} MiB"
 echo "  rdna3 profile log: $RDNA3_PROFILE_LOG"
 echo "  rdna3 op profile: $RDNA3_OP_PROFILE"
+echo "  rdna3 op profile max tokens: ${RDNA3_OP_PROFILE_MAX_TOKENS:-all}"
 echo "  rdna3 graph log: $RDNA3_GRAPH_LOG"
 echo "  rdna3 fail on host sync: $RDNA3_FAIL_ON_HOST_SYNC"
 echo "  rdna3 disable qwen35 topk: $RDNA3_DISABLE_QWEN35_TOPK"
