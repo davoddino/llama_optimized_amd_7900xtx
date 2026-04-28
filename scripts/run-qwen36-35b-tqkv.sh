@@ -16,9 +16,11 @@ PORT="${TQKV_PORT:-8002}"
 CTX_SIZE="${CTX_SIZE:-128000}"
 PARALLEL="${PARALLEL:-${N_PARALLEL:-1}}"
 TQKV_PROFILE="${TQKV_PROFILE:-fast}"
-BATCH_SIZE="${BATCH_SIZE:-2048}"
-UBATCH_SIZE="${UBATCH_SIZE:-512}"
+BATCH_SIZE="${BATCH_SIZE:-4096}"
+UBATCH_SIZE="${UBATCH_SIZE:-1024}"
 PROMPT_CACHE_MB="${PROMPT_CACHE_MB:-0}"
+CTX_CHECKPOINTS="${CTX_CHECKPOINTS:-0}"
+CHECKPOINT_EVERY_NT="${CHECKPOINT_EVERY_NT:--1}"
 KV_UNIFIED="${KV_UNIFIED:-}"
 CACHE_IDLE_SLOTS="${CACHE_IDLE_SLOTS:-}"
 RDNA3_PROFILE_LOG="${RDNA3_PROFILE_LOG:-0}"
@@ -244,6 +246,8 @@ echo "  ctx:   $CTX_SIZE"
 echo "  parallel slots: $PARALLEL"
 echo "  batch: $BATCH_SIZE / ubatch $UBATCH_SIZE"
 echo "  prompt cache RAM: ${PROMPT_CACHE_MB} MiB"
+echo "  ctx checkpoints: $CTX_CHECKPOINTS"
+echo "  checkpoint every n tokens: $CHECKPOINT_EVERY_NT"
 echo "  rdna3 profile log: $RDNA3_PROFILE_LOG"
 echo "  rdna3 op profile: $RDNA3_OP_PROFILE"
 echo "  rdna3 op profile max tokens: ${RDNA3_OP_PROFILE_MAX_TOKENS:-all}"
@@ -289,6 +293,8 @@ exec "$SERVER_BIN" \
     --batch-size "$BATCH_SIZE" \
     --ubatch-size "$UBATCH_SIZE" \
     --cache-ram "$PROMPT_CACHE_MB" \
+    --ctx-checkpoints "$CTX_CHECKPOINTS" \
+    --checkpoint-every-n-tokens "$CHECKPOINT_EVERY_NT" \
     --metrics \
     --host "$HOST" \
     --port "$PORT" \

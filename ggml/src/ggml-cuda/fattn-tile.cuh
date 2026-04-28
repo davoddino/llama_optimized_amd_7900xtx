@@ -263,6 +263,7 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  8, 128, 6,  32, 256)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 16, 256, 5,  32, 256)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 3,  64, 128)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 64, 256, 2,  64, 128)
 
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512,  4, 128, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512,  8, 256, 2,  64,  64)
@@ -337,6 +338,16 @@ static __host__ int ggml_cuda_fattn_tile_get_nbatch_K(const int DKQ, const int D
 static constexpr __device__ int ggml_cuda_fattn_tile_get_nbatch_K(const int DKQ, const int DV, const int ncols) {
     return (ggml_cuda_fattn_tile_get_config(DKQ, DV, ncols) >> 23) & ((1 << 9) - 1);
 }
+
+#if defined(GGML_USE_HIP) && defined(RDNA)
+static bool ggml_cuda_fattn_tile_type_is_tqkv(ggml_type type) {
+    return type == GGML_TYPE_TQKV_2_0    || type == GGML_TYPE_TQKV_2_5 ||
+           type == GGML_TYPE_TQKV_3_0    || type == GGML_TYPE_TQKV_3_5 ||
+           type == GGML_TYPE_TQKV_4_0    || type == GGML_TYPE_TQKV_2_0_IP ||
+           type == GGML_TYPE_TQKV_2_5_IP || type == GGML_TYPE_TQKV_3_0_IP ||
+           type == GGML_TYPE_TQKV_3_5_IP || type == GGML_TYPE_TQKV_4_0_IP;
+}
+#endif // defined(GGML_USE_HIP) && defined(RDNA)
 
 // TODO: deduplicate with mma-f16
 template<int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check>
@@ -1116,6 +1127,21 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
     constexpr size_t nbytes_shared = 0;
 
 #ifdef GGML_USE_HIP
+#ifdef RDNA
+    if constexpr (DKQ == 256 && DV == 256 && ncols2 == 8) {
+        const ggml_tensor * K = dst->src[1];
+        if (GGML_CUDA_CC_IS_RDNA3(cc) && K && ggml_cuda_fattn_tile_type_is_tqkv(K->type) && Q->ne[1] >= 128) {
+            constexpr int cols_per_block = 64;
+            const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+            const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap>;
+            launch_fattn<DV, cols_per_block/ncols2, ncols2>
+                (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, true, true, false, warp_size);
+            return;
+        }
+    }
+#endif // RDNA
+
     if constexpr (DV <= 128) {
         if (Q->ne[1] > 32/ncols2) {
             constexpr int cols_per_block = 64;
