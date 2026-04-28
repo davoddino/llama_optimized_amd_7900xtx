@@ -3963,6 +3963,76 @@ static bool ggml_cuda_moe_gate_up_fusion(
     return true;
 }
 
+static bool ggml_cuda_should_use_moe_gate_up_split_mmvq(
+        const ggml_tensor * up,
+        const ggml_tensor * gate,
+        const ggml_tensor * glu) {
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (!GGML_CUDA_CC_IS_RDNA3(cc) || getenv("GGML_CUDA_RDNA3_DISABLE_MOE_GATE_UP_FUSED") != nullptr) {
+        return false;
+    }
+
+    if (!up || !gate || !glu || up->op != GGML_OP_MUL_MAT_ID || gate->op != GGML_OP_MUL_MAT_ID || glu->op != GGML_OP_GLU) {
+        return false;
+    }
+    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0) {
+        return false;
+    }
+    if (glu->src[0] != gate || glu->src[1] != up) {
+        return false;
+    }
+
+    const ggml_tensor * up_w   = up->src[0];
+    const ggml_tensor * gate_w = gate->src[0];
+    const ggml_tensor * src1   = up->src[1];
+    const ggml_tensor * ids    = up->src[2];
+
+    if (!up_w || !gate_w || !src1 || !ids || gate->src[1] != src1 || gate->src[2] != ids) {
+        return false;
+    }
+    if (!ggml_is_quantized(up_w->type) || up_w->type != gate_w->type ||
+            src1->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 ||
+            up->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    switch (up_w->type) {
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_Q8_0:
+            break;
+        default:
+            return false;
+    }
+
+    if (!ggml_are_same_shape(up_w, gate_w) || !ggml_are_same_stride(up_w, gate_w)) {
+        return false;
+    }
+    if (up->ne[0] <= 0 || up->ne[1] < 2 || up->ne[1] > MMVQ_MAX_BATCH_SIZE || up->ne[2] <= 0) {
+        return false;
+    }
+
+    const int64_t n_expert_used = up->ne[1];
+    const int64_t n_tokens      = up->ne[2];
+    const int     max_batch     = get_mmvq_mmid_max_batch(up_w->type, cc);
+
+    if (n_tokens > max_batch || gate->ne[0] != up->ne[0] || gate->ne[1] != n_expert_used || gate->ne[2] != n_tokens ||
+            glu->ne[0] != up->ne[0] || glu->ne[1] != n_expert_used || glu->ne[2] != n_tokens) {
+        return false;
+    }
+    if (ids->ne[0] != n_expert_used || src1->ne[1] != 1 || src1->ne[2] != n_tokens) {
+        return false;
+    }
+    if (ggml_backend_buft_is_cuda_split(up_w->buffer->buft) ||
+            ggml_backend_buft_is_cuda_split(gate_w->buffer->buft) ||
+            ggml_backend_buft_is_cuda_split(src1->buffer->buft)) {
+        return false;
+    }
+
+    return true;
+}
+
 static bool ggml_cuda_moe_down_weighted_fusion(
         const ggml_cgraph * cgraph,
         const int           node_idx,
@@ -4661,6 +4731,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             const ggml_tensor * src0 = up->src[0];
                             const ggml_tensor * src1 = up->src[1];
                             const ggml_tensor * ids  = up->src[2];
+
+                            if (op == GGML_OP_MUL_MAT_ID && ggml_cuda_should_use_moe_gate_up_split_mmvq(up, gate, glu)) {
+                                if (getenv("GGML_CUDA_RDNA3_PROFILE_LOG") != nullptr) {
+                                    GGML_LOG_INFO("%s: MOE_GATE_UP_SPLIT_MMVQ_SWIGLU_FUSED src0_type=%s, n_ff=%" PRId64
+                                            ", experts=%" PRId64 ", tokens=%" PRId64 "\n",
+                                            __func__, ggml_type_name(src0->type), glu->ne[0], ids->ne[0], glu->ne[2]);
+                                }
+                                op_timer.set_path("MOE_GATE_UP_SPLIT_MMVQ_SWIGLU_FUSED");
+                                ggml_cuda_mul_mat_vec_q_moe_gate_up_split(*cuda_ctx, gate->src[0], up->src[0], src1, ids, glu);
+                                fused_mul_mat_vec = true;
+                                fused_node_count = 3;
+                                break;
+                            }
 
                             if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
                                 ggml_cuda_mm_fusion_args_host fusion_data{};
