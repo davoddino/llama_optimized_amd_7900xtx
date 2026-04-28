@@ -14,10 +14,18 @@ DOWNLOAD_URL="${DOWNLOAD_URL:-https://huggingface.co/unsloth/Qwen3.6-35B-A3B-UD-
 HOST="${HOST:-0.0.0.0}"
 PORT="${TQKV_PORT:-8002}"
 CTX_SIZE="${CTX_SIZE:-128000}"
+PARALLEL="${PARALLEL:-${N_PARALLEL:-1}}"
 TQKV_PROFILE="${TQKV_PROFILE:-fast}"
 BATCH_SIZE="${BATCH_SIZE:-2048}"
 UBATCH_SIZE="${UBATCH_SIZE:-512}"
 PROMPT_CACHE_MB="${PROMPT_CACHE_MB:-0}"
+KV_UNIFIED="${KV_UNIFIED:-}"
+CACHE_IDLE_SLOTS="${CACHE_IDLE_SLOTS:-}"
+RDNA3_PROFILE_LOG="${RDNA3_PROFILE_LOG:-0}"
+RDNA3_FAIL_ON_HOST_SYNC="${RDNA3_FAIL_ON_HOST_SYNC:-0}"
+RDNA3_DISABLE_QWEN35_TOPK="${RDNA3_DISABLE_QWEN35_TOPK:-0}"
+RDNA3_DISABLE_MOE_COMBINE="${RDNA3_DISABLE_MOE_COMBINE:-0}"
+RDNA3_MOE_MMVQ_RPB="${RDNA3_MOE_MMVQ_RPB:-}"
 
 case "$TQKV_PROFILE" in
     fast)
@@ -90,13 +98,52 @@ else
     fi
 fi
 
+SERVER_EXTRA_ARGS=()
+if [[ "$KV_UNIFIED" == "1" ]]; then
+    SERVER_EXTRA_ARGS+=(--kv-unified)
+elif [[ "$KV_UNIFIED" == "0" ]]; then
+    SERVER_EXTRA_ARGS+=(--no-kv-unified)
+fi
+
+if [[ "$CACHE_IDLE_SLOTS" == "1" ]]; then
+    SERVER_EXTRA_ARGS+=(--cache-idle-slots)
+elif [[ "$CACHE_IDLE_SLOTS" == "0" ]]; then
+    SERVER_EXTRA_ARGS+=(--no-cache-idle-slots)
+fi
+
+if [[ "$RDNA3_PROFILE_LOG" == "1" ]]; then
+    export GGML_CUDA_RDNA3_PROFILE_LOG=1
+fi
+
+if [[ "$RDNA3_FAIL_ON_HOST_SYNC" == "1" ]]; then
+    export GGML_CUDA_RDNA3_FAIL_ON_HOST_SYNC=1
+fi
+
+if [[ "$RDNA3_DISABLE_QWEN35_TOPK" == "1" ]]; then
+    export GGML_CUDA_RDNA3_DISABLE_QWEN35_TOPK=1
+fi
+
+if [[ "$RDNA3_DISABLE_MOE_COMBINE" == "1" ]]; then
+    export GGML_CUDA_RDNA3_DISABLE_MOE_COMBINE=1
+fi
+
+if [[ -n "$RDNA3_MOE_MMVQ_RPB" ]]; then
+    export GGML_CUDA_RDNA3_MOE_MMVQ_RPB="$RDNA3_MOE_MMVQ_RPB"
+fi
+
 echo "Starting TQKV server"
 echo "  model: $MODEL"
 echo "  profile: $TQKV_PROFILE ($PROFILE_NOTE)"
 echo "  cache: K=$CACHE_TYPE_K V=$CACHE_TYPE_V"
 echo "  ctx:   $CTX_SIZE"
+echo "  parallel slots: $PARALLEL"
 echo "  batch: $BATCH_SIZE / ubatch $UBATCH_SIZE"
 echo "  prompt cache RAM: ${PROMPT_CACHE_MB} MiB"
+echo "  rdna3 profile log: $RDNA3_PROFILE_LOG"
+echo "  rdna3 fail on host sync: $RDNA3_FAIL_ON_HOST_SYNC"
+echo "  rdna3 disable qwen35 topk: $RDNA3_DISABLE_QWEN35_TOPK"
+echo "  rdna3 disable moe combine: $RDNA3_DISABLE_MOE_COMBINE"
+echo "  rdna3 moe mmvq rows/block: ${RDNA3_MOE_MMVQ_RPB:-auto}"
 echo "  bin:   $SERVER_BIN"
 echo "  url:   http://$HOST:$PORT"
 
@@ -105,7 +152,7 @@ exec "$SERVER_BIN" \
     -a "$ALIAS" \
     -ngl all \
     -fa on \
-    -np 1 \
+    -np "$PARALLEL" \
     -cb \
     --cache-type-k "$CACHE_TYPE_K" \
     --cache-type-v "$CACHE_TYPE_V" \
@@ -122,4 +169,5 @@ exec "$SERVER_BIN" \
     --cache-ram "$PROMPT_CACHE_MB" \
     --metrics \
     --host "$HOST" \
-    --port "$PORT"
+    --port "$PORT" \
+    "${SERVER_EXTRA_ARGS[@]}"

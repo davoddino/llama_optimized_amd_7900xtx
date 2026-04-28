@@ -4,6 +4,8 @@
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <cstdlib>
+#include <type_traits>
 
 #ifndef GGML_CUDA_RDNA3_MOE_TOP8_MMVQ
 #define GGML_CUDA_RDNA3_MOE_TOP8_MMVQ 1
@@ -708,24 +710,66 @@ static void mul_mat_vec_q_switch_fusion(
 }
 
 template <ggml_type type>
+static void mul_mat_vec_q_moe_launch_rpb(
+        const void * vx, const void * vy, const int32_t * ids, float * dst,
+        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
+        const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
+        const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
+        const uint32_t ncols_dst, const uint32_t ids_stride,
+        const int warp_size, const int nchannels_dst, cudaStream_t stream, const int rows_per_block) {
+
+    auto launch = [&](auto rpb_tag) {
+        constexpr int rpb = decltype(rpb_tag)::value;
+        const int64_t nblocks_rows = (nrows_x + rpb - 1) / rpb;
+        const dim3 block_nums(nblocks_rows, nchannels_dst);
+        const dim3 block_dims(warp_size, ncols_dst);
+
+        mul_mat_vec_q_moe<type, rpb><<<block_nums, block_dims, 0, stream>>>(
+            vx, vy, ids, dst, ncols_x, nchannels_y, nrows_x,
+            stride_row_x, stride_col_y, stride_col_dst,
+            stride_channel_x, stride_channel_y, stride_channel_dst,
+            ncols_dst, ids_stride);
+    };
+
+    switch (rows_per_block) {
+        case 1:
+            launch(std::integral_constant<int, 1>{});
+            break;
+        case 4:
+            launch(std::integral_constant<int, 4>{});
+            break;
+        default:
+            launch(std::integral_constant<int, 2>{});
+            break;
+    }
+}
+
+template <ggml_type type>
 static void mul_mat_vec_q_moe_launch(
         const void * vx, const void * vy, const int32_t * ids, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
         const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
         const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
         const uint32_t ncols_dst, const uint32_t ids_stride,
-        const int warp_size, const int nchannels_dst, cudaStream_t stream) {
+        const int warp_size, const int nchannels_dst, const int cc, cudaStream_t stream) {
 
-    constexpr int rows_per_block = 2; // 2 gives best perf based on tuning
-    const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
-    const dim3 block_nums(nblocks_rows, nchannels_dst);
-    const dim3 block_dims(warp_size, ncols_dst);
+    int rows_per_block = GGML_CUDA_CC_IS_RDNA3(cc) ? 4 : 2;
+    if (const char * env = getenv("GGML_CUDA_RDNA3_MOE_MMVQ_RPB")) {
+        rows_per_block = atoi(env);
+    }
+    if (rows_per_block != 1 && rows_per_block != 2 && rows_per_block != 4) {
+        rows_per_block = GGML_CUDA_CC_IS_RDNA3(cc) ? 4 : 2;
+    }
+    if (getenv("GGML_CUDA_RDNA3_PROFILE_LOG") != nullptr) {
+        GGML_LOG_INFO("%s: MMVQ_MOE type=%s, rows_per_block=%d, nrows=%u, ncols_dst=%u, experts=%d\n",
+                __func__, ggml_type_name(type), rows_per_block, nrows_x, ncols_dst, nchannels_dst);
+    }
 
-    mul_mat_vec_q_moe<type, rows_per_block><<<block_nums, block_dims, 0, stream>>>(
+    mul_mat_vec_q_moe_launch_rpb<type>(
         vx, vy, ids, dst, ncols_x, nchannels_y, nrows_x,
         stride_row_x, stride_col_y, stride_col_dst,
         stride_channel_x, stride_channel_y, stride_channel_dst,
-        ncols_dst, ids_stride);
+        ncols_dst, ids_stride, warp_size, nchannels_dst, stream, rows_per_block);
 }
 
 template <ggml_type type>
@@ -795,13 +839,14 @@ static void mul_mat_vec_q_switch_ncols_dst(
         return use;
     };
 
-    if (has_ids && ncols_dst > 1) {
-        // Multi-token MUL_MAT_ID path - dedicated MoE kernel
+    if (has_ids && !has_fusion) {
+        // MUL_MAT_ID path - dedicated MoE kernel. This is used for both
+        // single-stream decode and microbatched multi-stream decode.
         mul_mat_vec_q_moe_launch<type>(
             vx, vy, ids, dst, ncols_x, nchannels_y_fd, nrows_x,
             stride_row_x, stride_col_y, stride_col_dst,
             stride_channel_x, stride_channel_y, stride_channel_dst,
-            ncols_dst, ids_stride, warp_size, nchannels_dst, stream);
+            ncols_dst, ids_stride, warp_size, nchannels_dst, cc, stream);
         return;
     }
 

@@ -2479,6 +2479,15 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    static const bool log_mmid_path = getenv("GGML_CUDA_RDNA3_PROFILE_LOG") != nullptr;
+
+    auto log_mul_mat_id_path = [&](const char * path) {
+        if (log_mmid_path) {
+            GGML_LOG_INFO("%s: MUL_MAT_ID path=%s: dst=%s, src0_type=%s, experts=%" PRId64
+                    ", expert_used=%" PRId64 ", tokens=%" PRId64 ", out=%" PRId64 "\n",
+                    __func__, path, dst->name, ggml_type_name(src0->type), ne02, ids->ne[0], ne12, ne0);
+        }
+    };
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
@@ -2487,11 +2496,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
+                    log_mul_mat_id_path("MMVQ");
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                     return;
                 }
             } else {
                 if (GGML_CUDA_CC_IS_AMD(cc)) {
+                    log_mul_mat_id_path("MMVF_AMD");
                     ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
                     return;
                 }
@@ -2499,11 +2510,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+            log_mul_mat_id_path("MMQ");
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }
 
         if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+            log_mul_mat_id_path("MMF");
             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
             return;
         }
@@ -2511,6 +2524,23 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     // note: this path should not be reached when recording CUDA graphs, because it requires stream synchronization
     // TODO: add asserts to verify this. should work with CUDA, HIP, etc.
+    static const bool log_mmid_host_sync =
+        getenv("GGML_CUDA_RDNA3_PROFILE_LOG") != nullptr ||
+        getenv("GGML_CUDA_MUL_MAT_ID_FALLBACK_LOG") != nullptr;
+    static const bool fail_mmid_host_sync =
+        getenv("GGML_CUDA_RDNA3_FAIL_ON_HOST_SYNC") != nullptr ||
+        getenv("GGML_CUDA_MUL_MAT_ID_FAIL_ON_HOST_SYNC") != nullptr;
+
+    if (log_mmid_host_sync || fail_mmid_host_sync) {
+        GGML_LOG_WARN("%s: MUL_MAT_ID host-sync fallback: dst=%s, src0_type=%s, experts=%" PRId64
+                ", expert_used=%" PRId64 ", tokens=%" PRId64 ", out=%" PRId64 "\n",
+                __func__, dst->name, ggml_type_name(src0->type), ne02, ids->ne[0], ne12, ne0);
+        if (fail_mmid_host_sync) {
+            GGML_ABORT("%s: blocked MUL_MAT_ID host-sync fallback; unset GGML_CUDA_RDNA3_FAIL_ON_HOST_SYNC to continue",
+                    __func__);
+        }
+    }
+
     cudaStream_t stream = ctx.stream();
 
     GGML_ASSERT(nb12 % nb11 == 0);
@@ -3447,6 +3477,125 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
     return is_ok;
 }
 
+struct ggml_cuda_moe_weighted_sum_fusion_info {
+    const ggml_tensor * experts = nullptr;
+    const ggml_tensor * weights = nullptr;
+    ggml_tensor *       dst     = nullptr;
+    int                 n_nodes = 0;
+};
+
+static bool ggml_cuda_moe_weighted_sum_fusion(
+        const ggml_cgraph * cgraph,
+        const int          node_idx,
+        ggml_cuda_moe_weighted_sum_fusion_info & info) {
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (!GGML_CUDA_CC_IS_RDNA3(cc) || getenv("GGML_CUDA_RDNA3_DISABLE_MOE_COMBINE") != nullptr) {
+        return false;
+    }
+
+    if (node_idx >= cgraph->n_nodes || cgraph->nodes[node_idx]->op != GGML_OP_MUL) {
+        return false;
+    }
+
+    ggml_tensor * weighted = cgraph->nodes[node_idx];
+    if (weighted->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const ggml_tensor * experts = weighted->src[0];
+    const ggml_tensor * weights = weighted->src[1];
+    if (!experts || !weights || experts->type != GGML_TYPE_F32 || weights->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    if (experts->ne[0] == 1 && weights->ne[0] > 1) {
+        std::swap(experts, weights);
+    }
+
+    const int64_t n_embd        = experts->ne[0];
+    const int64_t n_expert_used = experts->ne[1];
+    const int64_t n_tokens      = experts->ne[2];
+
+    if (n_embd <= 0 || n_tokens <= 0 || n_expert_used < 2 || n_expert_used > 8) {
+        return false;
+    }
+
+    if (weights->ne[0] != 1 || weights->ne[1] != n_expert_used || weights->ne[2] != n_tokens) {
+        return false;
+    }
+    if (weighted->ne[0] != n_embd || weighted->ne[1] != n_expert_used || weighted->ne[2] != n_tokens) {
+        return false;
+    }
+
+    const int n_expert_used_i = int(n_expert_used);
+    const int views_start = node_idx + 1;
+    const int adds_start  = views_start + n_expert_used_i;
+    const int last_node   = adds_start + n_expert_used_i - 2;
+    if (last_node >= cgraph->n_nodes) {
+        return false;
+    }
+
+    for (int i = 0; i < n_expert_used_i; ++i) {
+        const ggml_tensor * view = cgraph->nodes[views_start + i];
+        if (view->op != GGML_OP_VIEW || view->src[0] != weighted || view->view_src != weighted) {
+            return false;
+        }
+        if (view->type != GGML_TYPE_F32 || view->ne[0] != n_embd || view->ne[1] != n_tokens) {
+            return false;
+        }
+        if (view->nb[0] != weighted->nb[0] || view->nb[1] != weighted->nb[2]) {
+            return false;
+        }
+        if (view->view_offs != size_t(i)*weighted->nb[1]) {
+            return false;
+        }
+    }
+
+    const ggml_tensor * prev = cgraph->nodes[views_start];
+    for (int i = 1; i < n_expert_used_i; ++i) {
+        ggml_tensor * add = cgraph->nodes[adds_start + i - 1];
+        if (add->op != GGML_OP_ADD || add->src[0] != prev || add->src[1] != cgraph->nodes[views_start + i]) {
+            return false;
+        }
+        if (add->type != GGML_TYPE_F32 || add->ne[0] != n_embd || add->ne[1] != n_tokens) {
+            return false;
+        }
+        prev = add;
+    }
+
+    auto has_later_use = [&](const ggml_tensor * tensor) {
+        for (int i = last_node + 1; i < cgraph->n_nodes; ++i) {
+            for (int isrc = 0; isrc < GGML_MAX_SRC; ++isrc) {
+                if (cgraph->nodes[i]->src[isrc] == tensor) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    if (has_later_use(weighted)) {
+        return false;
+    }
+    for (int i = 0; i < n_expert_used_i; ++i) {
+        if (has_later_use(cgraph->nodes[views_start + i])) {
+            return false;
+        }
+    }
+    for (int i = 0; i < n_expert_used_i - 2; ++i) {
+        if (has_later_use(cgraph->nodes[adds_start + i])) {
+            return false;
+        }
+    }
+
+    info.experts = experts;
+    info.weights = weights;
+    info.dst     = cgraph->nodes[last_node];
+    info.n_nodes = 2*n_expert_used_i;
+
+    return true;
+}
+
 
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
@@ -3869,6 +4018,20 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         ggml_cuda_op_rope_fused(*cuda_ctx, rope, set_rows);
                         i += 2;
                         continue;
+                    }
+
+                    if (node->op == GGML_OP_MUL) {
+                        ggml_cuda_moe_weighted_sum_fusion_info moe_sum;
+                        if (ggml_cuda_moe_weighted_sum_fusion(cgraph, i, moe_sum)) {
+                            if (getenv("GGML_CUDA_RDNA3_PROFILE_LOG") != nullptr) {
+                                GGML_LOG_INFO("%s: MOE_WEIGHTED_SUM_FUSED n_embd=%" PRId64
+                                        ", experts=%" PRId64 ", tokens=%" PRId64 "\n",
+                                        __func__, moe_sum.experts->ne[0], moe_sum.experts->ne[1], moe_sum.experts->ne[2]);
+                            }
+                            ggml_cuda_op_moe_weighted_sum(*cuda_ctx, moe_sum.experts, moe_sum.weights, moe_sum.dst);
+                            i += moe_sum.n_nodes - 1;
+                            continue;
+                        }
                     }
 
                     if (node->op == GGML_OP_ADD || node->op == GGML_OP_MUL) {

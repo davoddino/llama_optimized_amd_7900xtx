@@ -1,4 +1,5 @@
 #include "binbcast.cuh"
+#include <algorithm>
 #include <cstdint>
 #include <utility>
 
@@ -500,6 +501,94 @@ void ggml_cuda_op_fused_mul(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
         default:
             GGML_ASSERT(false && "Unsupported n_fuse value");
     }
+}
+
+static __global__ void k_moe_weighted_sum_f32(
+        const float * __restrict__ experts,
+        const float * __restrict__ weights,
+        float *       __restrict__ dst,
+        const int64_t n_embd,
+        const int64_t n_expert_used,
+        const int64_t n_tokens,
+        const int64_t se0,
+        const int64_t se1,
+        const int64_t se2,
+        const int64_t sw1,
+        const int64_t sw2,
+        const int64_t sd0,
+        const int64_t sd1) {
+    const int64_t total = n_embd * n_tokens;
+    for (int64_t idx = int64_t(blockIdx.x)*blockDim.x + threadIdx.x; idx < total; idx += int64_t(blockDim.x)*gridDim.x) {
+        const int64_t i0 = idx % n_embd;
+        const int64_t it = idx / n_embd;
+
+        const float * expert_row = experts + it*se2 + i0*se0;
+        const float * weight_row = weights  + it*sw2;
+
+        float sum = 0.0f;
+#pragma unroll
+        for (int64_t ie = 0; ie < n_expert_used; ++ie) {
+            sum += expert_row[ie*se1] * weight_row[ie*sw1];
+        }
+
+        dst[it*sd1 + i0*sd0] = sum;
+    }
+}
+
+void ggml_cuda_op_moe_weighted_sum(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * experts,
+        const ggml_tensor * weights,
+        ggml_tensor *       dst) {
+    GGML_ASSERT(experts->type == GGML_TYPE_F32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type     == GGML_TYPE_F32);
+
+    GGML_ASSERT(weights->ne[0] == 1);
+    GGML_ASSERT(experts->ne[1] == weights->ne[1]);
+    GGML_ASSERT(experts->ne[2] == weights->ne[2]);
+    GGML_ASSERT(dst->ne[0]     == experts->ne[0]);
+    GGML_ASSERT(dst->ne[1]     == experts->ne[2]);
+
+    GGML_ASSERT(experts->nb[0] % sizeof(float) == 0);
+    GGML_ASSERT(experts->nb[1] % sizeof(float) == 0);
+    GGML_ASSERT(experts->nb[2] % sizeof(float) == 0);
+    GGML_ASSERT(weights->nb[1] % sizeof(float) == 0);
+    GGML_ASSERT(weights->nb[2] % sizeof(float) == 0);
+    GGML_ASSERT(dst->nb[0]     % sizeof(float) == 0);
+    GGML_ASSERT(dst->nb[1]     % sizeof(float) == 0);
+
+    const int64_t n_embd        = experts->ne[0];
+    const int64_t n_expert_used = experts->ne[1];
+    const int64_t n_tokens      = experts->ne[2];
+
+    const int64_t total = n_embd * n_tokens;
+    if (total == 0) {
+        return;
+    }
+
+    const int id  = ggml_cuda_get_device();
+    const int nsm = ggml_cuda_info().devices[id].nsm;
+
+    constexpr int block_size = 64;
+    const int64_t max_blocks = std::max<int>(1, nsm * 4);
+    const int64_t blocks     = std::min<int64_t>((total + block_size - 1) / block_size, max_blocks);
+    const dim3    block_nums((unsigned int) blocks, 1, 1);
+
+    k_moe_weighted_sum_f32<<<block_nums, block_size, 0, ctx.stream()>>>(
+        (const float *) experts->data,
+        (const float *) weights->data,
+        (float *)       dst->data,
+        n_embd,
+        n_expert_used,
+        n_tokens,
+        experts->nb[0] / sizeof(float),
+        experts->nb[1] / sizeof(float),
+        experts->nb[2] / sizeof(float),
+        weights->nb[1] / sizeof(float),
+        weights->nb[2] / sizeof(float),
+        dst->nb[0]     / sizeof(float),
+        dst->nb[1]     / sizeof(float));
 }
 
 void ggml_cuda_op_repeat_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

@@ -3,7 +3,10 @@
 #include "topk-moe.cuh"
 
 #include <cmath>
+#include <cfloat>
+#include <cstdlib>
 #include <initializer_list>
+#include <type_traits>
 
 // Kernel config struct - passed by value to CUDA kernel
 struct topk_moe_config {
@@ -259,6 +262,111 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
     }
 }
 
+template <int rows_per_block>
+__launch_bounds__(4 * WARP_SIZE, 1)
+static __global__ void topk_moe_qwen35_top8_cuda(const float * __restrict__ logits,
+                                                 float *       __restrict__ weights,
+                                                 int32_t *     __restrict__ ids,
+                                                 const int n_rows,
+                                                 const float scale_val) {
+    constexpr int n_experts        = 256;
+    constexpr int n_expert_used    = 8;
+    constexpr int experts_per_lane = n_experts / WARP_SIZE;
+
+    const int lane = threadIdx.x;
+    const int row  = blockIdx.x * rows_per_block + threadIdx.y;
+
+    if (row >= n_rows) {
+        return;
+    }
+
+    logits  += n_experts * row;
+    weights += n_expert_used * row;
+    ids     += n_experts * row;
+
+    float wt[experts_per_lane];
+
+#pragma unroll
+    for (int i = 0; i < experts_per_lane; ++i) {
+        wt[i] = logits[lane + i * WARP_SIZE];
+        if (__isnanf(wt[i])) {
+            wt[i] = -FLT_MAX;
+        }
+    }
+
+    float selected_val = -INFINITY;
+    int   selected_id  = -1;
+
+#pragma unroll
+    for (int k = 0; k < n_expert_used; ++k) {
+        float max_val    = wt[0];
+        int   max_expert = lane;
+
+#pragma unroll
+        for (int i = 1; i < experts_per_lane; ++i) {
+            const int expert = lane + i * WARP_SIZE;
+            if (wt[i] > max_val) {
+                max_val    = wt[i];
+                max_expert = expert;
+            }
+        }
+
+#pragma unroll
+        for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
+            const float val    = __shfl_xor_sync(0xFFFFFFFF, max_val, mask, WARP_SIZE);
+            const int   expert = __shfl_xor_sync(0xFFFFFFFF, max_expert, mask, WARP_SIZE);
+            if (val > max_val || (val == max_val && expert < max_expert)) {
+                max_val    = val;
+                max_expert = expert;
+            }
+        }
+
+        if ((max_expert & (WARP_SIZE - 1)) == lane) {
+            wt[max_expert / WARP_SIZE] = -INFINITY;
+        }
+
+        if (lane == k) {
+            selected_val = max_val;
+            selected_id  = max_expert;
+        }
+    }
+
+    float selected_weight[1] = { lane < n_expert_used ? selected_val : -INFINITY };
+    softmax_warp_inplace<1, true>(selected_weight, n_expert_used, lane);
+
+    if (lane < n_expert_used) {
+        ids[lane]     = selected_id;
+        weights[lane] = selected_weight[0] * scale_val;
+    }
+}
+
+static void launch_topk_moe_qwen35_top8_cuda(ggml_backend_cuda_context & ctx,
+                                             const float * logits,
+                                             float *       weights,
+                                             int32_t *     ids,
+                                             const int     n_rows,
+                                             const float   scale_val) {
+    if (n_rows <= 0) {
+        return;
+    }
+
+    auto launch = [&](auto rpb_tag) {
+        constexpr int rows_per_block = decltype(rpb_tag)::value;
+        dim3 grid_dims((n_rows + rows_per_block - 1) / rows_per_block, 1, 1);
+        dim3 block_dims(WARP_SIZE, rows_per_block, 1);
+        topk_moe_qwen35_top8_cuda<rows_per_block><<<grid_dims, block_dims, 0, ctx.stream()>>>(
+            logits, weights, ids, n_rows, scale_val);
+    };
+
+    if (n_rows <= 1) {
+        launch(std::integral_constant<int, 1>{});
+    } else if (n_rows == 2) {
+        launch(std::integral_constant<int, 2>{});
+    } else {
+        launch(std::integral_constant<int, 4>{});
+    }
+}
+
 template<bool has_bias>
 static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
                                  const float *               logits,
@@ -362,15 +470,38 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
         clamp_val = ggml_get_op_params_f32(clamp, 0);
     }
 
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    static const bool disable_qwen35_top8 = getenv("GGML_CUDA_RDNA3_DISABLE_QWEN35_TOPK") != nullptr;
+    static const bool log_topk_path = getenv("GGML_CUDA_RDNA3_PROFILE_LOG") != nullptr;
+
+    if (!disable_qwen35_top8 && GGML_CUDA_CC_IS_RDNA3(cc) && !bias &&
+            n_experts == 256 && n_expert_used == 8 && with_norm &&
+            !args.sigmoid && !args.delayed_softmax) {
+        if (log_topk_path) {
+            GGML_LOG_INFO("%s: TOPK_MOE path=RDNA3_QWEN35_TOP8, rows=%d, experts=%d, expert_used=%d\n",
+                    __func__, n_rows, n_experts, n_expert_used);
+        }
+        launch_topk_moe_qwen35_top8_cuda(ctx, logits_d, weights_d, ids_d, n_rows, scale_val);
+        return;
+    }
+
     topk_moe_config config;
     config.use_sigmoid     = args.sigmoid;
     config.with_norm       = with_norm;
     config.delayed_softmax = args.delayed_softmax;
 
     if (bias) {
+        if (log_topk_path) {
+            GGML_LOG_INFO("%s: TOPK_MOE path=GENERIC_BIAS, rows=%d, experts=%d, expert_used=%d\n",
+                    __func__, n_rows, n_experts, n_expert_used);
+        }
         launch_topk_moe_cuda<true>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used, clamp_val,
                              scale_val, config);
     } else {
+        if (log_topk_path) {
+            GGML_LOG_INFO("%s: TOPK_MOE path=GENERIC, rows=%d, experts=%d, expert_used=%d\n",
+                    __func__, n_rows, n_experts, n_expert_used);
+        }
         launch_topk_moe_cuda<false>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used, clamp_val,
                              scale_val, config);
     }
