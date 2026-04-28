@@ -13,6 +13,94 @@
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
+static bool rdna3_mmvq_env_enabled(const char * name) {
+    const char * value = getenv(name);
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+static int rdna3_mmvq_env_i32(const char * name, const int default_value) {
+    const char * value = getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return default_value;
+    }
+
+    char * end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (end == value) {
+        return default_value;
+    }
+
+    return int(parsed);
+}
+
+static bool rdna3_qwen36_fastpath_enabled() {
+    static const bool enabled = rdna3_mmvq_env_enabled("GGML_CUDA_RDNA3_QWEN36_FASTPATH");
+    return enabled;
+}
+
+static bool rdna3_qwen36_moe_decode_shape(
+        const ggml_type type, const int cc, const uint32_t ncols_x, const uint32_t nrows,
+        const uint32_t n_expert_used, const uint32_t ncols_dst) {
+    if (!rdna3_qwen36_fastpath_enabled() || !GGML_CUDA_CC_IS_RDNA3(cc)) {
+        return false;
+    }
+
+    if (ncols_dst != 1 || n_expert_used != 8) {
+        return false;
+    }
+
+    switch (type) {
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            break;
+        default:
+            return false;
+    }
+
+    return ncols_x > 0 && nrows > 0;
+}
+
+static bool rdna3_qwen36_output_decode_shape(
+        const ggml_type type, const int cc, const uint32_t ncols_x, const uint32_t nrows_x,
+        const uint32_t ncols_dst, const bool has_ids, const bool has_fusion) {
+    if (!rdna3_qwen36_fastpath_enabled() || !GGML_CUDA_CC_IS_RDNA3(cc) || has_ids || has_fusion) {
+        return false;
+    }
+
+    if (ncols_dst != 1 || ncols_x == 0 || ncols_x > 4096 || nrows_x < 32768) {
+        return false;
+    }
+
+    switch (type) {
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static int rdna3_mmvq_rows_per_block(
+        const char * env_name, const ggml_type type, const int cc, const uint32_t ncols_x, const uint32_t nrows,
+        const uint32_t n_expert_used, const uint32_t ncols_dst, const int rdna3_default, const int generic_default,
+        const int qwen36_default) {
+    int rows_per_block = GGML_CUDA_CC_IS_RDNA3(cc) ? rdna3_default : generic_default;
+
+    if (rdna3_qwen36_moe_decode_shape(type, cc, ncols_x, nrows, n_expert_used, ncols_dst)) {
+        rows_per_block = qwen36_default;
+    }
+
+    const int selected_default = rows_per_block;
+    rows_per_block = rdna3_mmvq_env_i32(env_name, rows_per_block);
+    if (rows_per_block != 1 && rows_per_block != 2 && rows_per_block != 4 && rows_per_block != 8) {
+        rows_per_block = selected_default;
+    }
+
+    return rows_per_block;
+}
+
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q1_0:    return vec_dot_q1_0_q8_1;
@@ -399,6 +487,9 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
             default:
                 return 1;
         }
+    }
+    if (table_id == MMVQ_PARAMETERS_RDNA4 || table_id == MMVQ_PARAMETERS_RDNA3_0) {
+        return small_k ? nwarps : 1;
     }
     return 1;
 }
@@ -964,16 +1055,13 @@ static void mul_mat_vec_q_moe_launch(
         const uint32_t ncols_dst, const uint32_t ids_stride,
         const int warp_size, const int nchannels_dst, const int cc, cudaStream_t stream) {
 
-    int rows_per_block = GGML_CUDA_CC_IS_RDNA3(cc) ? 4 : 2;
-    if (const char * env = getenv("GGML_CUDA_RDNA3_MOE_MMVQ_RPB")) {
-        rows_per_block = atoi(env);
-    }
-    if (rows_per_block != 1 && rows_per_block != 2 && rows_per_block != 4 && rows_per_block != 8) {
-        rows_per_block = GGML_CUDA_CC_IS_RDNA3(cc) ? 4 : 2;
-    }
+    const int rows_per_block = rdna3_mmvq_rows_per_block(
+        "GGML_CUDA_RDNA3_MOE_MMVQ_RPB", type, cc, ncols_x, nrows_x, nchannels_dst, ncols_dst,
+        /*rdna3_default=*/ 4, /*generic_default=*/ 2, /*qwen36_default=*/ 8);
     if (getenv("GGML_CUDA_RDNA3_PROFILE_LOG") != nullptr) {
-        GGML_LOG_INFO("%s: MMVQ_MOE type=%s, rows_per_block=%d, nrows=%u, ncols_dst=%u, experts=%d\n",
-                __func__, ggml_type_name(type), rows_per_block, nrows_x, ncols_dst, nchannels_dst);
+        GGML_LOG_INFO("%s: MMVQ_MOE type=%s, rows_per_block=%d, nrows=%u, ncols_dst=%u, experts=%d, qwen36_fast=%d\n",
+                __func__, ggml_type_name(type), rows_per_block, nrows_x, ncols_dst, nchannels_dst,
+                rdna3_qwen36_moe_decode_shape(type, cc, ncols_x, nrows_x, nchannels_dst, ncols_dst) ? 1 : 0);
     }
 
     mul_mat_vec_q_moe_launch_rpb<type>(
@@ -1037,16 +1125,13 @@ static void mul_mat_vec_q_moe_weighted_launch(
         const uint32_t n_expert_used, const uint32_t ncols_dst, const uint32_t ids_stride,
         const int warp_size, const int cc, cudaStream_t stream) {
 
-    int rows_per_block = GGML_CUDA_CC_IS_RDNA3(cc) ? 4 : 2;
-    if (const char * env = getenv("GGML_CUDA_RDNA3_MOE_MMVQ_RPB")) {
-        rows_per_block = atoi(env);
-    }
-    if (rows_per_block != 1 && rows_per_block != 2 && rows_per_block != 4 && rows_per_block != 8) {
-        rows_per_block = GGML_CUDA_CC_IS_RDNA3(cc) ? 4 : 2;
-    }
+    const int rows_per_block = rdna3_mmvq_rows_per_block(
+        "GGML_CUDA_RDNA3_MOE_MMVQ_RPB", type, cc, ncols_x, nrows_x, n_expert_used, ncols_dst,
+        /*rdna3_default=*/ 4, /*generic_default=*/ 2, /*qwen36_default=*/ 8);
     if (getenv("GGML_CUDA_RDNA3_PROFILE_LOG") != nullptr) {
-        GGML_LOG_INFO("%s: MMVQ_MOE_WEIGHTED type=%s, rows_per_block=%d, nrows=%u, tokens=%u, experts=%u, scales=%d\n",
-                __func__, ggml_type_name(type), rows_per_block, nrows_x, ncols_dst, n_expert_used, weights1 != nullptr ? 2 : 1);
+        GGML_LOG_INFO("%s: MMVQ_MOE_WEIGHTED type=%s, rows_per_block=%d, nrows=%u, tokens=%u, experts=%u, scales=%d, qwen36_fast=%d\n",
+                __func__, ggml_type_name(type), rows_per_block, nrows_x, ncols_dst, n_expert_used, weights1 != nullptr ? 2 : 1,
+                rdna3_qwen36_moe_decode_shape(type, cc, ncols_x, nrows_x, n_expert_used, ncols_dst) ? 1 : 0);
     }
 
     if (weights1 != nullptr) {
@@ -1116,16 +1201,13 @@ static void mul_mat_vec_q_moe_gate_up_launch(
         const uint32_t n_expert_used, const uint32_t ncols_dst, const uint32_t ids_stride,
         const int warp_size, const int cc, cudaStream_t stream) {
 
-    int rows_per_block = GGML_CUDA_CC_IS_RDNA3(cc) ? 2 : 1;
-    if (const char * env = getenv("GGML_CUDA_RDNA3_MOE_GATE_UP_RPB")) {
-        rows_per_block = atoi(env);
-    }
-    if (rows_per_block != 1 && rows_per_block != 2 && rows_per_block != 4 && rows_per_block != 8) {
-        rows_per_block = GGML_CUDA_CC_IS_RDNA3(cc) ? 2 : 1;
-    }
+    const int rows_per_block = rdna3_mmvq_rows_per_block(
+        "GGML_CUDA_RDNA3_MOE_GATE_UP_RPB", type, cc, ncols_x, nrows_dst, n_expert_used, ncols_dst,
+        /*rdna3_default=*/ 2, /*generic_default=*/ 1, /*qwen36_default=*/ 4);
     if (getenv("GGML_CUDA_RDNA3_PROFILE_LOG") != nullptr) {
-        GGML_LOG_INFO("%s: MMVQ_MOE_GATE_UP type=%s, rows_per_block=%d, nrows=%u, tokens=%u, experts=%u, scale=%d\n",
-                __func__, ggml_type_name(type), rows_per_block, nrows_dst, ncols_dst, n_expert_used, scale != nullptr ? 1 : 0);
+        GGML_LOG_INFO("%s: MMVQ_MOE_GATE_UP type=%s, rows_per_block=%d, nrows=%u, tokens=%u, experts=%u, scale=%d, qwen36_fast=%d\n",
+                __func__, ggml_type_name(type), rows_per_block, nrows_dst, ncols_dst, n_expert_used, scale != nullptr ? 1 : 0,
+                rdna3_qwen36_moe_decode_shape(type, cc, ncols_x, nrows_dst, n_expert_used, ncols_dst) ? 1 : 0);
     }
 
     if (scale != nullptr) {
@@ -1189,16 +1271,13 @@ static void mul_mat_vec_q_moe_gate_up_split_launch(
         const uint32_t n_expert_used, const uint32_t ncols_dst, const uint32_t ids_stride,
         const int warp_size, const int cc, cudaStream_t stream) {
 
-    int rows_per_block = GGML_CUDA_CC_IS_RDNA3(cc) ? 2 : 1;
-    if (const char * env = getenv("GGML_CUDA_RDNA3_MOE_GATE_UP_RPB")) {
-        rows_per_block = atoi(env);
-    }
-    if (rows_per_block != 1 && rows_per_block != 2 && rows_per_block != 4 && rows_per_block != 8) {
-        rows_per_block = GGML_CUDA_CC_IS_RDNA3(cc) ? 2 : 1;
-    }
+    const int rows_per_block = rdna3_mmvq_rows_per_block(
+        "GGML_CUDA_RDNA3_MOE_GATE_UP_RPB", type, cc, ncols_x, nrows_dst, n_expert_used, ncols_dst,
+        /*rdna3_default=*/ 2, /*generic_default=*/ 1, /*qwen36_default=*/ 4);
     if (getenv("GGML_CUDA_RDNA3_PROFILE_LOG") != nullptr) {
-        GGML_LOG_INFO("%s: MMVQ_MOE_GATE_UP_SPLIT type=%s, rows_per_block=%d, nrows=%u, tokens=%u, experts=%u\n",
-                __func__, ggml_type_name(type), rows_per_block, nrows_dst, ncols_dst, n_expert_used);
+        GGML_LOG_INFO("%s: MMVQ_MOE_GATE_UP_SPLIT type=%s, rows_per_block=%d, nrows=%u, tokens=%u, experts=%u, qwen36_fast=%d\n",
+                __func__, ggml_type_name(type), rows_per_block, nrows_dst, ncols_dst, n_expert_used,
+                rdna3_qwen36_moe_decode_shape(type, cc, ncols_x, nrows_dst, n_expert_used, ncols_dst) ? 1 : 0);
     }
 
     mul_mat_vec_q_moe_gate_up_split_launch_rpb<type>(
@@ -1290,6 +1369,18 @@ static void mul_mat_vec_q_switch_ncols_dst(
             constexpr int c_ncols_dst = 1;
 
             bool use_small_k = should_use_small_k(c_ncols_dst);
+            const bool qwen36_output_fast =
+                rdna3_qwen36_output_decode_shape(type, cc, ncols_x, nrows_x, ncols_dst, has_ids, has_fusion);
+            if (qwen36_output_fast) {
+                use_small_k = true;
+            }
+
+            if (qwen36_output_fast && rdna3_mmvq_env_enabled("GGML_CUDA_RDNA3_PROFILE_LOG")) {
+                const int nwarps = calc_nwarps(type, c_ncols_dst, table_id);
+                const int rows_per_block = calc_rows_per_block(c_ncols_dst, table_id, use_small_k, nwarps);
+                GGML_LOG_INFO("%s: MMVQ_OUTPUT_QWEN36_FAST type=%s, rows_per_block=%d, nrows=%d, ncols_x=%d, nwarps=%d\n",
+                        __func__, ggml_type_name(type), rows_per_block, nrows_x, ncols_x, nwarps);
+            }
 
             if (use_small_k) {
                 std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,

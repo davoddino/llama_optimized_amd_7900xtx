@@ -6,6 +6,8 @@
 #include "fattn-wmma-f16.cuh"
 #include "fattn.cuh"
 
+#include <cstdlib>
+
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -332,6 +334,39 @@ static bool ggml_cuda_fattn_type_is_tqkv(ggml_type type) {
            type == GGML_TYPE_TQKV_3_5_IP || type == GGML_TYPE_TQKV_4_0_IP;
 }
 
+static bool ggml_cuda_fattn_env_enabled(const char * name) {
+    const char * value = getenv(name);
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+static int64_t ggml_cuda_fattn_env_i64(const char * name, const int64_t default_value) {
+    const char * value = getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return default_value;
+    }
+
+    char * end = nullptr;
+    const int64_t parsed = std::strtoll(value, &end, 10);
+    if (end == value) {
+        return default_value;
+    }
+
+    return parsed;
+}
+
+static bool ggml_cuda_rdna3_tqkv_fattn_force_tile(const int cc, const ggml_tensor * Q, const ggml_tensor * K) {
+    if (!GGML_CUDA_CC_IS_RDNA3(cc) || Q->ne[1] > 2) {
+        return false;
+    }
+
+    if (ggml_cuda_fattn_env_enabled("GGML_CUDA_RDNA3_TQKV_FATTN_TILE")) {
+        return true;
+    }
+
+    const int64_t min_ctx = ggml_cuda_fattn_env_i64("GGML_CUDA_RDNA3_TQKV_FATTN_TILE_MIN_CTX", -1);
+    return min_ctx >= 0 && K->ne[1] >= min_ctx;
+}
+
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
@@ -445,7 +480,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         if (K->type != V->type) {
             return BEST_FATTN_KERNEL_NONE;
         }
-        return can_use_vector_kernel && Q->ne[1] <= 2 ? BEST_FATTN_KERNEL_VEC : BEST_FATTN_KERNEL_TILE;
+
+        if (can_use_vector_kernel && Q->ne[1] <= 2 && !ggml_cuda_rdna3_tqkv_fattn_force_tile(cc, Q, K)) {
+            return BEST_FATTN_KERNEL_VEC;
+        }
+
+        return BEST_FATTN_KERNEL_TILE;
     }
 
     // If Turing tensor cores are available, use them:
@@ -548,6 +588,37 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         }
     }
     return BEST_FATTN_KERNEL_TILE;
+}
+
+static const char * ggml_cuda_fattn_kernel_name(const best_fattn_kernel kernel, const bool tqkv) {
+    switch (kernel) {
+        case BEST_FATTN_KERNEL_NONE:
+            return "FLASH_ATTN_NONE";
+        case BEST_FATTN_KERNEL_TILE:
+            return tqkv ? "FLASH_ATTN_TQKV_TILE" : "FLASH_ATTN_TILE";
+        case BEST_FATTN_KERNEL_VEC:
+            return tqkv ? "FLASH_ATTN_TQKV_VEC" : "FLASH_ATTN_VEC";
+        case BEST_FATTN_KERNEL_WMMA_F16:
+            return "FLASH_ATTN_WMMA_F16";
+        case BEST_FATTN_KERNEL_MMA_F16:
+            return "FLASH_ATTN_MMA_F16";
+    }
+
+    return "FLASH_ATTN_UNKNOWN";
+}
+
+const char * ggml_cuda_flash_attn_ext_kernel_name(int device, const ggml_tensor * dst) {
+#ifndef FLASH_ATTN_AVAILABLE
+    GGML_UNUSED(device); GGML_UNUSED(dst);
+    return "FLASH_ATTN_UNAVAILABLE";
+#else
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const bool tqkv = (K != nullptr && ggml_cuda_fattn_type_is_tqkv(K->type)) ||
+        (V != nullptr && ggml_cuda_fattn_type_is_tqkv(V->type));
+
+    return ggml_cuda_fattn_kernel_name(ggml_cuda_get_best_fattn_kernel(device, dst), tqkv);
+#endif // FLASH_ATTN_AVAILABLE
 }
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

@@ -118,6 +118,8 @@ struct ggml_cuda_rdna3_op_profile_state {
 };
 
 static thread_local ggml_cuda_rdna3_op_profile_state * ggml_cuda_rdna3_op_profile_current = nullptr;
+class ggml_cuda_rdna3_op_timer;
+static thread_local ggml_cuda_rdna3_op_timer * ggml_cuda_rdna3_op_timer_current = nullptr;
 
 static bool ggml_cuda_rdna3_op_profile_enabled(const int device) {
     return ggml_cuda_env_enabled("GGML_CUDA_RDNA3_OP_PROFILE") &&
@@ -129,8 +131,59 @@ static bool ggml_cuda_rdna3_graph_log_enabled(const int device) {
         GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[device].cc);
 }
 
+static bool ggml_cuda_rdna3_qwen36_fastpath_enabled(const int device) {
+    return ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_FASTPATH") &&
+        GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[device].cc);
+}
+
+static bool ggml_cuda_rdna3_qwen36_moe_decode_shape(const ggml_tensor * src0, const ggml_tensor * ids, const int64_t n_tokens) {
+    if (src0 == nullptr || ids == nullptr || ids->type != GGML_TYPE_I32 || ids->ne[0] != 8 || n_tokens != 1) {
+        return false;
+    }
+
+    switch (src0->type) {
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static bool ggml_cuda_rdna3_tensor_name_starts_with(const ggml_tensor * tensor, const char * prefix) {
     return tensor != nullptr && std::strncmp(tensor->name, prefix, std::strlen(prefix)) == 0;
+}
+
+static bool ggml_cuda_rdna3_qwen36_output_decode_shape(
+        const int device, const ggml_tensor * src0, const ggml_tensor * dst) {
+    if (!ggml_cuda_rdna3_qwen36_fastpath_enabled(device) || src0 == nullptr || dst == nullptr ||
+            !ggml_cuda_rdna3_tensor_name_starts_with(dst, "result_output") || dst->ne[1] != 1 ||
+            src0->ne[0] <= 0 || src0->ne[0] > 4096 || src0->ne[1] < 32768) {
+        return false;
+    }
+
+    switch (src0->type) {
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool ggml_cuda_rdna3_qwen36_topk_moe_decode_shape(
+        const int device, const ggml_tensor * logits, const ggml_tensor * weights, const ggml_tensor * ids,
+        const ggml_tensor * bias, const ggml_cuda_topk_moe_args & args) {
+    if (!ggml_cuda_rdna3_qwen36_fastpath_enabled(device) || logits == nullptr || weights == nullptr ||
+            ids == nullptr || bias != nullptr) {
+        return false;
+    }
+
+    return logits->type == GGML_TYPE_F32 && weights->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 &&
+        logits->ne[0] == 256 && logits->ne[1] == 1 && weights->ne[1] == 8 &&
+        args.norm && !args.sigmoid && !args.delayed_softmax && !args.prob_bias;
 }
 
 static int64_t ggml_cuda_rdna3_named_tensor_n_tokens(const ggml_tensor * tensor) {
@@ -237,6 +290,7 @@ public:
         CUDA_CHECK(cudaEventCreateWithFlags(&stop, 0));
         CUDA_CHECK(cudaEventRecord(start, ctx->stream()));
         active = true;
+        ggml_cuda_rdna3_op_timer_current = this;
     }
 
     ~ggml_cuda_rdna3_op_timer() {
@@ -264,6 +318,10 @@ public:
         record.calls++;
         record.total_ms += elapsed_ms;
         record.max_ms = std::max(record.max_ms, elapsed_ms);
+
+        if (ggml_cuda_rdna3_op_timer_current == this) {
+            ggml_cuda_rdna3_op_timer_current = nullptr;
+        }
     }
 
     void set_path(const char * path_) {
@@ -278,6 +336,12 @@ private:
     cudaEvent_t stop = nullptr;
     bool active = false;
 };
+
+static void ggml_cuda_rdna3_op_profile_set_path(const char * path) {
+    if (ggml_cuda_rdna3_op_timer_current != nullptr) {
+        ggml_cuda_rdna3_op_timer_current->set_path(path);
+    }
+}
 
 static void ggml_cuda_rdna3_op_profile_print(const ggml_cuda_rdna3_op_profile_state & profile, const int64_t n_tokens) {
     if (profile.records.empty()) {
@@ -2667,24 +2731,34 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (!split && use_mul_mat_vec_f) {
         // the custom F16 vector kernel can be used over batched cuBLAS GEMM
         // but this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
+        ggml_cuda_rdna3_op_profile_set_path("MUL_MAT_VEC_F");
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
     } else if (!split && use_mul_mat_f) {
+        ggml_cuda_rdna3_op_profile_set_path("MUL_MAT_F");
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
     } else if (!split && use_mul_mat_vec_q) {
+        const bool qwen36_output_fast = ggml_cuda_rdna3_qwen36_output_decode_shape(ctx.device, src0, dst);
+        ggml_cuda_rdna3_op_profile_set_path(qwen36_output_fast ? "QWEN36_OUTPUT_MMVQ_FAST" : "MUL_MAT_VEC_Q");
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
     } else if (!split && use_mul_mat_q) {
+        ggml_cuda_rdna3_op_profile_set_path("MUL_MAT_Q");
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
     } else if (!split && (use_batched_cublas_f16 || use_batched_cublas_bf16 || use_batched_cublas_f32)
         && !ggml_is_transposed(src0) && !ggml_is_transposed(src1) && src1->ne[2]*src1->ne[3] > 1) {
         // general KQ + KQV multi-batch without FlashAttention
+        ggml_cuda_rdna3_op_profile_set_path("MUL_MAT_BATCHED_CUBLAS");
         ggml_cuda_mul_mat_batched_cublas(ctx, src0, src1, dst);
     } else if (use_mul_mat_vec_f) {
+        ggml_cuda_rdna3_op_profile_set_path("MUL_MAT_SPLIT_VEC_F");
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_vec_f, nullptr);
     } else if (use_mul_mat_vec_q) {
+        ggml_cuda_rdna3_op_profile_set_path("MUL_MAT_SPLIT_VEC_Q");
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_vec_q, quantize_row_q8_1_cuda);
     } else if (use_mul_mat_q) {
+        ggml_cuda_rdna3_op_profile_set_path("MUL_MAT_SPLIT_Q");
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_q, quantize_mmq_q8_1_cuda);
     } else {
+        ggml_cuda_rdna3_op_profile_set_path("MUL_MAT_CUBLAS");
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_cublas, nullptr);
     }
 }
@@ -3169,6 +3243,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_argsort(ctx, dst);
             break;
         case GGML_OP_FLASH_ATTN_EXT:
+            ggml_cuda_rdna3_op_profile_set_path(ggml_cuda_flash_attn_ext_kernel_name(ctx.device, dst));
             ggml_cuda_flash_attn_ext(ctx, dst);
             break;
         case GGML_OP_CROSS_ENTROPY_LOSS:
@@ -4627,7 +4702,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                                     ggml_cuda_should_use_topk_moe(node, logits, weights, ids) &&
                                     ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/ true)) {
-                                    op_timer.set_path("TOPK_MOE_FUSED");
+                                    const bool qwen36_topk_fast = ggml_cuda_rdna3_qwen36_topk_moe_decode_shape(
+                                        cuda_ctx->device, logits, weights, ids, bias, args);
+                                    op_timer.set_path(qwen36_topk_fast ? "QWEN36_TOPK_MOE_FUSED" : "TOPK_MOE_FUSED");
                                     ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
                                     i += ops.size() - 1;
                                     continue;
@@ -4672,7 +4749,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                         __func__, ggml_type_name(moe_gate_up.src0->type), moe_gate_up.dst->ne[0], moe_gate_up.ids->ne[0],
                                         moe_gate_up.dst->ne[2], moe_gate_up.scale != nullptr ? 1 : 0);
                             }
-                            op_timer.set_path("MOE_GATE_UP_MMVQ_SWIGLU_FUSED");
+                            const bool qwen36_fast = ggml_cuda_rdna3_qwen36_fastpath_enabled(cuda_ctx->device) &&
+                                ggml_cuda_rdna3_qwen36_moe_decode_shape(moe_gate_up.src0, moe_gate_up.ids, moe_gate_up.dst->ne[2]);
+                            op_timer.set_path(qwen36_fast ?
+                                    "QWEN36_MOE_GATE_UP_MMVQ_SWIGLU_FUSED" : "MOE_GATE_UP_MMVQ_SWIGLU_FUSED");
                             ggml_cuda_mul_mat_vec_q_moe_gate_up(*cuda_ctx, moe_gate_up.src0, moe_gate_up.src1, moe_gate_up.ids,
                                     moe_gate_up.scale, moe_gate_up.dst);
                             i += moe_gate_up.n_nodes - 1;
@@ -4687,7 +4767,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                         __func__, ggml_type_name(moe_down.src0->type), moe_down.dst->ne[0], moe_down.ids->ne[0],
                                         moe_down.dst->ne[1], moe_down.weights1 != nullptr ? 2 : 1);
                             }
-                            op_timer.set_path("MOE_DOWN_WEIGHTED_MMVQ_FUSED");
+                            const bool qwen36_fast = ggml_cuda_rdna3_qwen36_fastpath_enabled(cuda_ctx->device) &&
+                                ggml_cuda_rdna3_qwen36_moe_decode_shape(moe_down.src0, moe_down.ids, moe_down.src1->ne[2]);
+                            op_timer.set_path(qwen36_fast ?
+                                    "QWEN36_MOE_DOWN_WEIGHTED_MMVQ_FUSED" : "MOE_DOWN_WEIGHTED_MMVQ_FUSED");
                             ggml_cuda_mul_mat_vec_q_moe_weighted(*cuda_ctx, moe_down.src0, moe_down.src1, moe_down.ids,
                                     moe_down.weights0, moe_down.weights1, moe_down.dst);
                             i += moe_down.n_nodes - 1;
@@ -4854,7 +4937,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                             ", experts=%" PRId64 ", tokens=%" PRId64 "\n",
                                             __func__, ggml_type_name(src0->type), glu->ne[0], ids->ne[0], glu->ne[2]);
                                 }
-                                op_timer.set_path("MOE_GATE_UP_SPLIT_MMVQ_SWIGLU_FUSED");
+                                const bool qwen36_fast = ggml_cuda_rdna3_qwen36_fastpath_enabled(cuda_ctx->device) &&
+                                    ggml_cuda_rdna3_qwen36_moe_decode_shape(src0, ids, glu->ne[2]);
+                                op_timer.set_path(qwen36_fast ?
+                                        "QWEN36_MOE_GATE_UP_SPLIT_MMVQ_SWIGLU_FUSED" : "MOE_GATE_UP_SPLIT_MMVQ_SWIGLU_FUSED");
                                 ggml_cuda_mul_mat_vec_q_moe_gate_up_split(*cuda_ctx, gate->src[0], up->src[0], src1, ids, glu);
                                 fused_mul_mat_vec = true;
                                 fused_node_count = 3;
@@ -5114,9 +5200,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     if (rdna3_graph_log) {
-        GGML_LOG_INFO("%s: RDNA3 graph support compiled=1 env_disabled=%d arch_disabled=%d op_profile=%d nodes=%d uid=%" PRIu64 "\n",
+        GGML_LOG_INFO("%s: RDNA3 graph support compiled=1 env_disabled=%d arch_disabled=%d op_profile=%d qwen36_fast=%d nodes=%d uid=%" PRIu64 "\n",
                 __func__, ggml_cuda_env_enabled("GGML_CUDA_DISABLE_GRAPHS") ? 1 : 0,
-                graph->disable_due_to_gpu_arch ? 1 : 0, rdna3_op_profile_this_eval ? 1 : 0, cgraph->n_nodes, cgraph->uid);
+                graph->disable_due_to_gpu_arch ? 1 : 0, rdna3_op_profile_this_eval ? 1 : 0,
+                ggml_cuda_rdna3_qwen36_fastpath_enabled(cuda_ctx->device) ? 1 : 0, cgraph->n_nodes, cgraph->uid);
     }
 
     if (graph->is_enabled() && !rdna3_op_profile_this_eval) {

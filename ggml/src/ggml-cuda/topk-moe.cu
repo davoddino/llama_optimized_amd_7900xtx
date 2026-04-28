@@ -15,6 +15,46 @@ struct topk_moe_config {
     bool delayed_softmax;
 };
 
+static bool topk_moe_env_enabled(const char * name) {
+    const char * value = getenv(name);
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+static int topk_moe_env_i32(const char * name, const int default_value) {
+    const char * value = getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return default_value;
+    }
+
+    char * end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (end == value) {
+        return default_value;
+    }
+
+    return int(parsed);
+}
+
+static bool topk_moe_qwen36_fastpath_enabled() {
+    static const bool enabled = topk_moe_env_enabled("GGML_CUDA_RDNA3_QWEN36_FASTPATH");
+    return enabled;
+}
+
+static int topk_moe_qwen_top8_rows_per_block(const int n_rows) {
+    const int default_rows_per_block = n_rows <= 1 ? 1 : (n_rows == 2 ? 2 : 4);
+    const int rows_per_block =
+        topk_moe_env_i32("GGML_CUDA_RDNA3_QWEN36_TOPK_RPB", default_rows_per_block);
+
+    switch (rows_per_block) {
+        case 1:
+        case 2:
+        case 4:
+            return rows_per_block;
+        default:
+            return default_rows_per_block;
+    }
+}
+
 // Warp-local softmax used for both the pre-top-k logits and the post-top-k delayed path.
 template <int experts_per_thread, bool use_limit>
 __device__ void softmax_warp_inplace(float (&vals)[experts_per_thread], const int limit, const int lane) {
@@ -264,11 +304,11 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
 
 template <int rows_per_block>
 __launch_bounds__(4 * WARP_SIZE, 1)
-static __global__ void topk_moe_qwen35_top8_cuda(const float * __restrict__ logits,
-                                                 float *       __restrict__ weights,
-                                                 int32_t *     __restrict__ ids,
-                                                 const int n_rows,
-                                                 const float scale_val) {
+static __global__ void topk_moe_qwen_top8_cuda(const float * __restrict__ logits,
+                                               float *       __restrict__ weights,
+                                               int32_t *     __restrict__ ids,
+                                               const int n_rows,
+                                               const float scale_val) {
     constexpr int n_experts        = 256;
     constexpr int n_expert_used    = 8;
     constexpr int experts_per_lane = n_experts / WARP_SIZE;
@@ -340,12 +380,12 @@ static __global__ void topk_moe_qwen35_top8_cuda(const float * __restrict__ logi
     }
 }
 
-static void launch_topk_moe_qwen35_top8_cuda(ggml_backend_cuda_context & ctx,
-                                             const float * logits,
-                                             float *       weights,
-                                             int32_t *     ids,
-                                             const int     n_rows,
-                                             const float   scale_val) {
+static void launch_topk_moe_qwen_top8_cuda(ggml_backend_cuda_context & ctx,
+                                           const float * logits,
+                                           float *       weights,
+                                           int32_t *     ids,
+                                           const int     n_rows,
+                                           const float   scale_val) {
     if (n_rows <= 0) {
         return;
     }
@@ -354,16 +394,23 @@ static void launch_topk_moe_qwen35_top8_cuda(ggml_backend_cuda_context & ctx,
         constexpr int rows_per_block = decltype(rpb_tag)::value;
         dim3 grid_dims((n_rows + rows_per_block - 1) / rows_per_block, 1, 1);
         dim3 block_dims(WARP_SIZE, rows_per_block, 1);
-        topk_moe_qwen35_top8_cuda<rows_per_block><<<grid_dims, block_dims, 0, ctx.stream()>>>(
+        topk_moe_qwen_top8_cuda<rows_per_block><<<grid_dims, block_dims, 0, ctx.stream()>>>(
             logits, weights, ids, n_rows, scale_val);
     };
 
-    if (n_rows <= 1) {
-        launch(std::integral_constant<int, 1>{});
-    } else if (n_rows == 2) {
-        launch(std::integral_constant<int, 2>{});
-    } else {
-        launch(std::integral_constant<int, 4>{});
+    switch (topk_moe_qwen_top8_rows_per_block(n_rows)) {
+        case 1:
+            launch(std::integral_constant<int, 1>{});
+            break;
+        case 2:
+            launch(std::integral_constant<int, 2>{});
+            break;
+        case 4:
+            launch(std::integral_constant<int, 4>{});
+            break;
+        default:
+            GGML_ASSERT(false && "invalid Qwen top-k rows_per_block");
+            break;
     }
 }
 
@@ -471,17 +518,21 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
     }
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    static const bool disable_qwen35_top8 = getenv("GGML_CUDA_RDNA3_DISABLE_QWEN35_TOPK") != nullptr;
+    static const bool disable_qwen_top8 =
+        topk_moe_env_enabled("GGML_CUDA_RDNA3_DISABLE_QWEN_TOPK") ||
+        topk_moe_env_enabled("GGML_CUDA_RDNA3_DISABLE_QWEN35_TOPK");
     static const bool log_topk_path = getenv("GGML_CUDA_RDNA3_PROFILE_LOG") != nullptr;
 
-    if (!disable_qwen35_top8 && GGML_CUDA_CC_IS_RDNA3(cc) && !bias &&
+    if (!disable_qwen_top8 && GGML_CUDA_CC_IS_RDNA3(cc) && !bias &&
             n_experts == 256 && n_expert_used == 8 && with_norm &&
             !args.sigmoid && !args.delayed_softmax) {
         if (log_topk_path) {
-            GGML_LOG_INFO("%s: TOPK_MOE path=RDNA3_QWEN35_TOP8, rows=%d, experts=%d, expert_used=%d\n",
-                    __func__, n_rows, n_experts, n_expert_used);
+            GGML_LOG_INFO("%s: TOPK_MOE path=%s, rows=%d, rows_per_block=%d, experts=%d, expert_used=%d\n",
+                    __func__,
+                    topk_moe_qwen36_fastpath_enabled() ? "RDNA3_QWEN36_TOP8" : "RDNA3_QWEN_TOP8",
+                    n_rows, topk_moe_qwen_top8_rows_per_block(n_rows), n_experts, n_expert_used);
         }
-        launch_topk_moe_qwen35_top8_cuda(ctx, logits_d, weights_d, ids_d, n_rows, scale_val);
+        launch_topk_moe_qwen_top8_cuda(ctx, logits_d, weights_d, ids_d, n_rows, scale_val);
         return;
     }
 
