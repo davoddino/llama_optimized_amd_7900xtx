@@ -206,59 +206,63 @@ static int64_t ggml_cuda_rdna3_named_tensor_n_tokens(const ggml_tensor * tensor)
     return -1;
 }
 
+static void ggml_cuda_rdna3_graph_n_tokens_update(int64_t & n_tokens, const int64_t candidate) {
+    if (candidate > n_tokens) {
+        n_tokens = candidate;
+    }
+}
+
+static void ggml_cuda_rdna3_graph_n_tokens_update_named(int64_t & n_tokens, const ggml_tensor * tensor) {
+    ggml_cuda_rdna3_graph_n_tokens_update(n_tokens, ggml_cuda_rdna3_named_tensor_n_tokens(tensor));
+}
+
+static void ggml_cuda_rdna3_graph_n_tokens_update_node(int64_t & n_tokens, const ggml_tensor * node) {
+    if (node == nullptr) {
+        return;
+    }
+
+    ggml_cuda_rdna3_graph_n_tokens_update_named(n_tokens, node);
+
+    if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+        const ggml_tensor * q = node->src[0];
+        if (q != nullptr) {
+            ggml_cuda_rdna3_graph_n_tokens_update(n_tokens, q->ne[1]);
+        }
+    }
+
+    if (node->op == GGML_OP_MUL_MAT_ID) {
+        const ggml_tensor * src1 = node->src[1];
+        if (src1 != nullptr) {
+            ggml_cuda_rdna3_graph_n_tokens_update(n_tokens, src1->ne[2]);
+        }
+        ggml_cuda_rdna3_graph_n_tokens_update(n_tokens, node->ne[2]);
+    }
+}
+
 static int64_t ggml_cuda_rdna3_graph_n_tokens(const ggml_cgraph * cgraph) {
+    int64_t n_tokens = -1;
+
     if (const ggml_tensor * inp_tokens = ggml_graph_get_tensor(cgraph, "inp_tokens")) {
-        return inp_tokens->ne[0];
+        ggml_cuda_rdna3_graph_n_tokens_update(n_tokens, inp_tokens->ne[0]);
     }
 
     if (const ggml_tensor * inp_embd = ggml_graph_get_tensor(cgraph, "inp_embd")) {
-        return inp_embd->ne[1];
+        ggml_cuda_rdna3_graph_n_tokens_update(n_tokens, inp_embd->ne[1]);
     }
 
     if (const ggml_tensor * attn_scale = ggml_graph_get_tensor(cgraph, "attn_scale")) {
-        return attn_scale->ne[2];
+        ggml_cuda_rdna3_graph_n_tokens_update(n_tokens, attn_scale->ne[2]);
     }
 
     for (int i = 0; i < cgraph->n_leafs; ++i) {
-        const int64_t n_tokens = ggml_cuda_rdna3_named_tensor_n_tokens(cgraph->leafs[i]);
-        if (n_tokens > 0) {
-            return n_tokens;
-        }
+        ggml_cuda_rdna3_graph_n_tokens_update_named(n_tokens, cgraph->leafs[i]);
     }
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
-        const ggml_tensor * node = cgraph->nodes[i];
-        if (node == nullptr) {
-            continue;
-        }
-
-        const int64_t n_tokens = ggml_cuda_rdna3_named_tensor_n_tokens(node);
-        if (n_tokens > 0) {
-            return n_tokens;
-        }
-
-        if (node->op == GGML_OP_FLASH_ATTN_EXT) {
-            const ggml_tensor * q = node->src[0];
-            if (q != nullptr && q->ne[1] > 0) {
-                return q->ne[1];
-            }
-            if (node->ne[2] > 0) {
-                return node->ne[2];
-            }
-        }
-
-        if (node->op == GGML_OP_MUL_MAT_ID) {
-            const ggml_tensor * src1 = node->src[1];
-            if (src1 != nullptr && src1->ne[2] > 0) {
-                return src1->ne[2];
-            }
-            if (node->ne[2] > 0) {
-                return node->ne[2];
-            }
-        }
+        ggml_cuda_rdna3_graph_n_tokens_update_node(n_tokens, cgraph->nodes[i]);
     }
 
-    return -1;
+    return n_tokens;
 }
 
 static bool ggml_cuda_rdna3_op_profile_should_run(const ggml_cgraph * cgraph, int64_t * n_tokens) {
