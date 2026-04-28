@@ -3606,6 +3606,15 @@ struct ggml_cuda_moe_down_weighted_fusion_info {
     int                 n_nodes  = 0;
 };
 
+struct ggml_cuda_moe_gate_up_fusion_info {
+    const ggml_tensor * src0    = nullptr;
+    const ggml_tensor * src1    = nullptr;
+    const ggml_tensor * ids     = nullptr;
+    const ggml_tensor * scale   = nullptr;
+    ggml_tensor *       dst     = nullptr;
+    int                 n_nodes = 0;
+};
+
 struct ggml_cuda_moe_weighted_tail_info {
     ggml_tensor * dst     = nullptr;
     int           n_nodes = 0;
@@ -3711,6 +3720,130 @@ static bool ggml_cuda_moe_weighted_sum_tail(
     tail.dst     = cgraph->nodes[last_node];
     tail.n_nodes = 2*n_expert_used;
     tail.last    = last_node;
+    return true;
+}
+
+static bool ggml_cuda_moe_gate_up_fusion(
+        const ggml_cgraph * cgraph,
+        const int           node_idx,
+        ggml_cuda_moe_gate_up_fusion_info & info) {
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (!GGML_CUDA_CC_IS_RDNA3(cc) || getenv("GGML_CUDA_RDNA3_DISABLE_MOE_GATE_UP_FUSED") != nullptr) {
+        return false;
+    }
+
+    if (node_idx >= cgraph->n_nodes || cgraph->nodes[node_idx]->op != GGML_OP_MUL_MAT_ID) {
+        return false;
+    }
+
+    ggml_tensor * gate_up = cgraph->nodes[node_idx];
+    const ggml_tensor * src0 = gate_up->src[0];
+    const ggml_tensor * src1 = gate_up->src[1];
+    const ggml_tensor * ids  = gate_up->src[2];
+
+    if (!src0 || !src1 || !ids || src1->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 || gate_up->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    switch (src0->type) {
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_Q8_0:
+            break;
+        default:
+            return false;
+    }
+
+    if (gate_up->ne[0] <= 0 || gate_up->ne[0] % 2 != 0 || gate_up->ne[1] < 2 ||
+            gate_up->ne[1] > MMVQ_MAX_BATCH_SIZE || gate_up->ne[2] > MMVQ_MAX_BATCH_SIZE) {
+        return false;
+    }
+
+    const int64_t n_ff          = gate_up->ne[0] / 2;
+    const int64_t n_expert_used = gate_up->ne[1];
+    const int64_t n_tokens      = gate_up->ne[2];
+
+    if (ids->ne[0] != n_expert_used || src1->ne[1] != 1 || src1->ne[2] != n_tokens) {
+        return false;
+    }
+
+    int node_cur = node_idx + 1;
+    const ggml_tensor * gate_src = gate_up;
+    const ggml_tensor * scale    = nullptr;
+
+    if (node_cur < cgraph->n_nodes) {
+        const ggml_tensor * maybe_mul = cgraph->nodes[node_cur];
+        const ggml_tensor * maybe_scale = nullptr;
+        if (ggml_cuda_moe_mul_factor(maybe_mul, gate_up, n_expert_used, n_tokens, maybe_scale)) {
+            gate_src = maybe_mul;
+            scale    = maybe_scale;
+            node_cur++;
+        }
+    }
+
+    if (node_cur + 2 >= cgraph->n_nodes) {
+        return false;
+    }
+
+    ggml_tensor * view0 = cgraph->nodes[node_cur + 0];
+    ggml_tensor * view1 = cgraph->nodes[node_cur + 1];
+    ggml_tensor * glu   = cgraph->nodes[node_cur + 2];
+
+    if (view0->op != GGML_OP_VIEW || view1->op != GGML_OP_VIEW || glu->op != GGML_OP_GLU) {
+        return false;
+    }
+    if (view0->src[0] != gate_src || view1->src[0] != gate_src || view0->view_src != gate_src || view1->view_src != gate_src) {
+        return false;
+    }
+    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0) {
+        return false;
+    }
+    if (glu->src[0] != view0 || glu->src[1] != view1) {
+        return false;
+    }
+    if (view0->type != GGML_TYPE_F32 || view1->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (view0->ne[0] != n_ff || view1->ne[0] != n_ff || view0->ne[1] != n_expert_used || view1->ne[1] != n_expert_used ||
+            view0->ne[2] != n_tokens || view1->ne[2] != n_tokens) {
+        return false;
+    }
+    if (view0->view_offs != 0 || view1->view_offs != size_t(n_ff)*gate_src->nb[0]) {
+        return false;
+    }
+    if (view0->nb[0] != gate_src->nb[0] || view1->nb[0] != gate_src->nb[0] ||
+            view0->nb[1] != gate_src->nb[1] || view1->nb[1] != gate_src->nb[1] ||
+            view0->nb[2] != gate_src->nb[2] || view1->nb[2] != gate_src->nb[2]) {
+        return false;
+    }
+    if (glu->ne[0] != n_ff || glu->ne[1] != n_expert_used || glu->ne[2] != n_tokens) {
+        return false;
+    }
+
+    const int last_node = node_cur + 2;
+    auto has_later_use = [&](const ggml_tensor * tensor) {
+        for (int i = last_node + 1; i < cgraph->n_nodes; ++i) {
+            for (int isrc = 0; isrc < GGML_MAX_SRC; ++isrc) {
+                if (cgraph->nodes[i]->src[isrc] == tensor) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    if (has_later_use(gate_up) || (gate_src != gate_up && has_later_use(gate_src)) || has_later_use(view0) || has_later_use(view1)) {
+        return false;
+    }
+
+    info.src0    = src0;
+    info.src1    = src1;
+    info.ids     = ids;
+    info.scale   = scale;
+    info.dst     = glu;
+    info.n_nodes = last_node - node_idx + 1;
+
     return true;
 }
 
@@ -4224,6 +4357,20 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
 
                     if (node->op == GGML_OP_MUL_MAT_ID) {
+                        ggml_cuda_moe_gate_up_fusion_info moe_gate_up;
+                        if (ggml_cuda_moe_gate_up_fusion(cgraph, i, moe_gate_up)) {
+                            if (getenv("GGML_CUDA_RDNA3_PROFILE_LOG") != nullptr) {
+                                GGML_LOG_INFO("%s: MOE_GATE_UP_MMVQ_SWIGLU_FUSED src0_type=%s, n_ff=%" PRId64
+                                        ", experts=%" PRId64 ", tokens=%" PRId64 ", scale=%d\n",
+                                        __func__, ggml_type_name(moe_gate_up.src0->type), moe_gate_up.dst->ne[0], moe_gate_up.ids->ne[0],
+                                        moe_gate_up.dst->ne[2], moe_gate_up.scale != nullptr ? 1 : 0);
+                            }
+                            ggml_cuda_mul_mat_vec_q_moe_gate_up(*cuda_ctx, moe_gate_up.src0, moe_gate_up.src1, moe_gate_up.ids,
+                                    moe_gate_up.scale, moe_gate_up.dst);
+                            i += moe_gate_up.n_nodes - 1;
+                            continue;
+                        }
+
                         ggml_cuda_moe_down_weighted_fusion_info moe_down;
                         if (ggml_cuda_moe_down_weighted_fusion(cgraph, i, moe_down)) {
                             if (getenv("GGML_CUDA_RDNA3_PROFILE_LOG") != nullptr) {
