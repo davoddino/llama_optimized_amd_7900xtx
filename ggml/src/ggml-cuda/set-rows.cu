@@ -713,7 +713,7 @@ static void set_rows_pair_cuda(
     GGML_CUDA_SET_ROWS_PAIR_QUANT(GGML_TYPE_TQKV_3_5_IP, block_tqkv_3_5_ip, QK_TQKV, quantize_f32_tqkv_3_5_ip_block)
     GGML_CUDA_SET_ROWS_PAIR_QUANT(GGML_TYPE_TQKV_4_0_IP, block_tqkv_4_0_ip, QK_TQKV, quantize_f32_tqkv_4_0_ip_block)
 #undef GGML_CUDA_SET_ROWS_PAIR_QUANT
-    } else {
+    else {
         GGML_ABORT("unsupported type %s", ggml_type_name(dst0->type));
     }
 }

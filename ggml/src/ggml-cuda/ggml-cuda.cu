@@ -117,6 +117,7 @@ struct ggml_cuda_rdna3_op_profile_state {
     std::unordered_map<std::string, ggml_cuda_rdna3_op_profile_record> records;
 };
 
+static std::atomic<int64_t> ggml_cuda_rdna3_op_profile_eval_count{0};
 static thread_local ggml_cuda_rdna3_op_profile_state * ggml_cuda_rdna3_op_profile_current = nullptr;
 class ggml_cuda_rdna3_op_timer;
 static thread_local ggml_cuda_rdna3_op_timer * ggml_cuda_rdna3_op_timer_current = nullptr;
@@ -271,15 +272,24 @@ static bool ggml_cuda_rdna3_op_profile_should_run(const ggml_cgraph * cgraph, in
     const char * max_tokens_env = getenv("GGML_CUDA_RDNA3_OP_PROFILE_MAX_TOKENS");
     const bool has_max_tokens_filter = max_tokens_env != nullptr && max_tokens_env[0] != '\0';
     const int64_t max_tokens = ggml_cuda_env_i64("GGML_CUDA_RDNA3_OP_PROFILE_MAX_TOKENS", -1);
-    if (!has_max_tokens_filter || max_tokens < 0) {
+    if (has_max_tokens_filter && max_tokens >= 0) {
+        if (*n_tokens < 0 || *n_tokens > max_tokens) {
+            return false;
+        }
+    }
+
+    const char * max_evals_env = getenv("GGML_CUDA_RDNA3_OP_PROFILE_MAX_EVALS");
+    const bool has_max_evals_filter = max_evals_env != nullptr && max_evals_env[0] != '\0';
+    const int64_t max_evals = ggml_cuda_env_i64("GGML_CUDA_RDNA3_OP_PROFILE_MAX_EVALS", -1);
+    if (!has_max_evals_filter || max_evals < 0) {
         return true;
     }
 
-    if (*n_tokens < 0) {
+    if (max_evals == 0) {
         return false;
     }
 
-    return *n_tokens <= max_tokens;
+    return ggml_cuda_rdna3_op_profile_eval_count.fetch_add(1, std::memory_order_relaxed) < max_evals;
 }
 
 class ggml_cuda_rdna3_op_timer {
@@ -404,6 +414,10 @@ static void ggml_cuda_rdna3_op_profile_print(const ggml_cuda_rdna3_op_profile_st
         GGML_LOG_INFO("rdna3_op_profile: %-9" PRId64 " %-9.3f %-9.3f %-9.3f %s\n",
                 rec.calls, rec.total_ms, avg_ms, rec.max_ms, row.first.c_str());
     }
+    if (max_summary_rows < path_rows.size()) {
+        GGML_LOG_INFO("rdna3_op_profile: ... %" PRIu64 " more path rows hidden; set GGML_CUDA_RDNA3_OP_PROFILE_SUMMARY_ROWS=0 for all\n",
+                uint64_t(path_rows.size() - max_summary_rows));
+    }
 
     GGML_LOG_INFO("rdna3_op_profile: %-9s %-9s %-9s %-9s %s\n", "calls", "total_ms", "avg_ms", "max_ms", "path | op | tensor");
 
@@ -414,6 +428,10 @@ static void ggml_cuda_rdna3_op_profile_print(const ggml_cuda_rdna3_op_profile_st
         const double avg_ms = rec.calls > 0 ? rec.total_ms / double(rec.calls) : 0.0;
         GGML_LOG_INFO("rdna3_op_profile: %-9" PRId64 " %-9.3f %-9.3f %-9.3f %s\n",
                 rec.calls, rec.total_ms, avg_ms, rec.max_ms, row.first.c_str());
+    }
+    if (max_rows < rows.size()) {
+        GGML_LOG_INFO("rdna3_op_profile: ... %" PRIu64 " more op rows hidden; set GGML_CUDA_RDNA3_OP_PROFILE_MAX_ROWS=0 for all\n",
+                uint64_t(rows.size() - max_rows));
     }
 }
 
