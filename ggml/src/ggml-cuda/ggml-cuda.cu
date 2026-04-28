@@ -72,6 +72,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cfloat>
+#include <cstring>
 #include <initializer_list>
 #include <limits>
 #include <map>
@@ -128,6 +129,30 @@ static bool ggml_cuda_rdna3_graph_log_enabled(const int device) {
         GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[device].cc);
 }
 
+static bool ggml_cuda_rdna3_tensor_name_starts_with(const ggml_tensor * tensor, const char * prefix) {
+    return tensor != nullptr && std::strncmp(tensor->name, prefix, std::strlen(prefix)) == 0;
+}
+
+static int64_t ggml_cuda_rdna3_named_tensor_n_tokens(const ggml_tensor * tensor) {
+    if (ggml_cuda_rdna3_tensor_name_starts_with(tensor, "inp_tokens")) {
+        return tensor->ne[0];
+    }
+
+    if (ggml_cuda_rdna3_tensor_name_starts_with(tensor, "inp_embd")) {
+        return tensor->ne[1];
+    }
+
+    if (ggml_cuda_rdna3_tensor_name_starts_with(tensor, "attn_scale")) {
+        return tensor->ne[2];
+    }
+
+    if (ggml_cuda_rdna3_tensor_name_starts_with(tensor, "ffn_moe_") && tensor->ne[2] > 0) {
+        return tensor->ne[2];
+    }
+
+    return -1;
+}
+
 static int64_t ggml_cuda_rdna3_graph_n_tokens(const ggml_cgraph * cgraph) {
     if (const ggml_tensor * inp_tokens = ggml_graph_get_tensor(cgraph, "inp_tokens")) {
         return inp_tokens->ne[0];
@@ -141,14 +166,63 @@ static int64_t ggml_cuda_rdna3_graph_n_tokens(const ggml_cgraph * cgraph) {
         return attn_scale->ne[2];
     }
 
+    for (int i = 0; i < cgraph->n_leafs; ++i) {
+        const int64_t n_tokens = ggml_cuda_rdna3_named_tensor_n_tokens(cgraph->leafs[i]);
+        if (n_tokens > 0) {
+            return n_tokens;
+        }
+    }
+
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node == nullptr) {
+            continue;
+        }
+
+        const int64_t n_tokens = ggml_cuda_rdna3_named_tensor_n_tokens(node);
+        if (n_tokens > 0) {
+            return n_tokens;
+        }
+
+        if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+            const ggml_tensor * q = node->src[0];
+            if (q != nullptr && q->ne[1] > 0) {
+                return q->ne[1];
+            }
+            if (node->ne[2] > 0) {
+                return node->ne[2];
+            }
+        }
+
+        if (node->op == GGML_OP_MUL_MAT_ID) {
+            const ggml_tensor * src1 = node->src[1];
+            if (src1 != nullptr && src1->ne[2] > 0) {
+                return src1->ne[2];
+            }
+            if (node->ne[2] > 0) {
+                return node->ne[2];
+            }
+        }
+    }
+
     return -1;
 }
 
 static bool ggml_cuda_rdna3_op_profile_should_run(const ggml_cgraph * cgraph, int64_t * n_tokens) {
     *n_tokens = ggml_cuda_rdna3_graph_n_tokens(cgraph);
 
+    const char * max_tokens_env = getenv("GGML_CUDA_RDNA3_OP_PROFILE_MAX_TOKENS");
+    const bool has_max_tokens_filter = max_tokens_env != nullptr && max_tokens_env[0] != '\0';
     const int64_t max_tokens = ggml_cuda_env_i64("GGML_CUDA_RDNA3_OP_PROFILE_MAX_TOKENS", -1);
-    return max_tokens < 0 || *n_tokens < 0 || *n_tokens <= max_tokens;
+    if (!has_max_tokens_filter || max_tokens < 0) {
+        return true;
+    }
+
+    if (*n_tokens < 0) {
+        return false;
+    }
+
+    return *n_tokens <= max_tokens;
 }
 
 class ggml_cuda_rdna3_op_timer {
@@ -5076,8 +5150,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     } else if (rdna3_graph_log && rdna3_op_profile_this_eval) {
         GGML_LOG_INFO("%s: RDNA3 graph disabled for this evaluation: op profiling uses per-op events\n", __func__);
     } else if (rdna3_graph_log && rdna3_op_profile) {
-        GGML_LOG_INFO("%s: RDNA3 op profile skipped for this evaluation: tokens=%" PRId64 "\n",
-                __func__, rdna3_profile_tokens);
+        if (rdna3_profile_tokens >= 0) {
+            GGML_LOG_INFO("%s: RDNA3 op profile skipped for this evaluation: tokens=%" PRId64 "\n",
+                    __func__, rdna3_profile_tokens);
+        } else {
+            GGML_LOG_INFO("%s: RDNA3 op profile skipped for this evaluation: tokens=unknown\n", __func__);
+        }
     }
 #else
     if (rdna3_graph_log) {
