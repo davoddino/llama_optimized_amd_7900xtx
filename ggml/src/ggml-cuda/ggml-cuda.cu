@@ -3621,6 +3621,94 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
     return true;
 }
 
+static bool ggml_cuda_set_rows_pair_type_supported(const ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_TQKV_2_0:
+        case GGML_TYPE_TQKV_2_5:
+        case GGML_TYPE_TQKV_3_0:
+        case GGML_TYPE_TQKV_3_5:
+        case GGML_TYPE_TQKV_4_0:
+        case GGML_TYPE_TQKV_2_0_IP:
+        case GGML_TYPE_TQKV_2_5_IP:
+        case GGML_TYPE_TQKV_3_0_IP:
+        case GGML_TYPE_TQKV_3_5_IP:
+        case GGML_TYPE_TQKV_4_0_IP:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool ggml_cuda_tensor_logical_ranges_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    if (a->data == nullptr || b->data == nullptr) {
+        return false;
+    }
+
+    const uintptr_t a_start = (uintptr_t) a->data;
+    const uintptr_t a_end   = a_start + ggml_nbytes(a);
+    const uintptr_t b_start = (uintptr_t) b->data;
+    const uintptr_t b_end   = b_start + ggml_nbytes(b);
+
+    return b_start < a_end && a_start < b_end;
+}
+
+static bool ggml_cuda_should_fuse_set_rows_pair(const ggml_tensor * set_rows0, const ggml_tensor * set_rows1) {
+    if (set_rows0->op != GGML_OP_SET_ROWS || set_rows1->op != GGML_OP_SET_ROWS) {
+        return false;
+    }
+
+    const ggml_tensor * src00 = set_rows0->src[0];
+    const ggml_tensor * src01 = set_rows1->src[0];
+    const ggml_tensor * idx0  = set_rows0->src[1];
+    const ggml_tensor * idx1  = set_rows1->src[1];
+
+    if (src00->type != GGML_TYPE_F32 || src01->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    if (idx0 != idx1 || (idx0->type != GGML_TYPE_I64 && idx0->type != GGML_TYPE_I32)) {
+        return false;
+    }
+
+    if (set_rows0->type != set_rows1->type || !ggml_cuda_set_rows_pair_type_supported(set_rows0->type)) {
+        return false;
+    }
+
+    if (!ggml_are_same_shape(src00, src01) || !ggml_are_same_shape(set_rows0, set_rows1)) {
+        return false;
+    }
+
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+        if (src00->nb[i] != src01->nb[i] || set_rows0->nb[i] != set_rows1->nb[i]) {
+            return false;
+        }
+    }
+
+    if (ggml_cuda_tensor_logical_ranges_overlap(set_rows0, set_rows1)) {
+        return false;
+    }
+
+    if (ggml_cuda_tensor_logical_ranges_overlap(set_rows0, src00) ||
+        ggml_cuda_tensor_logical_ranges_overlap(set_rows0, src01) ||
+        ggml_cuda_tensor_logical_ranges_overlap(set_rows0, idx0)  ||
+        ggml_cuda_tensor_logical_ranges_overlap(set_rows1, src00) ||
+        ggml_cuda_tensor_logical_ranges_overlap(set_rows1, src01) ||
+        ggml_cuda_tensor_logical_ranges_overlap(set_rows1, idx0)) {
+        return false;
+    }
+
+    return true;
+}
+
 static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int node_idx, ggml_cuda_topk_moe_args & args) {
     args.sigmoid         = false;
     args.softmax         = false;
@@ -4411,28 +4499,23 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         }
     }
 
-    std::initializer_list<enum ggml_op> rms_norm_silu_mul_ops = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL };
-
-    if (is_equal(rms_norm_silu_mul_ops, ops) &&
-        unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SILU &&
-        ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 3 })) {
-        const ggml_tensor * rms_norm   = cgraph->nodes[node_idx];
-        const ggml_tensor * weight_mul = cgraph->nodes[node_idx + 1];
-        const ggml_tensor * silu       = cgraph->nodes[node_idx + 2];
-        const ggml_tensor * out_mul    = cgraph->nodes[node_idx + 3];
-
+    auto can_fuse_rms_norm_silu_mul = [&](const int node_count,
+                                          const ggml_tensor * rms_norm,
+                                          const ggml_tensor * weight_mul,
+                                          const ggml_tensor * silu,
+                                          const ggml_tensor * out_mul) {
         if (ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU) {
             return false;
         }
 
-        if (rms_norm->src[0]->type != GGML_TYPE_F32 ||
-            rms_norm->type         != GGML_TYPE_F32 ||
-            weight_mul->src[0]->type != GGML_TYPE_F32 ||
-            weight_mul->src[1]->type != GGML_TYPE_F32 ||
-            weight_mul->type         != GGML_TYPE_F32 ||
-            silu->src[0]->type       != GGML_TYPE_F32 ||
-            silu->type               != GGML_TYPE_F32 ||
-            out_mul->type            != GGML_TYPE_F32) {
+        if (rms_norm->src[0]->type    != GGML_TYPE_F32 ||
+            rms_norm->type            != GGML_TYPE_F32 ||
+            weight_mul->src[0]->type  != GGML_TYPE_F32 ||
+            weight_mul->src[1]->type  != GGML_TYPE_F32 ||
+            weight_mul->type          != GGML_TYPE_F32 ||
+            silu->src[0]->type        != GGML_TYPE_F32 ||
+            silu->type                != GGML_TYPE_F32 ||
+            out_mul->type             != GGML_TYPE_F32) {
             return false;
         }
 
@@ -4469,8 +4552,34 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
             return false;
         }
 
-        int out_nodes[] = { node_idx + 3 };
-        return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int) ops.size(), out_nodes, 1);
+        int out_nodes[] = { node_idx + node_count - 1 };
+        return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, node_count, out_nodes, 1);
+    };
+
+    std::initializer_list<enum ggml_op> rms_norm_silu_mul_ops = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL };
+
+    if (is_equal(rms_norm_silu_mul_ops, ops) &&
+        unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SILU &&
+        ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 3 })) {
+        const ggml_tensor * rms_norm   = cgraph->nodes[node_idx];
+        const ggml_tensor * weight_mul = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * silu       = cgraph->nodes[node_idx + 2];
+        const ggml_tensor * out_mul    = cgraph->nodes[node_idx + 3];
+
+        return can_fuse_rms_norm_silu_mul(4, rms_norm, weight_mul, silu, out_mul);
+    }
+
+    std::initializer_list<enum ggml_op> silu_rms_norm_mul_ops = { GGML_OP_UNARY, GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL };
+
+    if (is_equal(silu_rms_norm_mul_ops, ops) &&
+        unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SILU &&
+        ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 3 })) {
+        const ggml_tensor * silu       = cgraph->nodes[node_idx];
+        const ggml_tensor * rms_norm   = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * weight_mul = cgraph->nodes[node_idx + 2];
+        const ggml_tensor * out_mul    = cgraph->nodes[node_idx + 3];
+
+        return can_fuse_rms_norm_silu_mul(4, rms_norm, weight_mul, silu, out_mul);
     }
 
     std::initializer_list<enum ggml_op> l2_norm_pair_ops = { GGML_OP_L2_NORM, GGML_OP_L2_NORM };
@@ -4972,6 +5081,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         continue;
                     }
 
+                    if (can_fuse_linear_stream_region(2) &&
+                            ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_SET_ROWS, GGML_OP_SET_ROWS }, { i, i + 1 }) &&
+                            ggml_cuda_should_fuse_set_rows_pair(node, cgraph->nodes[i + 1])) {
+                        op_timer.set_path("SET_ROWS_PAIR_FUSED");
+                        ggml_cuda_op_set_rows_pair(*cuda_ctx, node, cgraph->nodes[i + 1]);
+                        i++;
+                        continue;
+                    }
+
                     if (node->op == GGML_OP_MUL_MAT_ID) {
                         ggml_cuda_moe_gate_up_fusion_info moe_gate_up;
                         if (ggml_cuda_moe_gate_up_fusion(cgraph, i, moe_gate_up)) {
@@ -5280,6 +5398,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU })) {
                         op_timer.set_path("RMS_NORM_SILU_MUL_FUSED");
                         ggml_cuda_op_rms_norm_fused_silu_mul(*cuda_ctx, node, cgraph->nodes[i+1], cgraph->nodes[i+2], cgraph->nodes[i+3]);
+                        i += 3;
+                        continue;
+                    }
+
+                    if (can_fuse_linear_stream_region(4) &&
+                            ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL }, { GGML_UNARY_OP_SILU })) {
+                        op_timer.set_path("RMS_NORM_SILU_MUL_FUSED");
+                        ggml_cuda_op_rms_norm_fused_silu_mul(*cuda_ctx, cgraph->nodes[i+1], cgraph->nodes[i+2], node, cgraph->nodes[i+3]);
                         i += 3;
                         continue;
                     }
