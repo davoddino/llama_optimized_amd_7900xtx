@@ -102,6 +102,7 @@ gated_delta_net_ar_tiled_cuda(const float * q,
     __shared__ float k_shared[S_v];
     __shared__ float g_shared[S_v];
     __shared__ float g_scalar_shared;
+    __shared__ float kq_scalar_shared;
 
 #pragma unroll
     for (int r = 0; r < rows_per_lane; ++r) {
@@ -154,26 +155,43 @@ gated_delta_net_ar_tiled_cuda(const float * q,
     if constexpr (!KDA) {
         const float g_val = g_scalar_shared;
 
-        float kv_shard = 0.0f;
+        float2 sk_sq_shard = make_float2(0.0f, 0.0f);
+        float kq_shard = 0.0f;
 #pragma unroll
         for (int r = 0; r < rows_per_lane; ++r) {
-            kv_shard += s_shard[r] * k_shared[r * warp_size + lane];
+            const int i = r * warp_size + lane;
+            const float k_val = k_shared[i];
+            const float q_val = q_shared[i];
+
+            sk_sq_shard.x += s_shard[r] * k_val;
+            sk_sq_shard.y += s_shard[r] * q_val;
+
+            if (col_lane == 0) {
+                kq_shard += k_val * q_val;
+            }
         }
 
-        const float kv_col    = warp_reduce_sum<warp_size>(kv_shard);
-        const float delta_col = (v_t[col] - g_val * kv_col) * beta_val;
+        if (col_lane == 0) {
+            const float kq_col = warp_reduce_sum<warp_size>(kq_shard);
+            if (lane == 0) {
+                kq_scalar_shared = kq_col;
+            }
+        }
 
-        float attn_partial = 0.0f;
+        const float2 sk_sq_col = warp_reduce_sum<warp_size>(sk_sq_shard);
+        const float delta_col = (v_t[col] - g_val * sk_sq_col.x) * beta_val;
+
+        __syncthreads();
+
+        if (lane == 0) {
+            const float attn_col = g_val * sk_sq_col.y + delta_col * kq_scalar_shared;
+            attn_data[col] = attn_col * scale;
+        }
+
 #pragma unroll
         for (int r = 0; r < rows_per_lane; ++r) {
             const int i = r * warp_size + lane;
             s_shard[r] = g_val * s_shard[r] + k_shared[i] * delta_col;
-            attn_partial += s_shard[r] * q_shared[i];
-        }
-
-        const float attn_col = warp_reduce_sum<warp_size>(attn_partial);
-        if (lane == 0) {
-            attn_data[col] = attn_col * scale;
         }
     } else {
         float kv_shard = 0.0f;

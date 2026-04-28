@@ -19,8 +19,9 @@ TQKV_PROFILE="${TQKV_PROFILE:-fast}"
 BATCH_SIZE="${BATCH_SIZE:-4096}"
 UBATCH_SIZE="${UBATCH_SIZE:-1024}"
 PROMPT_CACHE_MB="${PROMPT_CACHE_MB:-0}"
-CTX_CHECKPOINTS="${CTX_CHECKPOINTS:-32}"
+CTX_CHECKPOINTS="${CTX_CHECKPOINTS:-0}"
 CHECKPOINT_EVERY_NT="${CHECKPOINT_EVERY_NT:--1}"
+BACKEND_SAMPLING="${BACKEND_SAMPLING:-1}"
 KV_UNIFIED="${KV_UNIFIED:-}"
 CACHE_IDLE_SLOTS="${CACHE_IDLE_SLOTS:-}"
 RDNA3_PROFILE_LOG="${RDNA3_PROFILE_LOG:-0}"
@@ -42,6 +43,8 @@ RDNA3_QWEN36_TOPK_RPB="${RDNA3_QWEN36_TOPK_RPB:-}"
 RDNA3_TQKV_FATTN_TILE="${RDNA3_TQKV_FATTN_TILE:-0}"
 RDNA3_TQKV_FATTN_TILE_MIN_CTX="${RDNA3_TQKV_FATTN_TILE_MIN_CTX:-}"
 RDNA3_TQKV_FATTN_KQ_LANES="${RDNA3_TQKV_FATTN_KQ_LANES:-}"
+RDNA3_TQKV_FATTN_GQA_DECODE="${RDNA3_TQKV_FATTN_GQA_DECODE:-1}"
+RDNA3_TQKV_FATTN_GQA_HEADS="${RDNA3_TQKV_FATTN_GQA_HEADS:-4}"
 RDNA3_MOE_MMVQ_RPB="${RDNA3_MOE_MMVQ_RPB:-}"
 RDNA3_MOE_GATE_UP_RPB="${RDNA3_MOE_GATE_UP_RPB:-}"
 RDNA3_GDN_WARPS="${RDNA3_GDN_WARPS:-}"
@@ -52,15 +55,9 @@ case "$RDNA3_KERNEL_PRESET" in
         ;;
     attn-kq4)
         RDNA3_TQKV_FATTN_KQ_LANES="${RDNA3_TQKV_FATTN_KQ_LANES:-4}"
-        RDNA3_GDN_AR_COLS="${RDNA3_GDN_AR_COLS:-16}"
-        RDNA3_MOE_MMVQ_RPB="${RDNA3_MOE_MMVQ_RPB:-16}"
-        RDNA3_MOE_GATE_UP_RPB="${RDNA3_MOE_GATE_UP_RPB:-8}"
         ;;
     attn-kq8)
         RDNA3_TQKV_FATTN_KQ_LANES="${RDNA3_TQKV_FATTN_KQ_LANES:-8}"
-        RDNA3_GDN_AR_COLS="${RDNA3_GDN_AR_COLS:-16}"
-        RDNA3_MOE_MMVQ_RPB="${RDNA3_MOE_MMVQ_RPB:-16}"
-        RDNA3_MOE_GATE_UP_RPB="${RDNA3_MOE_GATE_UP_RPB:-8}"
         ;;
     decode-wide)
         RDNA3_TQKV_FATTN_KQ_LANES="${RDNA3_TQKV_FATTN_KQ_LANES:-4}"
@@ -159,6 +156,10 @@ elif [[ "$CACHE_IDLE_SLOTS" == "0" ]]; then
     SERVER_EXTRA_ARGS+=(--no-cache-idle-slots)
 fi
 
+if [[ "$BACKEND_SAMPLING" == "1" ]]; then
+    SERVER_EXTRA_ARGS+=(--backend-sampling)
+fi
+
 if [[ "$RDNA3_PROFILE_LOG" == "1" ]]; then
     export GGML_CUDA_RDNA3_PROFILE_LOG=1
 fi
@@ -228,6 +229,9 @@ if [[ -n "$RDNA3_TQKV_FATTN_KQ_LANES" ]]; then
     export GGML_CUDA_RDNA3_TQKV_FATTN_KQ_LANES="$RDNA3_TQKV_FATTN_KQ_LANES"
 fi
 
+export GGML_CUDA_RDNA3_TQKV_FATTN_GQA_DECODE="$RDNA3_TQKV_FATTN_GQA_DECODE"
+export GGML_CUDA_RDNA3_TQKV_FATTN_GQA_HEADS="$RDNA3_TQKV_FATTN_GQA_HEADS"
+
 if [[ -n "$RDNA3_MOE_MMVQ_RPB" ]]; then
     export GGML_CUDA_RDNA3_MOE_MMVQ_RPB="$RDNA3_MOE_MMVQ_RPB"
 fi
@@ -254,6 +258,7 @@ echo "  batch: $BATCH_SIZE / ubatch $UBATCH_SIZE"
 echo "  prompt cache RAM: ${PROMPT_CACHE_MB} MiB"
 echo "  ctx checkpoints: $CTX_CHECKPOINTS"
 echo "  checkpoint every n tokens: $CHECKPOINT_EVERY_NT"
+echo "  backend sampling: $BACKEND_SAMPLING"
 echo "  rdna3 profile log: $RDNA3_PROFILE_LOG"
 echo "  rdna3 op profile: $RDNA3_OP_PROFILE"
 echo "  rdna3 op profile max tokens: ${RDNA3_OP_PROFILE_MAX_TOKENS:-all}"
@@ -272,6 +277,8 @@ echo "  rdna3 qwen36 topk rows/block: ${RDNA3_QWEN36_TOPK_RPB:-auto}"
 echo "  rdna3 tqkv fattn tile: $RDNA3_TQKV_FATTN_TILE"
 echo "  rdna3 tqkv fattn tile min ctx: ${RDNA3_TQKV_FATTN_TILE_MIN_CTX:-off}"
 echo "  rdna3 tqkv fattn KQ lanes: ${RDNA3_TQKV_FATTN_KQ_LANES:-auto}"
+echo "  rdna3 tqkv fattn GQA decode: $RDNA3_TQKV_FATTN_GQA_DECODE"
+echo "  rdna3 tqkv fattn GQA heads/block: $RDNA3_TQKV_FATTN_GQA_HEADS"
 echo "  rdna3 moe mmvq rows/block: ${RDNA3_MOE_MMVQ_RPB:-auto}"
 echo "  rdna3 moe gate_up rows/block: ${RDNA3_MOE_GATE_UP_RPB:-auto}"
 echo "  rdna3 gated delta net warps: ${RDNA3_GDN_WARPS:-auto}"

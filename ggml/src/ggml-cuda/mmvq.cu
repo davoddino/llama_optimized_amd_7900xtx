@@ -853,8 +853,9 @@ static __global__ void mul_mat_vec_q_moe_weighted(
     }
 }
 
-template <ggml_type type, int c_rows_per_block, bool has_scale>
-__launch_bounds__(MMVQ_MAX_BATCH_SIZE*ggml_cuda_get_physical_warp_size(), 1)
+template <ggml_type type, int c_rows_per_block, bool has_scale,
+          int c_expert_used = MMVQ_MAX_BATCH_SIZE, bool c_single_token = false>
+__launch_bounds__(c_expert_used*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe_gate_up(
         const void * __restrict__ vx, const void * __restrict__ vy, const int32_t * __restrict__ ids,
         const float * __restrict__ scale, float * __restrict__ dst,
@@ -872,11 +873,22 @@ static __global__ void mul_mat_vec_q_moe_gate_up(
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
     const uint32_t channel_dst = threadIdx.y;
-    const uint32_t token_idx   = blockIdx.y;
+    const uint32_t token_idx   = c_single_token ? 0 : blockIdx.y;
     const int      row0        = c_rows_per_block*blockIdx.x;
 
-    if (channel_dst >= n_expert_used || token_idx >= ncols_dst) {
-        return;
+    if constexpr (c_expert_used == MMVQ_MAX_BATCH_SIZE && !c_single_token) {
+        if (channel_dst >= n_expert_used || token_idx >= ncols_dst) {
+            return;
+        }
+    } else if constexpr (c_single_token) {
+        GGML_UNUSED(ncols_dst);
+        if (channel_dst >= c_expert_used) {
+            return;
+        }
+    } else {
+        if (channel_dst >= c_expert_used || token_idx >= ncols_dst) {
+            return;
+        }
     }
 
     const int      blocks_per_row_x = ncols_x / qk;
@@ -1182,7 +1194,7 @@ static void mul_mat_vec_q_moe_weighted_launch(
     const bool qwen36_top8_decode = rdna3_qwen36_moe_decode_shape(type, cc, ncols_x, nrows_x, n_expert_used, ncols_dst);
     const int rows_per_block = rdna3_mmvq_rows_per_block(
         "GGML_CUDA_RDNA3_MOE_MMVQ_RPB", type, cc, ncols_x, nrows_x, n_expert_used, ncols_dst,
-        /*rdna3_default=*/ 4, /*generic_default=*/ 2, /*qwen36_default=*/ 16);
+        /*rdna3_default=*/ 4, /*generic_default=*/ 2, /*qwen36_default=*/ 8);
     if (getenv("GGML_CUDA_RDNA3_PROFILE_LOG") != nullptr) {
         GGML_LOG_INFO("%s: MMVQ_MOE_WEIGHTED type=%s, rows_per_block=%d, nrows=%u, tokens=%u, experts=%u, scales=%d, qwen36_fast=%d\n",
                 __func__, ggml_type_name(type), rows_per_block, nrows_x, ncols_dst, n_expert_used, weights1 != nullptr ? 2 : 1,
@@ -1215,37 +1227,54 @@ static void mul_mat_vec_q_moe_gate_up_launch_rpb(
         const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
         const uint32_t scale_stride_channel, const uint32_t scale_stride_col,
         const uint32_t n_expert_used, const uint32_t ncols_dst, const uint32_t ids_stride,
-        const int warp_size, cudaStream_t stream, const int rows_per_block) {
+        const int warp_size, cudaStream_t stream, const int rows_per_block, const bool qwen36_top8_decode) {
 
-    auto launch = [&](auto rpb_tag) {
+    auto launch = [&](auto rpb_tag, auto qwen36_tag) {
         constexpr int rpb = decltype(rpb_tag)::value;
+        constexpr bool qwen36 = decltype(qwen36_tag)::value;
         const int64_t nblocks_rows = (nrows_dst + rpb - 1) / rpb;
         const dim3 block_nums(nblocks_rows, ncols_dst);
         const dim3 block_dims(warp_size, n_expert_used);
 
-        mul_mat_vec_q_moe_gate_up<type, rpb, has_scale><<<block_nums, block_dims, 0, stream>>>(
-            vx, vy, ids, scale, dst, ncols_x, nchannels_y, nrows_dst,
-            stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-            scale_stride_channel, scale_stride_col, n_expert_used, ncols_dst, ids_stride);
+        if constexpr (qwen36) {
+            mul_mat_vec_q_moe_gate_up<type, rpb, has_scale, 8, true><<<block_nums, block_dims, 0, stream>>>(
+                vx, vy, ids, scale, dst, ncols_x, nchannels_y, nrows_dst,
+                stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                scale_stride_channel, scale_stride_col, n_expert_used, ncols_dst, ids_stride);
+        } else {
+            mul_mat_vec_q_moe_gate_up<type, rpb, has_scale><<<block_nums, block_dims, 0, stream>>>(
+                vx, vy, ids, scale, dst, ncols_x, nchannels_y, nrows_dst,
+                stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                scale_stride_channel, scale_stride_col, n_expert_used, ncols_dst, ids_stride);
+        }
     };
 
-    switch (rows_per_block) {
-        case 1:
-            launch(std::integral_constant<int, 1>{});
-            break;
-        case 4:
-            launch(std::integral_constant<int, 4>{});
-            break;
-        case 8:
-            launch(std::integral_constant<int, 8>{});
-            break;
-        case 16:
-            launch(std::integral_constant<int, 16>{});
-            break;
-        default:
-            launch(std::integral_constant<int, 2>{});
-            break;
+    auto dispatch = [&](auto qwen36_tag) {
+        switch (rows_per_block) {
+            case 1:
+                launch(std::integral_constant<int, 1>{}, qwen36_tag);
+                break;
+            case 4:
+                launch(std::integral_constant<int, 4>{}, qwen36_tag);
+                break;
+            case 8:
+                launch(std::integral_constant<int, 8>{}, qwen36_tag);
+                break;
+            case 16:
+                launch(std::integral_constant<int, 16>{}, qwen36_tag);
+                break;
+            default:
+                launch(std::integral_constant<int, 2>{}, qwen36_tag);
+                break;
+        }
+    };
+
+    if (qwen36_top8_decode) {
+        dispatch(std::true_type{});
+        return;
     }
+
+    dispatch(std::false_type{});
 }
 
 template <ggml_type type>
@@ -1259,13 +1288,14 @@ static void mul_mat_vec_q_moe_gate_up_launch(
         const uint32_t n_expert_used, const uint32_t ncols_dst, const uint32_t ids_stride,
         const int warp_size, const int cc, cudaStream_t stream) {
 
+    const bool qwen36_top8_decode = rdna3_qwen36_moe_decode_shape(type, cc, ncols_x, nrows_dst, n_expert_used, ncols_dst);
     const int rows_per_block = rdna3_mmvq_rows_per_block(
         "GGML_CUDA_RDNA3_MOE_GATE_UP_RPB", type, cc, ncols_x, nrows_dst, n_expert_used, ncols_dst,
         /*rdna3_default=*/ 2, /*generic_default=*/ 1, /*qwen36_default=*/ 4);
     if (getenv("GGML_CUDA_RDNA3_PROFILE_LOG") != nullptr) {
         GGML_LOG_INFO("%s: MMVQ_MOE_GATE_UP type=%s, rows_per_block=%d, nrows=%u, tokens=%u, experts=%u, scale=%d, qwen36_fast=%d\n",
                 __func__, ggml_type_name(type), rows_per_block, nrows_dst, ncols_dst, n_expert_used, scale != nullptr ? 1 : 0,
-                rdna3_qwen36_moe_decode_shape(type, cc, ncols_x, nrows_dst, n_expert_used, ncols_dst) ? 1 : 0);
+                qwen36_top8_decode ? 1 : 0);
     }
 
     if (scale != nullptr) {
@@ -1273,13 +1303,13 @@ static void mul_mat_vec_q_moe_gate_up_launch(
             vx, vy, ids, scale, dst, ncols_x, nchannels_y, nrows_dst,
             stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
             scale_stride_channel, scale_stride_col, n_expert_used, ncols_dst, ids_stride,
-            warp_size, stream, rows_per_block);
+            warp_size, stream, rows_per_block, qwen36_top8_decode);
     } else {
         mul_mat_vec_q_moe_gate_up_launch_rpb<type, false>(
             vx, vy, ids, nullptr, dst, ncols_x, nchannels_y, nrows_dst,
             stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
             scale_stride_channel, scale_stride_col, n_expert_used, ncols_dst, ids_stride,
-            warp_size, stream, rows_per_block);
+            warp_size, stream, rows_per_block, qwen36_top8_decode);
     }
 }
 

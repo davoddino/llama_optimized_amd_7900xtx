@@ -231,6 +231,11 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     ggml_tensor * K = dst->src[1];
     ggml_tensor * V = dst->src[2];
 
+    if (ggml_cuda_rdna3_tqkv_fattn_gqa_decode_enabled(dst)) {
+        ggml_cuda_flash_attn_ext_vec_tqkv4_gqa_decode_d256(ctx, dst);
+        return;
+    }
+
 #ifdef GGML_CUDA_FA_ALL_QUANTS
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_F16)
@@ -637,7 +642,26 @@ const char * ggml_cuda_flash_attn_ext_kernel_name(int device, const ggml_tensor 
     if (kernel == BEST_FATTN_KERNEL_VEC && K != nullptr && V != nullptr &&
             K->type == GGML_TYPE_TQKV_4_0 && V->type == GGML_TYPE_TQKV_4_0 &&
             GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[device].cc)) {
-        switch (ggml_cuda_rdna3_tqkv_fattn_kq_lanes(ggml_cuda_info().devices[device].cc)) {
+        const int cc = ggml_cuda_info().devices[device].cc;
+        if (ggml_cuda_rdna3_tqkv_fattn_gqa_decode_enabled_cc(dst, cc)) {
+            const int heads = ggml_cuda_rdna3_tqkv_fattn_gqa_heads();
+            switch (ggml_cuda_rdna3_tqkv_fattn_kq_lanes(cc)) {
+                case 4:
+                    return heads == 8 ? "FLASH_ATTN_TQKV_RDNA3_GQA8_KQ4" :
+                           heads == 2 ? "FLASH_ATTN_TQKV_RDNA3_GQA2_KQ4" :
+                                        "FLASH_ATTN_TQKV_RDNA3_GQA4_KQ4";
+                case 8:
+                    return heads == 8 ? "FLASH_ATTN_TQKV_RDNA3_GQA8_KQ8" :
+                           heads == 2 ? "FLASH_ATTN_TQKV_RDNA3_GQA2_KQ8" :
+                                        "FLASH_ATTN_TQKV_RDNA3_GQA4_KQ8";
+                case 2:
+                default:
+                    return heads == 8 ? "FLASH_ATTN_TQKV_RDNA3_GQA8_KQ2" :
+                           heads == 2 ? "FLASH_ATTN_TQKV_RDNA3_GQA2_KQ2" :
+                                        "FLASH_ATTN_TQKV_RDNA3_GQA4_KQ2";
+            }
+        }
+        switch (ggml_cuda_rdna3_tqkv_fattn_kq_lanes(cc)) {
             case 4:
                 return "FLASH_ATTN_TQKV_VEC_KQ4";
             case 8:
