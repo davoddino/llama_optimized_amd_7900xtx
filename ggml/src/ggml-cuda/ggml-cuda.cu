@@ -81,9 +81,115 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
+
+static bool ggml_cuda_env_enabled(const char * name) {
+    const char * value = getenv(name);
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+struct ggml_cuda_rdna3_op_profile_record {
+    int64_t calls = 0;
+    double  total_ms = 0.0;
+    float   max_ms = 0.0f;
+};
+
+struct ggml_cuda_rdna3_op_profile_state {
+    std::unordered_map<std::string, ggml_cuda_rdna3_op_profile_record> records;
+};
+
+static thread_local ggml_cuda_rdna3_op_profile_state * ggml_cuda_rdna3_op_profile_current = nullptr;
+
+static bool ggml_cuda_rdna3_op_profile_enabled(const int device) {
+    return ggml_cuda_env_enabled("GGML_CUDA_RDNA3_OP_PROFILE") &&
+        GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[device].cc);
+}
+
+static bool ggml_cuda_rdna3_graph_log_enabled(const int device) {
+    return ggml_cuda_env_enabled("GGML_CUDA_RDNA3_GRAPH_LOG") &&
+        GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[device].cc);
+}
+
+class ggml_cuda_rdna3_op_timer {
+public:
+    ggml_cuda_rdna3_op_timer(ggml_backend_cuda_context * ctx, const ggml_tensor * node)
+        : ctx(ctx), node(node) {
+        if (ggml_cuda_rdna3_op_profile_current == nullptr) {
+            return;
+        }
+
+        CUDA_CHECK(cudaEventCreateWithFlags(&start, 0));
+        CUDA_CHECK(cudaEventCreateWithFlags(&stop, 0));
+        CUDA_CHECK(cudaEventRecord(start, ctx->stream()));
+        active = true;
+    }
+
+    ~ggml_cuda_rdna3_op_timer() {
+        if (!active) {
+            return;
+        }
+
+        CUDA_CHECK(cudaEventRecord(stop, ctx->stream()));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+
+        float elapsed_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
+        CUDA_CHECK(cudaEventDestroy(start));
+        CUDA_CHECK(cudaEventDestroy(stop));
+
+        std::string key;
+        key.reserve(192);
+        key += path;
+        key += " | ";
+        key += ggml_op_name(node->op);
+        key += " | ";
+        key += (node->name[0] != '\0' ? node->name : "(unnamed)");
+
+        ggml_cuda_rdna3_op_profile_record & record = ggml_cuda_rdna3_op_profile_current->records[key];
+        record.calls++;
+        record.total_ms += elapsed_ms;
+        record.max_ms = std::max(record.max_ms, elapsed_ms);
+    }
+
+    void set_path(const char * path_) {
+        path = path_;
+    }
+
+private:
+    ggml_backend_cuda_context * ctx = nullptr;
+    const ggml_tensor * node = nullptr;
+    const char * path = "direct";
+    cudaEvent_t start = nullptr;
+    cudaEvent_t stop = nullptr;
+    bool active = false;
+};
+
+static void ggml_cuda_rdna3_op_profile_print(const ggml_cuda_rdna3_op_profile_state & profile) {
+    if (profile.records.empty()) {
+        GGML_LOG_INFO("rdna3_op_profile: no GPU ops recorded\n");
+        return;
+    }
+
+    std::vector<std::pair<std::string, ggml_cuda_rdna3_op_profile_record>> rows(profile.records.begin(), profile.records.end());
+    std::sort(rows.begin(), rows.end(), [](const auto & a, const auto & b) {
+        return a.second.total_ms > b.second.total_ms;
+    });
+
+    GGML_LOG_INFO("rdna3_op_profile: top GPU op costs for this graph evaluation\n");
+    GGML_LOG_INFO("rdna3_op_profile: %-9s %-9s %-9s %-9s %s\n", "calls", "total_ms", "avg_ms", "max_ms", "path | op | tensor");
+
+    const size_t max_rows = 64;
+    for (size_t i = 0; i < rows.size() && i < max_rows; ++i) {
+        const auto & row = rows[i];
+        const auto & rec = row.second;
+        const double avg_ms = rec.calls > 0 ? rec.total_ms / double(rec.calls) : 0.0;
+        GGML_LOG_INFO("rdna3_op_profile: %-9" PRId64 " %-9.3f %-9.3f %-9.3f %s\n",
+                rec.calls, rec.total_ms, avg_ms, rec.max_ms, row.first.c_str());
+    }
+}
 
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
@@ -3119,6 +3225,8 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
+    const int device = ggml_cuda_get_device();
+    const bool graph_log = ggml_cuda_rdna3_graph_log_enabled(device);
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -3130,6 +3238,10 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
         if (node->src[0] && node->src[0]->buffer && ggml_backend_buft_is_cuda_split(node->src[0]->buffer->buft)) {
             use_cuda_graph = false; // Split buffers are not supported by CUDA graph capture
+            if (graph_log) {
+                GGML_LOG_INFO("%s: RDNA3 graph incompatible: split buffer at node %d (%s, %s)\n",
+                        __func__, i, ggml_op_name(node->op), node->name);
+            }
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: disabling CUDA graphs due to split buffer\n", __func__);
 #endif
@@ -3144,6 +3256,10 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
                 // TODO: figure out a way to enable for larger batch sizes, without hurting performance
                 // ref: https://github.com/ggml-org/llama.cpp/pull/18958
                 use_cuda_graph = false;
+                if (graph_log) {
+                    GGML_LOG_INFO("%s: RDNA3 graph incompatible: MUL_MAT_ID node %d (%s), src0_type=%s, tokens=%" PRId64
+                            ", mmvq_max=%d\n", __func__, i, node->name, ggml_type_name(node->src[0]->type), node->ne[2], mmvq_mmid_max);
+                }
 #ifndef NDEBUG
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
 #endif
@@ -4271,6 +4387,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                ggml_cuda_rdna3_op_timer op_timer(cuda_ctx, node);
+
                 // start of fusion operations
                 static bool disable_fusion = (getenv("GGML_CUDA_DISABLE_FUSION") != nullptr);
                 if (!disable_fusion) {
@@ -4323,6 +4441,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                                     ggml_cuda_should_use_topk_moe(node, logits, weights, ids) &&
                                     ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/ true)) {
+                                    op_timer.set_path("TOPK_MOE_FUSED");
                                     ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
                                     i += ops.size() - 1;
                                     continue;
@@ -4339,6 +4458,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                                     ggml_cuda_should_use_topk_moe(softmax, logits, weights, ids) &&
                                     ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/ true)) {
+                                    op_timer.set_path("TOPK_MOE_FUSED_DELAYED");
                                     ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
                                     i += ops.size() - 1;
                                     continue;
@@ -4351,6 +4471,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         ggml_tensor * rope = cgraph->nodes[i];
                         ggml_tensor * set_rows = cgraph->nodes[i + 2];
 
+                        op_timer.set_path("ROPE_SET_ROWS_FUSED");
                         ggml_cuda_op_rope_fused(*cuda_ctx, rope, set_rows);
                         i += 2;
                         continue;
@@ -4365,6 +4486,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                         __func__, ggml_type_name(moe_gate_up.src0->type), moe_gate_up.dst->ne[0], moe_gate_up.ids->ne[0],
                                         moe_gate_up.dst->ne[2], moe_gate_up.scale != nullptr ? 1 : 0);
                             }
+                            op_timer.set_path("MOE_GATE_UP_MMVQ_SWIGLU_FUSED");
                             ggml_cuda_mul_mat_vec_q_moe_gate_up(*cuda_ctx, moe_gate_up.src0, moe_gate_up.src1, moe_gate_up.ids,
                                     moe_gate_up.scale, moe_gate_up.dst);
                             i += moe_gate_up.n_nodes - 1;
@@ -4379,6 +4501,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                         __func__, ggml_type_name(moe_down.src0->type), moe_down.dst->ne[0], moe_down.ids->ne[0],
                                         moe_down.dst->ne[1], moe_down.weights1 != nullptr ? 2 : 1);
                             }
+                            op_timer.set_path("MOE_DOWN_WEIGHTED_MMVQ_FUSED");
                             ggml_cuda_mul_mat_vec_q_moe_weighted(*cuda_ctx, moe_down.src0, moe_down.src1, moe_down.ids,
                                     moe_down.weights0, moe_down.weights1, moe_down.dst);
                             i += moe_down.n_nodes - 1;
@@ -4394,6 +4517,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                         ", experts=%" PRId64 ", tokens=%" PRId64 "\n",
                                         __func__, moe_sum.experts->ne[0], moe_sum.experts->ne[1], moe_sum.experts->ne[2]);
                             }
+                            op_timer.set_path("MOE_WEIGHTED_SUM_FUSED");
                             ggml_cuda_op_moe_weighted_sum(*cuda_ctx, moe_sum.experts, moe_sum.weights, moe_sum.dst);
                             i += moe_sum.n_nodes - 1;
                             continue;
@@ -4427,8 +4551,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             }
                             fused_node.data = cgraph->nodes[i + n_fuse - 1]->data;
                             if (node->op == GGML_OP_ADD) {
+                                op_timer.set_path("ADD_CHAIN_FUSED");
                                 ggml_cuda_op_fused_add(*cuda_ctx, &fused_node, n_fuse);
                             } else {
+                                op_timer.set_path("MUL_CHAIN_FUSED");
                                 ggml_cuda_op_fused_mul(*cuda_ctx, &fused_node, n_fuse);
                             }
                             i += n_fuse - 1;
@@ -4502,6 +4628,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                 fusion_data.gate_bias = gate_bias_tensor;
                                 fusion_data.glu_op    = ggml_get_glu_op(glu);
 
+                                op_timer.set_path("MUL_MAT_VEC_F_GLU_BIAS_FUSED");
                                 ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                                 fused_mul_mat_vec = true;
                                 fused_node_count = 5;
@@ -4515,6 +4642,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                 fusion_data.gate_bias = gate_bias_tensor;
                                 fusion_data.glu_op    = ggml_get_glu_op(glu);
 
+                                op_timer.set_path("MUL_MAT_VEC_Q_GLU_BIAS_FUSED");
                                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                                 fused_mul_mat_vec = true;
                                 fused_node_count = 5;
@@ -4539,6 +4667,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                 fusion_data.gate   = gate->src[0];
                                 fusion_data.glu_op = ggml_get_glu_op(glu);
 
+                                op_timer.set_path("MUL_MAT_VEC_F_GLU_FUSED");
                                 ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                                 fused_mul_mat_vec = true;
                                 fused_node_count = 3;
@@ -4550,6 +4679,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                 fusion_data.gate   = gate->src[0];
                                 fusion_data.glu_op = ggml_get_glu_op(glu);
 
+                                op_timer.set_path("MUL_MAT_VEC_Q_GLU_FUSED");
                                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                                 fused_mul_mat_vec = true;
                                 fused_node_count = 3;
@@ -4608,6 +4738,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         fusion_data.x_bias = bias_tensor;
 
                         if (ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {
+                            op_timer.set_path("MUL_MAT_VEC_F_BIAS_FUSED");
                             ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
                             fused_mul_mat_vec = true;
                             fused_node_count = 2;
@@ -4615,6 +4746,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         }
 
                         if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
+                            op_timer.set_path("MUL_MAT_VEC_Q_BIAS_FUSED");
                             ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
                             fused_mul_mat_vec = true;
                             fused_node_count = 2;
@@ -4628,18 +4760,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
 
                     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD}, {})) {
+                        op_timer.set_path("RMS_NORM_MUL_ADD_FUSED");
                         ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
                         i += 2;
                         continue;
                     }
 
                     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL}, {})) {
+                        op_timer.set_path("RMS_NORM_MUL_FUSED");
                         ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i+1]);
                         i++;
                         continue;
                     }
 
                     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
+                        op_timer.set_path("SSM_CONV_SILU_FUSED");
                         ggml_cuda_op_ssm_conv(*cuda_ctx, node, cgraph->nodes[i+1]);
                         i++;
                         continue;
@@ -4648,12 +4783,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
                         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
                         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
+                        op_timer.set_path("UNARY_MUL_FUSED");
                         ggml_cuda_op_unary_mul(*cuda_ctx, node, cgraph->nodes[i+1]);
                         i++;
                         continue;
                     }
 
                     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_SQR }, { GGML_UNARY_OP_RELU })) {
+                        op_timer.set_path("RELU_SQR_FUSED");
                         ggml_cuda_op_relu_sqr(*cuda_ctx, node, cgraph->nodes[i+1]);
                         i++;
                         continue;
@@ -4661,6 +4798,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE }, { GGML_UNARY_OP_TANH })) {
                         i += 2;
+                        op_timer.set_path("SOFTCAP_FUSED");
                         ggml_cuda_op_softcap(*cuda_ctx, cgraph->nodes[i], node);
                         continue;
                     }
@@ -4693,6 +4831,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #ifdef USE_CUDA_GRAPH
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (use_cuda_graph && cuda_graph_update_required) { // End CUDA graph capture
+            if (ggml_cuda_rdna3_graph_log_enabled(cuda_ctx->device)) {
+                GGML_LOG_INFO("%s: RDNA3 graph capture end, nodes=%d\n", __func__, cgraph->n_nodes);
+            }
             if (graph->graph != nullptr) {
                 CUDA_CHECK(cudaGraphDestroy(graph->graph));
                 graph->graph = nullptr;
@@ -4713,12 +4854,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
+            if (ggml_cuda_rdna3_graph_log_enabled(cuda_ctx->device)) {
+                GGML_LOG_INFO("%s: RDNA3 graph instantiate\n", __func__);
+            }
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
         }
         if (cuda_graph_update_required) { // Update graph executable
+            if (ggml_cuda_rdna3_graph_log_enabled(cuda_ctx->device)) {
+                GGML_LOG_INFO("%s: RDNA3 graph executable update\n", __func__);
+            }
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
         }
         // Launch graph
+        if (ggml_cuda_rdna3_graph_log_enabled(cuda_ctx->device)) {
+            GGML_LOG_INFO("%s: RDNA3 graph launch\n", __func__);
+        }
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
 #else
         GGML_UNUSED(graph_key);
@@ -4752,6 +4902,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
+    const bool rdna3_op_profile = ggml_cuda_rdna3_op_profile_enabled(cuda_ctx->device);
+    const bool rdna3_graph_log  = ggml_cuda_rdna3_graph_log_enabled(cuda_ctx->device);
 
 #ifdef USE_CUDA_GRAPH
     graph_key = ggml_cuda_graph_get_key(cgraph);
@@ -4759,7 +4911,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    if (graph->is_enabled()) {
+    if (rdna3_graph_log) {
+        GGML_LOG_INFO("%s: RDNA3 graph support compiled=1 env_disabled=%d arch_disabled=%d op_profile=%d nodes=%d uid=%" PRIu64 "\n",
+                __func__, ggml_cuda_env_enabled("GGML_CUDA_DISABLE_GRAPHS") ? 1 : 0,
+                graph->disable_due_to_gpu_arch ? 1 : 0, rdna3_op_profile ? 1 : 0, cgraph->n_nodes, cgraph->uid);
+    }
+
+    if (graph->is_enabled() && !rdna3_op_profile) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
@@ -4784,7 +4942,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     cuda_graph_update_required = graph->instance == nullptr;
                 }
             }
+        } else if (rdna3_graph_log) {
+            GGML_LOG_INFO("%s: RDNA3 graph disabled for this evaluation: incompatible graph\n", __func__);
         }
+    } else if (rdna3_graph_log && rdna3_op_profile) {
+        GGML_LOG_INFO("%s: RDNA3 graph disabled for this evaluation: op profiling uses per-op events\n", __func__);
+    }
+#else
+    if (rdna3_graph_log) {
+        GGML_LOG_INFO("%s: RDNA3 graph support compiled=0 nodes=%d uid=%" PRIu64 "\n",
+                __func__, cgraph->n_nodes, cgraph->uid);
     }
 #endif // USE_CUDA_GRAPH
 
@@ -4798,7 +4965,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
+    ggml_cuda_rdna3_op_profile_state rdna3_profile;
+    if (rdna3_op_profile) {
+        ggml_cuda_rdna3_op_profile_current = &rdna3_profile;
+    }
+
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+    if (rdna3_op_profile) {
+        ggml_cuda_rdna3_op_profile_current = nullptr;
+        ggml_cuda_rdna3_op_profile_print(rdna3_profile);
+    }
 
     return GGML_STATUS_SUCCESS;
 }

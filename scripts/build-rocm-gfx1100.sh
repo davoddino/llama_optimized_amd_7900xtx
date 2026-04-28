@@ -8,6 +8,7 @@ BUILD_DIR="${BUILD_DIR:-$REPO_DIR/build-rocm-gfx1100}"
 ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
 GPU_TARGETS="${GPU_TARGETS:-gfx1100}"
 BUILD_TYPE="${BUILD_TYPE:-Release}"
+GGML_CUDA_GRAPHS="${GGML_CUDA_GRAPHS:-ON}"
 JOBS="${JOBS:-$(nproc)}"
 
 if [[ -x "$ROCM_PATH/llvm/bin/amdclang" && -x "$ROCM_PATH/llvm/bin/amdclang++" ]]; then
@@ -35,10 +36,12 @@ echo "  ROCm path:   $ROCM_PATH"
 echo "  GPU targets: $GPU_TARGETS"
 echo "  C compiler:  $CC_BIN"
 echo "  CXX compiler:$CXX_BIN"
+echo "  CUDA graphs: $GGML_CUDA_GRAPHS"
 
 cmake -S "$REPO_DIR" -B "$BUILD_DIR" -G Ninja \
     -DGGML_HIP=ON \
     -DGPU_TARGETS="$GPU_TARGETS" \
+    -DGGML_CUDA_GRAPHS="$GGML_CUDA_GRAPHS" \
     -DCMAKE_C_COMPILER="$CC_BIN" \
     -DCMAKE_CXX_COMPILER="$CXX_BIN" \
     -DCMAKE_BUILD_TYPE="$BUILD_TYPE"
