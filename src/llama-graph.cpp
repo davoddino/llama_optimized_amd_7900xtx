@@ -2163,6 +2163,14 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     return inp;
 }
 
+static ggml_tensor * build_attn_kv_shared_v_idxs(bool allow_shared, ggml_tensor * k_idxs, ggml_tensor * v_idxs) {
+    if (allow_shared && k_idxs && v_idxs && k_idxs->type == v_idxs->type && ggml_are_same_shape(k_idxs, v_idxs)) {
+        return k_idxs;
+    }
+
+    return v_idxs;
+}
+
 llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
@@ -2210,7 +2218,8 @@ ggml_tensor * llm_graph_context::build_attn(
         const auto & v_idxs = inp->get_v_idxs();
 
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur,
+                    build_attn_kv_shared_v_idxs(mctx_cur->can_share_kv_set_rows_idxs(), k_idxs, v_idxs), il));
     }
 
     const auto & kq_mask = inp->get_kq_mask();
@@ -2380,8 +2389,10 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
 
     // optionally store to KV cache
+    ggml_tensor * k_idxs_store = nullptr;
     if (k_cur) {
         const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
+        k_idxs_store = k_idxs;
 
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
     }
@@ -2389,7 +2400,8 @@ ggml_tensor * llm_graph_context::build_attn(
     if (v_cur) {
         const auto & v_idxs = is_swa ? inp->get_v_idxs_swa() : inp->get_v_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur,
+                    build_attn_kv_shared_v_idxs(mctx_cur->can_share_kv_set_rows_idxs(), k_idxs_store, v_idxs), il));
     }
 
     const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();

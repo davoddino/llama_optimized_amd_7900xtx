@@ -151,6 +151,7 @@ public:
     uint32_t get_n_stream() const;
 
     bool get_has_shift() const;
+    bool can_share_kv_set_rows_idxs() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
@@ -349,6 +350,7 @@ public:
     //
 
     uint32_t get_n_kv() const;
+    bool can_share_kv_set_rows_idxs() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;

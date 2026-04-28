@@ -3680,6 +3680,10 @@ static bool ggml_cuda_tensor_logical_ranges_overlap(const ggml_tensor * a, const
 }
 
 static bool ggml_cuda_should_fuse_set_rows_pair(const ggml_tensor * set_rows0, const ggml_tensor * set_rows1) {
+    if (getenv("GGML_CUDA_RDNA3_DISABLE_SET_ROWS_PAIR_FUSED") != nullptr) {
+        return false;
+    }
+
     if (set_rows0->op != GGML_OP_SET_ROWS || set_rows1->op != GGML_OP_SET_ROWS) {
         return false;
     }

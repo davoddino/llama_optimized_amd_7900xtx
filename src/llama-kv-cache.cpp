@@ -1130,6 +1130,10 @@ bool llama_kv_cache::get_has_shift() const {
     return result;
 }
 
+bool llama_kv_cache::can_share_kv_set_rows_idxs() const {
+    return !v_trans;
+}
+
 ggml_type llama_kv_cache::type_k() const {
     return layers[0].k->type;
 }
@@ -2446,6 +2450,10 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
+}
+
+bool llama_kv_cache_context::can_share_kv_set_rows_idxs() const {
+    return kv->can_share_kv_set_rows_idxs();
 }
 
 ggml_type llama_kv_cache_context::type_k() const {
