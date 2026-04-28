@@ -446,7 +446,9 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
-    mctx->set_input_v_idxs(self_v_idxs, ubatch);
+    if (self_v_idxs && self_v_idxs->buffer) {
+        mctx->set_input_v_idxs(self_v_idxs, ubatch);
+    }
 
     mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
 
@@ -496,12 +498,16 @@ bool llm_graph_input_attn_k::can_reuse(const llm_graph_params & params) {
 
 void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
     mctx->get_base()->set_input_k_idxs(self_k_idxs, ubatch);
-    mctx->get_base()->set_input_v_idxs(self_v_idxs, ubatch);
+    if (self_v_idxs && self_v_idxs->buffer) {
+        mctx->get_base()->set_input_v_idxs(self_v_idxs, ubatch);
+    }
 
     mctx->get_base()->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
 
     mctx->get_swa()->set_input_k_idxs(self_k_idxs_swa, ubatch);
-    mctx->get_swa()->set_input_v_idxs(self_v_idxs_swa, ubatch);
+    if (self_v_idxs_swa && self_v_idxs_swa->buffer) {
+        mctx->get_swa()->set_input_v_idxs(self_v_idxs_swa, ubatch);
+    }
 
     mctx->get_swa()->set_input_kq_mask(self_kq_mask_swa, ubatch, cparams.causal_attn);
 
@@ -572,7 +578,9 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
 
 void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
-    mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
+    if (inp_attn->self_v_idxs && inp_attn->self_v_idxs->buffer) {
+        mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
+    }
 
     mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
 
@@ -669,7 +677,9 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
     // base tensors may not be allocated if there are no non-SWA attention layers
     if (inp_attn->self_k_idxs && inp_attn->self_k_idxs->buffer) {
         attn_ctx->get_base()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
-        attn_ctx->get_base()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
+        if (inp_attn->self_v_idxs && inp_attn->self_v_idxs->buffer) {
+            attn_ctx->get_base()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
+        }
 
         attn_ctx->get_base()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
     }
@@ -677,7 +687,9 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
     // swa tensors may not be allocated if there are no SWA attention layers
     if (inp_attn->self_k_idxs_swa && inp_attn->self_k_idxs_swa->buffer) {
         attn_ctx->get_swa()->set_input_k_idxs(inp_attn->self_k_idxs_swa, ubatch);
-        attn_ctx->get_swa()->set_input_v_idxs(inp_attn->self_v_idxs_swa, ubatch);
+        if (inp_attn->self_v_idxs_swa && inp_attn->self_v_idxs_swa->buffer) {
+            attn_ctx->get_swa()->set_input_v_idxs(inp_attn->self_v_idxs_swa, ubatch);
+        }
 
         attn_ctx->get_swa()->set_input_kq_mask(inp_attn->self_kq_mask_swa, ubatch, cparams.causal_attn);
     }
