@@ -94,7 +94,8 @@ static int rdna3_mmvq_rows_per_block(
 
     const int selected_default = rows_per_block;
     rows_per_block = rdna3_mmvq_env_i32(env_name, rows_per_block);
-    if (rows_per_block != 1 && rows_per_block != 2 && rows_per_block != 4 && rows_per_block != 8) {
+    if (rows_per_block != 1 && rows_per_block != 2 && rows_per_block != 4 &&
+            rows_per_block != 8 && rows_per_block != 16) {
         rows_per_block = selected_default;
     }
 
@@ -759,8 +760,9 @@ static __global__ void mul_mat_vec_q_moe(
     }
 }
 
-template <ggml_type type, int c_rows_per_block, bool has_weights1>
-__launch_bounds__(MMVQ_MAX_BATCH_SIZE*ggml_cuda_get_physical_warp_size(), 1)
+template <ggml_type type, int c_rows_per_block, bool has_weights1,
+          int c_expert_used = MMVQ_MAX_BATCH_SIZE, bool c_single_token = false>
+__launch_bounds__(c_expert_used*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe_weighted(
         const void * __restrict__ vx, const void * __restrict__ vy, const int32_t * __restrict__ ids,
         const float * __restrict__ weights0, const float * __restrict__ weights1, float * __restrict__ dst,
@@ -778,14 +780,25 @@ static __global__ void mul_mat_vec_q_moe_weighted(
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
-    __shared__ float partial[MMVQ_MAX_BATCH_SIZE][c_rows_per_block];
+    __shared__ float partial[c_expert_used][c_rows_per_block];
 
     const uint32_t channel_dst = threadIdx.y;
-    const uint32_t token_idx   = blockIdx.y;
+    const uint32_t token_idx   = c_single_token ? 0 : blockIdx.y;
     const int      row0        = c_rows_per_block*blockIdx.x;
 
-    if (channel_dst >= n_expert_used || token_idx >= ncols_dst) {
-        return;
+    if constexpr (c_expert_used == MMVQ_MAX_BATCH_SIZE && !c_single_token) {
+        if (channel_dst >= n_expert_used || token_idx >= ncols_dst) {
+            return;
+        }
+    } else if constexpr (c_single_token) {
+        GGML_UNUSED(ncols_dst);
+        if (channel_dst >= c_expert_used) {
+            return;
+        }
+    } else {
+        if (channel_dst >= c_expert_used || token_idx >= ncols_dst) {
+            return;
+        }
     }
 
     const int      blocks_per_row_x = ncols_x / qk;
@@ -826,9 +839,13 @@ static __global__ void mul_mat_vec_q_moe_weighted(
 
     if (threadIdx.y == 0 && threadIdx.x < c_rows_per_block && uint32_t(row0 + threadIdx.x) < nrows_x) {
         float sum = 0.0f;
+        if constexpr (c_expert_used == MMVQ_MAX_BATCH_SIZE) {
+            for (uint32_t i = 0; i < n_expert_used; ++i) {
+                sum += partial[i][threadIdx.x];
+            }
+        } else {
 #pragma unroll
-        for (int i = 0; i < MMVQ_MAX_BATCH_SIZE; ++i) {
-            if (uint32_t(i) < n_expert_used) {
+            for (int i = 0; i < c_expert_used; ++i) {
                 sum += partial[i][threadIdx.x];
             }
         }
@@ -905,8 +922,9 @@ static __global__ void mul_mat_vec_q_moe_gate_up(
     }
 }
 
-template <ggml_type type, int c_rows_per_block>
-__launch_bounds__(MMVQ_MAX_BATCH_SIZE*ggml_cuda_get_physical_warp_size(), 1)
+template <ggml_type type, int c_rows_per_block,
+          int c_expert_used = MMVQ_MAX_BATCH_SIZE, bool c_single_token = false>
+__launch_bounds__(c_expert_used*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe_gate_up_split(
         const void * __restrict__ vx_gate, const void * __restrict__ vx_up,
         const void * __restrict__ vy, const int32_t * __restrict__ ids, float * __restrict__ dst,
@@ -923,11 +941,22 @@ static __global__ void mul_mat_vec_q_moe_gate_up_split(
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
     const uint32_t channel_dst = threadIdx.y;
-    const uint32_t token_idx   = blockIdx.y;
+    const uint32_t token_idx   = c_single_token ? 0 : blockIdx.y;
     const int      row0        = c_rows_per_block*blockIdx.x;
 
-    if (channel_dst >= n_expert_used || token_idx >= ncols_dst) {
-        return;
+    if constexpr (c_expert_used == MMVQ_MAX_BATCH_SIZE && !c_single_token) {
+        if (channel_dst >= n_expert_used || token_idx >= ncols_dst) {
+            return;
+        }
+    } else if constexpr (c_single_token) {
+        GGML_UNUSED(ncols_dst);
+        if (channel_dst >= c_expert_used) {
+            return;
+        }
+    } else {
+        if (channel_dst >= c_expert_used || token_idx >= ncols_dst) {
+            return;
+        }
     }
 
     const int      blocks_per_row_x = ncols_x / qk;
@@ -1040,6 +1069,9 @@ static void mul_mat_vec_q_moe_launch_rpb(
         case 8:
             launch(std::integral_constant<int, 8>{});
             break;
+        case 16:
+            launch(std::integral_constant<int, 16>{});
+            break;
         default:
             launch(std::integral_constant<int, 2>{});
             break;
@@ -1081,36 +1113,58 @@ static void mul_mat_vec_q_moe_weighted_launch_rpb(
         const uint32_t weights0_stride_channel, const uint32_t weights0_stride_col,
         const uint32_t weights1_stride_channel, const uint32_t weights1_stride_col,
         const uint32_t n_expert_used, const uint32_t ncols_dst, const uint32_t ids_stride,
-        const int warp_size, cudaStream_t stream, const int rows_per_block) {
+        const int warp_size, cudaStream_t stream, const int rows_per_block, const bool qwen36_top8_decode) {
 
-    auto launch = [&](auto rpb_tag) {
+    auto launch = [&](auto rpb_tag, auto qwen36_tag) {
         constexpr int rpb = decltype(rpb_tag)::value;
+        constexpr bool qwen36 = decltype(qwen36_tag)::value;
         const int64_t nblocks_rows = (nrows_x + rpb - 1) / rpb;
         const dim3 block_nums(nblocks_rows, ncols_dst);
         const dim3 block_dims(warp_size, n_expert_used);
 
-        mul_mat_vec_q_moe_weighted<type, rpb, has_weights1><<<block_nums, block_dims, 0, stream>>>(
-            vx, vy, ids, weights0, weights1, dst, ncols_x, nchannels_y, nrows_x,
-            stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y,
-            weights0_stride_channel, weights0_stride_col,
-            weights1_stride_channel, weights1_stride_col,
-            n_expert_used, ncols_dst, ids_stride);
+        if constexpr (qwen36) {
+            mul_mat_vec_q_moe_weighted<type, rpb, has_weights1, 8, true><<<block_nums, block_dims, 0, stream>>>(
+                vx, vy, ids, weights0, weights1, dst, ncols_x, nchannels_y, nrows_x,
+                stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y,
+                weights0_stride_channel, weights0_stride_col,
+                weights1_stride_channel, weights1_stride_col,
+                n_expert_used, ncols_dst, ids_stride);
+        } else {
+            mul_mat_vec_q_moe_weighted<type, rpb, has_weights1><<<block_nums, block_dims, 0, stream>>>(
+                vx, vy, ids, weights0, weights1, dst, ncols_x, nchannels_y, nrows_x,
+                stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y,
+                weights0_stride_channel, weights0_stride_col,
+                weights1_stride_channel, weights1_stride_col,
+                n_expert_used, ncols_dst, ids_stride);
+        }
     };
 
-    switch (rows_per_block) {
-        case 1:
-            launch(std::integral_constant<int, 1>{});
-            break;
-        case 4:
-            launch(std::integral_constant<int, 4>{});
-            break;
-        case 8:
-            launch(std::integral_constant<int, 8>{});
-            break;
-        default:
-            launch(std::integral_constant<int, 2>{});
-            break;
+    auto dispatch = [&](auto qwen36_tag) {
+        switch (rows_per_block) {
+            case 1:
+                launch(std::integral_constant<int, 1>{}, qwen36_tag);
+                break;
+            case 4:
+                launch(std::integral_constant<int, 4>{}, qwen36_tag);
+                break;
+            case 8:
+                launch(std::integral_constant<int, 8>{}, qwen36_tag);
+                break;
+            case 16:
+                launch(std::integral_constant<int, 16>{}, qwen36_tag);
+                break;
+            default:
+                launch(std::integral_constant<int, 2>{}, qwen36_tag);
+                break;
+        }
+    };
+
+    if (qwen36_top8_decode) {
+        dispatch(std::true_type{});
+        return;
     }
+
+    dispatch(std::false_type{});
 }
 
 template <ggml_type type>
@@ -1125,13 +1179,14 @@ static void mul_mat_vec_q_moe_weighted_launch(
         const uint32_t n_expert_used, const uint32_t ncols_dst, const uint32_t ids_stride,
         const int warp_size, const int cc, cudaStream_t stream) {
 
+    const bool qwen36_top8_decode = rdna3_qwen36_moe_decode_shape(type, cc, ncols_x, nrows_x, n_expert_used, ncols_dst);
     const int rows_per_block = rdna3_mmvq_rows_per_block(
         "GGML_CUDA_RDNA3_MOE_MMVQ_RPB", type, cc, ncols_x, nrows_x, n_expert_used, ncols_dst,
-        /*rdna3_default=*/ 4, /*generic_default=*/ 2, /*qwen36_default=*/ 8);
+        /*rdna3_default=*/ 4, /*generic_default=*/ 2, /*qwen36_default=*/ 16);
     if (getenv("GGML_CUDA_RDNA3_PROFILE_LOG") != nullptr) {
         GGML_LOG_INFO("%s: MMVQ_MOE_WEIGHTED type=%s, rows_per_block=%d, nrows=%u, tokens=%u, experts=%u, scales=%d, qwen36_fast=%d\n",
                 __func__, ggml_type_name(type), rows_per_block, nrows_x, ncols_dst, n_expert_used, weights1 != nullptr ? 2 : 1,
-                rdna3_qwen36_moe_decode_shape(type, cc, ncols_x, nrows_x, n_expert_used, ncols_dst) ? 1 : 0);
+                qwen36_top8_decode ? 1 : 0);
     }
 
     if (weights1 != nullptr) {
@@ -1140,14 +1195,14 @@ static void mul_mat_vec_q_moe_weighted_launch(
             stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y,
             weights0_stride_channel, weights0_stride_col,
             weights1_stride_channel, weights1_stride_col,
-            n_expert_used, ncols_dst, ids_stride, warp_size, stream, rows_per_block);
+            n_expert_used, ncols_dst, ids_stride, warp_size, stream, rows_per_block, qwen36_top8_decode);
     } else {
         mul_mat_vec_q_moe_weighted_launch_rpb<type, false>(
             vx, vy, ids, weights0, nullptr, dst, ncols_x, nchannels_y, nrows_x,
             stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y,
             weights0_stride_channel, weights0_stride_col,
             weights1_stride_channel, weights1_stride_col,
-            n_expert_used, ncols_dst, ids_stride, warp_size, stream, rows_per_block);
+            n_expert_used, ncols_dst, ids_stride, warp_size, stream, rows_per_block, qwen36_top8_decode);
     }
 }
 
@@ -1183,6 +1238,9 @@ static void mul_mat_vec_q_moe_gate_up_launch_rpb(
             break;
         case 8:
             launch(std::integral_constant<int, 8>{});
+            break;
+        case 16:
+            launch(std::integral_constant<int, 16>{});
             break;
         default:
             launch(std::integral_constant<int, 2>{});
@@ -1232,34 +1290,54 @@ static void mul_mat_vec_q_moe_gate_up_split_launch_rpb(
         const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
         const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
         const uint32_t n_expert_used, const uint32_t ncols_dst, const uint32_t ids_stride,
-        const int warp_size, cudaStream_t stream, const int rows_per_block) {
+        const int warp_size, cudaStream_t stream, const int rows_per_block, const bool qwen36_top8_decode) {
 
-    auto launch = [&](auto rpb_tag) {
+    auto launch = [&](auto rpb_tag, auto qwen36_tag) {
         constexpr int rpb = decltype(rpb_tag)::value;
+        constexpr bool qwen36 = decltype(qwen36_tag)::value;
         const int64_t nblocks_rows = (nrows_dst + rpb - 1) / rpb;
         const dim3 block_nums(nblocks_rows, ncols_dst);
         const dim3 block_dims(warp_size, n_expert_used);
 
-        mul_mat_vec_q_moe_gate_up_split<type, rpb><<<block_nums, block_dims, 0, stream>>>(
-            vx_gate, vx_up, vy, ids, dst, ncols_x, nchannels_y, nrows_dst,
-            stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-            n_expert_used, ncols_dst, ids_stride);
+        if constexpr (qwen36) {
+            mul_mat_vec_q_moe_gate_up_split<type, rpb, 8, true><<<block_nums, block_dims, 0, stream>>>(
+                vx_gate, vx_up, vy, ids, dst, ncols_x, nchannels_y, nrows_dst,
+                stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                n_expert_used, ncols_dst, ids_stride);
+        } else {
+            mul_mat_vec_q_moe_gate_up_split<type, rpb><<<block_nums, block_dims, 0, stream>>>(
+                vx_gate, vx_up, vy, ids, dst, ncols_x, nchannels_y, nrows_dst,
+                stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                n_expert_used, ncols_dst, ids_stride);
+        }
     };
 
-    switch (rows_per_block) {
-        case 1:
-            launch(std::integral_constant<int, 1>{});
-            break;
-        case 4:
-            launch(std::integral_constant<int, 4>{});
-            break;
-        case 8:
-            launch(std::integral_constant<int, 8>{});
-            break;
-        default:
-            launch(std::integral_constant<int, 2>{});
-            break;
+    auto dispatch = [&](auto qwen36_tag) {
+        switch (rows_per_block) {
+            case 1:
+                launch(std::integral_constant<int, 1>{}, qwen36_tag);
+                break;
+            case 4:
+                launch(std::integral_constant<int, 4>{}, qwen36_tag);
+                break;
+            case 8:
+                launch(std::integral_constant<int, 8>{}, qwen36_tag);
+                break;
+            case 16:
+                launch(std::integral_constant<int, 16>{}, qwen36_tag);
+                break;
+            default:
+                launch(std::integral_constant<int, 2>{}, qwen36_tag);
+                break;
+        }
+    };
+
+    if (qwen36_top8_decode) {
+        dispatch(std::true_type{});
+        return;
     }
+
+    dispatch(std::false_type{});
 }
 
 template <ggml_type type>
@@ -1271,19 +1349,20 @@ static void mul_mat_vec_q_moe_gate_up_split_launch(
         const uint32_t n_expert_used, const uint32_t ncols_dst, const uint32_t ids_stride,
         const int warp_size, const int cc, cudaStream_t stream) {
 
+    const bool qwen36_top8_decode = rdna3_qwen36_moe_decode_shape(type, cc, ncols_x, nrows_dst, n_expert_used, ncols_dst);
     const int rows_per_block = rdna3_mmvq_rows_per_block(
         "GGML_CUDA_RDNA3_MOE_GATE_UP_RPB", type, cc, ncols_x, nrows_dst, n_expert_used, ncols_dst,
         /*rdna3_default=*/ 2, /*generic_default=*/ 1, /*qwen36_default=*/ 4);
     if (getenv("GGML_CUDA_RDNA3_PROFILE_LOG") != nullptr) {
         GGML_LOG_INFO("%s: MMVQ_MOE_GATE_UP_SPLIT type=%s, rows_per_block=%d, nrows=%u, tokens=%u, experts=%u, qwen36_fast=%d\n",
                 __func__, ggml_type_name(type), rows_per_block, nrows_dst, ncols_dst, n_expert_used,
-                rdna3_qwen36_moe_decode_shape(type, cc, ncols_x, nrows_dst, n_expert_used, ncols_dst) ? 1 : 0);
+                qwen36_top8_decode ? 1 : 0);
     }
 
     mul_mat_vec_q_moe_gate_up_split_launch_rpb<type>(
         vx_gate, vx_up, vy, ids, dst, ncols_x, nchannels_y, nrows_dst,
         stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-        n_expert_used, ncols_dst, ids_stride, warp_size, stream, rows_per_block);
+        n_expert_used, ncols_dst, ids_stride, warp_size, stream, rows_per_block, qwen36_top8_decode);
 }
 
 template <ggml_type type>
