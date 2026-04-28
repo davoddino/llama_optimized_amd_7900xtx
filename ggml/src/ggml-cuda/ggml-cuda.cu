@@ -174,6 +174,32 @@ static bool ggml_cuda_rdna3_qwen36_output_decode_shape(
     }
 }
 
+static bool ggml_cuda_rdna3_qwen36_linear_mmvq_decode_shape(
+        const int device, const ggml_tensor * src0, const ggml_tensor * dst) {
+    if (!ggml_cuda_rdna3_qwen36_fastpath_enabled(device) ||
+            !ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_LINEAR_MMVQ_FAST") ||
+            src0 == nullptr || dst == nullptr || dst->ne[1] != 1) {
+        return false;
+    }
+
+    switch (src0->type) {
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            break;
+        default:
+            return false;
+    }
+
+    const bool qwen36_in =
+        src0->ne[0] == 512 || src0->ne[0] == 2048 || src0->ne[0] == 4096;
+    const bool qwen36_out =
+        src0->ne[1] == 512 || src0->ne[1] == 2048 || src0->ne[1] == 4096 ||
+        src0->ne[1] == 8192 || src0->ne[1] == 12288;
+
+    return qwen36_in && qwen36_out;
+}
+
 static bool ggml_cuda_rdna3_qwen36_topk_moe_decode_shape(
         const int device, const ggml_tensor * logits, const ggml_tensor * weights, const ggml_tensor * ids,
         const ggml_tensor * bias, const ggml_cuda_topk_moe_args & args) {
@@ -2802,7 +2828,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
     } else if (!split && use_mul_mat_vec_q) {
         const bool qwen36_output_fast = ggml_cuda_rdna3_qwen36_output_decode_shape(ctx.device, src0, dst);
-        ggml_cuda_rdna3_op_profile_set_path(qwen36_output_fast ? "QWEN36_OUTPUT_MMVQ_FAST" : "MUL_MAT_VEC_Q");
+        const bool qwen36_linear_fast = ggml_cuda_rdna3_qwen36_linear_mmvq_decode_shape(ctx.device, src0, dst);
+        ggml_cuda_rdna3_op_profile_set_path(qwen36_output_fast ? "QWEN36_OUTPUT_MMVQ_FAST" :
+                qwen36_linear_fast ? "QWEN36_LINEAR_MMVQ_FAST" : "MUL_MAT_VEC_Q");
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
     } else if (!split && use_mul_mat_q) {
         ggml_cuda_rdna3_op_profile_set_path("MUL_MAT_Q");
@@ -3679,12 +3707,72 @@ static bool ggml_cuda_tensor_logical_ranges_overlap(const ggml_tensor * a, const
     return b_start < a_end && a_start < b_end;
 }
 
+static bool ggml_cuda_rdna3_set_rows_pair_log_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_RDNA3_SET_ROWS_PAIR_LOG") != nullptr;
+    return enabled;
+}
+
+static void ggml_cuda_log_set_rows_pair_scan(const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_cuda_rdna3_set_rows_pair_log_enabled()) {
+        return;
+    }
+
+    static std::atomic<int> log_count{0};
+    if (log_count.fetch_add(1, std::memory_order_relaxed) >= 96) {
+        return;
+    }
+
+    const ggml_tensor * node  = cgraph->nodes[node_idx];
+    const ggml_tensor * next1 = node_idx + 1 < cgraph->n_nodes ? cgraph->nodes[node_idx + 1] : nullptr;
+    const ggml_tensor * next2 = node_idx + 2 < cgraph->n_nodes ? cgraph->nodes[node_idx + 2] : nullptr;
+
+    GGML_LOG_INFO("rdna3_set_rows_pair: scan i=%d name=%s next=%s/%s next2=%s/%s idx=%p\n",
+            node_idx, node->name,
+            next1 ? ggml_op_name(next1->op) : "none", next1 ? next1->name : "",
+            next2 ? ggml_op_name(next2->op) : "none", next2 ? next2->name : "",
+            node->src[1] ? (void *) node->src[1] : nullptr);
+}
+
+static void ggml_cuda_log_set_rows_pair_reject(
+        const char        * reason,
+        const ggml_tensor * set_rows0,
+        const ggml_tensor * set_rows1) {
+    if (!ggml_cuda_rdna3_set_rows_pair_log_enabled()) {
+        return;
+    }
+
+    static std::atomic<int> log_count{0};
+    if (log_count.fetch_add(1, std::memory_order_relaxed) >= 96) {
+        return;
+    }
+
+    const ggml_tensor * src00 = set_rows0 && set_rows0->src[0] ? set_rows0->src[0] : nullptr;
+    const ggml_tensor * src01 = set_rows1 && set_rows1->src[0] ? set_rows1->src[0] : nullptr;
+    const ggml_tensor * idx0  = set_rows0 && set_rows0->src[1] ? set_rows0->src[1] : nullptr;
+    const ggml_tensor * idx1  = set_rows1 && set_rows1->src[1] ? set_rows1->src[1] : nullptr;
+
+    GGML_LOG_INFO("rdna3_set_rows_pair: reject=%s a=%s/%s b=%s/%s a_src=%s/%s b_src=%s/%s idx_same=%d idx_type=%s "
+            "a_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] b_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+            "a_src_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] b_src_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+            reason,
+            set_rows0 ? set_rows0->name : "null", set_rows0 ? ggml_type_name(set_rows0->type) : "null",
+            set_rows1 ? set_rows1->name : "null", set_rows1 ? ggml_type_name(set_rows1->type) : "null",
+            src00 ? src00->name : "null", src00 ? ggml_type_name(src00->type) : "null",
+            src01 ? src01->name : "null", src01 ? ggml_type_name(src01->type) : "null",
+            idx0 && idx0 == idx1 ? 1 : 0, idx0 ? ggml_type_name(idx0->type) : "null",
+            set_rows0 ? set_rows0->ne[0] : 0, set_rows0 ? set_rows0->ne[1] : 0, set_rows0 ? set_rows0->ne[2] : 0, set_rows0 ? set_rows0->ne[3] : 0,
+            set_rows1 ? set_rows1->ne[0] : 0, set_rows1 ? set_rows1->ne[1] : 0, set_rows1 ? set_rows1->ne[2] : 0, set_rows1 ? set_rows1->ne[3] : 0,
+            src00 ? src00->ne[0] : 0, src00 ? src00->ne[1] : 0, src00 ? src00->ne[2] : 0, src00 ? src00->ne[3] : 0,
+            src01 ? src01->ne[0] : 0, src01 ? src01->ne[1] : 0, src01 ? src01->ne[2] : 0, src01 ? src01->ne[3] : 0);
+}
+
 static bool ggml_cuda_should_fuse_set_rows_pair(const ggml_tensor * set_rows0, const ggml_tensor * set_rows1) {
     if (getenv("GGML_CUDA_RDNA3_DISABLE_SET_ROWS_PAIR_FUSED") != nullptr) {
         return false;
     }
 
     if (set_rows0->op != GGML_OP_SET_ROWS || set_rows1->op != GGML_OP_SET_ROWS) {
+        ggml_cuda_log_set_rows_pair_reject("op", set_rows0, set_rows1);
         return false;
     }
 
@@ -3694,28 +3782,34 @@ static bool ggml_cuda_should_fuse_set_rows_pair(const ggml_tensor * set_rows0, c
     const ggml_tensor * idx1  = set_rows1->src[1];
 
     if (src00->type != GGML_TYPE_F32 || src01->type != GGML_TYPE_F32) {
+        ggml_cuda_log_set_rows_pair_reject("src-type", set_rows0, set_rows1);
         return false;
     }
 
     if (idx0 != idx1 || (idx0->type != GGML_TYPE_I64 && idx0->type != GGML_TYPE_I32)) {
+        ggml_cuda_log_set_rows_pair_reject("idx", set_rows0, set_rows1);
         return false;
     }
 
     if (set_rows0->type != set_rows1->type || !ggml_cuda_set_rows_pair_type_supported(set_rows0->type)) {
+        ggml_cuda_log_set_rows_pair_reject("dst-type", set_rows0, set_rows1);
         return false;
     }
 
     if (!ggml_are_same_shape(src00, src01) || !ggml_are_same_shape(set_rows0, set_rows1)) {
+        ggml_cuda_log_set_rows_pair_reject("shape", set_rows0, set_rows1);
         return false;
     }
 
     for (int i = 1; i < GGML_MAX_DIMS; ++i) {
         if (src00->nb[i] != src01->nb[i] || set_rows0->nb[i] != set_rows1->nb[i]) {
+            ggml_cuda_log_set_rows_pair_reject("stride", set_rows0, set_rows1);
             return false;
         }
     }
 
     if (ggml_cuda_tensor_logical_ranges_overlap(set_rows0, set_rows1)) {
+        ggml_cuda_log_set_rows_pair_reject("dst-overlap", set_rows0, set_rows1);
         return false;
     }
 
@@ -3725,6 +3819,7 @@ static bool ggml_cuda_should_fuse_set_rows_pair(const ggml_tensor * set_rows0, c
         ggml_cuda_tensor_logical_ranges_overlap(set_rows1, src00) ||
         ggml_cuda_tensor_logical_ranges_overlap(set_rows1, src01) ||
         ggml_cuda_tensor_logical_ranges_overlap(set_rows1, idx0)) {
+        ggml_cuda_log_set_rows_pair_reject("src-overlap", set_rows0, set_rows1);
         return false;
     }
 
@@ -5101,6 +5196,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         ggml_cuda_op_rope_fused(*cuda_ctx, rope, set_rows);
                         i += 2;
                         continue;
+                    }
+
+                    if (node->op == GGML_OP_SET_ROWS) {
+                        ggml_cuda_log_set_rows_pair_scan(cgraph, i);
                     }
 
                     if (can_fuse_linear_stream_region(2) &&

@@ -2183,6 +2183,70 @@ static ggml_tensor * build_attn_kv_shared_v_idxs(bool allow_shared, ggml_tensor 
     return v_idxs;
 }
 
+static bool build_attn_kv_type_tqkv(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_TQKV_2_0:
+        case GGML_TYPE_TQKV_2_5:
+        case GGML_TYPE_TQKV_3_0:
+        case GGML_TYPE_TQKV_3_5:
+        case GGML_TYPE_TQKV_4_0:
+        case GGML_TYPE_TQKV_2_0_IP:
+        case GGML_TYPE_TQKV_2_5_IP:
+        case GGML_TYPE_TQKV_3_0_IP:
+        case GGML_TYPE_TQKV_3_5_IP:
+        case GGML_TYPE_TQKV_4_0_IP:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool build_attn_kv_can_pair_set_rows(
+        const llama_kv_cache_context * mctx,
+        const llama_hparams          & hparams,
+        ggml_tensor                  * k_store,
+        ggml_tensor                  * v_store,
+        ggml_tensor                  * k_idxs,
+        ggml_tensor                  * v_idxs,
+        int                            il) {
+    if (!k_store || !v_store || k_store->op != GGML_OP_SET_ROWS || v_store->op != GGML_OP_SET_ROWS) {
+        return false;
+    }
+
+    if (!mctx->can_share_kv_set_rows_idxs() || mctx->type_k() != mctx->type_v() || !build_attn_kv_type_tqkv(mctx->type_k())) {
+        return false;
+    }
+
+    return hparams.n_embd_k_gqa(il) == hparams.n_embd_v_gqa(il) &&
+        k_idxs && v_idxs && k_idxs->type == v_idxs->type && ggml_are_same_shape(k_idxs, v_idxs);
+}
+
+static void build_attn_kv_expand_store_pairable(
+        ggml_cgraph                  * gf,
+        const llama_kv_cache_context * mctx,
+        const llama_hparams          & hparams,
+        ggml_tensor                  * k_store,
+        ggml_tensor                  * v_store,
+        ggml_tensor                  * k_idxs,
+        ggml_tensor                  * v_idxs,
+        int                            il) {
+    if (build_attn_kv_can_pair_set_rows(mctx, hparams, k_store, v_store, k_idxs, v_idxs, il)) {
+        ggml_build_forward_expand(gf, k_store->src[0]);
+        ggml_build_forward_expand(gf, v_store->src[0]);
+        ggml_build_forward_expand(gf, k_store);
+        ggml_build_forward_expand(gf, v_store);
+        return;
+    }
+
+    if (k_store) {
+        ggml_build_forward_expand(gf, k_store);
+    }
+
+    if (v_store) {
+        ggml_build_forward_expand(gf, v_store);
+    }
+}
+
 llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
@@ -2228,10 +2292,12 @@ ggml_tensor * llm_graph_context::build_attn(
     {
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
+        ggml_tensor * v_idxs_store = build_attn_kv_shared_v_idxs(mctx_cur->can_share_kv_set_rows_idxs(), k_idxs, v_idxs);
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur,
-                    build_attn_kv_shared_v_idxs(mctx_cur->can_share_kv_set_rows_idxs(), k_idxs, v_idxs), il));
+        ggml_tensor * k_store = mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il);
+        ggml_tensor * v_store = mctx_cur->cpy_v(ctx0, v_cur, v_idxs_store, il);
+
+        build_attn_kv_expand_store_pairable(gf, mctx_cur, hparams, k_store, v_store, k_idxs, v_idxs_store, il);
     }
 
     const auto & kq_mask = inp->get_kq_mask();
@@ -2402,19 +2468,24 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // optionally store to KV cache
     ggml_tensor * k_idxs_store = nullptr;
+    ggml_tensor * k_store = nullptr;
     if (k_cur) {
         const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
         k_idxs_store = k_idxs;
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+        k_store = mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il);
     }
 
+    ggml_tensor * v_idxs_store = nullptr;
+    ggml_tensor * v_store = nullptr;
     if (v_cur) {
         const auto & v_idxs = is_swa ? inp->get_v_idxs_swa() : inp->get_v_idxs();
+        v_idxs_store = build_attn_kv_shared_v_idxs(mctx_cur->can_share_kv_set_rows_idxs(), k_idxs_store, v_idxs);
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur,
-                    build_attn_kv_shared_v_idxs(mctx_cur->can_share_kv_set_rows_idxs(), k_idxs_store, v_idxs), il));
+        v_store = mctx_cur->cpy_v(ctx0, v_cur, v_idxs_store, il);
     }
+
+    build_attn_kv_expand_store_pairable(gf, mctx_cur, hparams, k_store, v_store, k_idxs_store, v_idxs_store, il);
 
     const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
 
