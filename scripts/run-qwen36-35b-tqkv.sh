@@ -47,6 +47,7 @@ RDNA3_TQKV_FATTN_KQ_LANES="${RDNA3_TQKV_FATTN_KQ_LANES:-}"
 RDNA3_TQKV_FATTN_GQA_DECODE="${RDNA3_TQKV_FATTN_GQA_DECODE:-1}"
 RDNA3_TQKV_FATTN_GQA_HEADS="${RDNA3_TQKV_FATTN_GQA_HEADS:-4}"
 RDNA3_MOE_MMVQ_RPB="${RDNA3_MOE_MMVQ_RPB:-}"
+RDNA3_MOE_DOWN_RPB="${RDNA3_MOE_DOWN_RPB:-}"
 RDNA3_MOE_GATE_UP_RPB="${RDNA3_MOE_GATE_UP_RPB:-}"
 RDNA3_GDN_WARPS="${RDNA3_GDN_WARPS:-}"
 RDNA3_GDN_AR_COLS="${RDNA3_GDN_AR_COLS:-}"
@@ -244,6 +245,10 @@ if [[ -n "$RDNA3_MOE_MMVQ_RPB" ]]; then
     export GGML_CUDA_RDNA3_MOE_MMVQ_RPB="$RDNA3_MOE_MMVQ_RPB"
 fi
 
+if [[ -n "$RDNA3_MOE_DOWN_RPB" ]]; then
+    export GGML_CUDA_RDNA3_MOE_DOWN_RPB="$RDNA3_MOE_DOWN_RPB"
+fi
+
 if [[ -n "$RDNA3_MOE_GATE_UP_RPB" ]]; then
     export GGML_CUDA_RDNA3_MOE_GATE_UP_RPB="$RDNA3_MOE_GATE_UP_RPB"
 fi
@@ -297,6 +302,7 @@ echo "  rdna3 tqkv fattn KQ lanes: ${RDNA3_TQKV_FATTN_KQ_LANES:-auto}"
 echo "  rdna3 tqkv fattn GQA decode: $RDNA3_TQKV_FATTN_GQA_DECODE"
 echo "  rdna3 tqkv fattn GQA heads/block: $RDNA3_TQKV_FATTN_GQA_HEADS"
 echo "  rdna3 moe mmvq rows/block: ${RDNA3_MOE_MMVQ_RPB:-auto}"
+echo "  rdna3 moe down rows/block: ${RDNA3_MOE_DOWN_RPB:-${RDNA3_MOE_MMVQ_RPB:-auto}}"
 echo "  rdna3 moe gate_up rows/block: ${RDNA3_MOE_GATE_UP_RPB:-auto}"
 echo "  rdna3 gated delta net warps: ${RDNA3_GDN_WARPS:-auto}"
 echo "  rdna3 gated delta net ar cols/block: ${RDNA3_GDN_AR_COLS:-auto}"

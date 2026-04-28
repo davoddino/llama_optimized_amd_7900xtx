@@ -72,7 +72,8 @@ static __global__ void k_set_rows_quant(const float * __restrict__ src0,
 template <typename idx_t, typename block_type, int qk, void (*quantize_func)(const float *, block_type *)>
 static __global__ void k_set_rows_quant_pair(const float * __restrict__ src0_0,
                                              const float * __restrict__ src0_1,
-                                             const idx_t * __restrict__ src1,
+                                             const idx_t * __restrict__ src1_0,
+                                             const idx_t * __restrict__ src1_1,
                                              block_type * __restrict__ dst0,
                                              block_type * __restrict__ dst1,
                                              const int64_t ne_total,
@@ -122,6 +123,7 @@ static __global__ void k_set_rows_quant_pair(const float * __restrict__ src0_0,
     const int64_t i11 = fastmodulo((uint32_t) i02, ne11_fd);
     const int64_t i10 = i01;
 
+    const idx_t * src1 = pair == 0 ? src1_0 : src1_1;
     const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
 
     const float * src0 = pair == 0 ? src0_0 : src0_1;
@@ -183,7 +185,9 @@ static void set_rows_cuda_quant(
 
 template<typename idx_t, typename block_type, int qk, void (*quantize_func)(const float*, block_type*)>
 static void set_rows_pair_cuda_quant(
-        const float * src0_0_d, const float * src0_1_d, const idx_t * src1_d, block_type * dst0_d, block_type * dst1_d,
+        const float * src0_0_d, const float * src0_1_d,
+        const idx_t * src1_0_d, const idx_t * src1_1_d,
+        block_type * dst0_d, block_type * dst1_d,
         const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
         const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
         const size_t nb01, const size_t nb02, const size_t nb03,
@@ -215,7 +219,7 @@ static void set_rows_pair_cuda_quant(
         const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
 
         k_set_rows_quant_pair<idx_t, block_type, qk, quantize_func><<<grid_size, block_size, 0, stream>>>(
-            src0_0_d, src0_1_d, src1_d, dst0_d, dst1_d, ne_total, ne10, ne11, ne12, ne13, s01, s02, s03,
+            src0_0_d, src0_1_d, src1_0_d, src1_1_d, dst0_d, dst1_d, ne_total, ne10, ne11, ne12, ne13, s01, s02, s03,
             s10, s11, s12, s1, s2, s3, ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
     }
 }
@@ -284,7 +288,8 @@ static __global__ void k_set_rows(const src_t * __restrict__ src0,
 template <typename src_t, typename idx_t, typename dst_t>
 static __global__ void k_set_rows_pair(const src_t * __restrict__ src0_0,
                                        const src_t * __restrict__ src0_1,
-                                       const idx_t * __restrict__ src1,
+                                       const idx_t * __restrict__ src1_0,
+                                       const idx_t * __restrict__ src1_1,
                                        dst_t * __restrict__ dst0,
                                        dst_t * __restrict__ dst1,
                                        const int64_t ne_total,
@@ -333,6 +338,7 @@ static __global__ void k_set_rows_pair(const src_t * __restrict__ src0_0,
     const int64_t i11 = fastmodulo((uint32_t) i02, ne11_fd);
     const int64_t i10 = i01;
 
+    const idx_t * src1 = pair == 0 ? src1_0 : src1_1;
     const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
 
     const src_t * src0 = pair == 0 ? src0_0 : src0_1;
@@ -390,7 +396,9 @@ static void set_rows_cuda(
 
 template<typename src_t, typename idx_t, typename dst_t>
 static void set_rows_pair_cuda(
-        const src_t * src0_0_d, const src_t * src0_1_d, const idx_t * src1_d, dst_t * dst0_d, dst_t * dst1_d,
+        const src_t * src0_0_d, const src_t * src0_1_d,
+        const idx_t * src1_0_d, const idx_t * src1_1_d,
+        dst_t * dst0_d, dst_t * dst1_d,
         const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
         const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
         const size_t nb01, const size_t nb02, const size_t nb03,
@@ -420,7 +428,7 @@ static void set_rows_pair_cuda(
         const uint3 ne11_fd = init_fastdiv_values((uint32_t) ne11);
         const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
 
-        k_set_rows_pair<<<grid_size, block_size, 0, stream>>>(src0_0_d, src0_1_d, src1_d, dst0_d, dst1_d,
+        k_set_rows_pair<<<grid_size, block_size, 0, stream>>>(src0_0_d, src0_1_d, src1_0_d, src1_1_d, dst0_d, dst1_d,
                                                               ne_total, ne10, ne11, ne12, ne13, s01, s02, s03,
                                                               s10, s11, s12, s1, s2, s3, ne00_fd, ne01_fd,
                                                               ne02_fd, ne11_fd, ne12_fd);
@@ -637,14 +645,17 @@ static void set_rows_pair_cuda(
         ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0_0,
         const ggml_tensor * src0_1,
-        const ggml_tensor * src1,
+        const ggml_tensor * src1_0,
+        const ggml_tensor * src1_1,
         ggml_tensor * dst0,
         ggml_tensor * dst1) {
     const src_t * src0_0_d = (const src_t *)src0_0->data;
     const src_t * src0_1_d = (const src_t *)src0_1->data;
-    const idx_t * src1_d   = (const idx_t *)src1->data;
+    const idx_t * src1_0_d = (const idx_t *)src1_0->data;
+    const idx_t * src1_1_d = (const idx_t *)src1_1->data;
 
     const ggml_tensor * src0 = src0_0;
+    const ggml_tensor * src1 = src1_0;
     ggml_tensor * dst = dst0;
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -655,7 +666,7 @@ static void set_rows_pair_cuda(
 
     if (dst0->type == GGML_TYPE_F32) {
         set_rows_pair_cuda(
-            src0_0_d, src0_1_d, src1_d, (float*)dst0->data, (float*)dst1->data,
+            src0_0_d, src0_1_d, src1_0_d, src1_1_d, (float*)dst0->data, (float*)dst1->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
             nb01, nb02, nb03,
@@ -665,7 +676,7 @@ static void set_rows_pair_cuda(
         );
     } else if (dst0->type == GGML_TYPE_F16) {
         set_rows_pair_cuda(
-            src0_0_d, src0_1_d, src1_d, (half*)dst0->data, (half*)dst1->data,
+            src0_0_d, src0_1_d, src1_0_d, src1_1_d, (half*)dst0->data, (half*)dst1->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
             nb01, nb02, nb03,
@@ -675,7 +686,7 @@ static void set_rows_pair_cuda(
         );
     } else if (dst0->type == GGML_TYPE_BF16) {
         set_rows_pair_cuda(
-            src0_0_d, src0_1_d, src1_d, (nv_bfloat16*)dst0->data, (nv_bfloat16*)dst1->data,
+            src0_0_d, src0_1_d, src1_0_d, src1_1_d, (nv_bfloat16*)dst0->data, (nv_bfloat16*)dst1->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
             nb01, nb02, nb03,
@@ -687,7 +698,7 @@ static void set_rows_pair_cuda(
 #define GGML_CUDA_SET_ROWS_PAIR_QUANT(type_name, block_type, qk, quant_func)                         \
     else if (dst0->type == type_name) {                                                              \
         set_rows_pair_cuda_quant<idx_t, block_type, qk, quant_func>(                                  \
-            src0_0_d, src0_1_d, src1_d, (block_type*)dst0->data, (block_type*)dst1->data,             \
+            src0_0_d, src0_1_d, src1_0_d, src1_1_d, (block_type*)dst0->data, (block_type*)dst1->data, \
             ne00, ne01, ne02, ne03,                                                                  \
             ne10, ne11, ne12, ne13,                                                                  \
             nb01, nb02, nb03,                                                                        \
@@ -736,17 +747,18 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 void ggml_cuda_op_set_rows_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst0, ggml_tensor * dst1) {
     const ggml_tensor * src0_0 = dst0->src[0];
     const ggml_tensor * src0_1 = dst1->src[0];
-    const ggml_tensor * src1   = dst0->src[1];
+    const ggml_tensor * src1_0 = dst0->src[1];
+    const ggml_tensor * src1_1 = dst1->src[1];
 
     GGML_ASSERT(src0_0->type == GGML_TYPE_F32);
     GGML_ASSERT(src0_1->type == GGML_TYPE_F32);
-    GGML_ASSERT(src1 == dst1->src[1]);
-    GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);
+    GGML_ASSERT(src1_0->type == src1_1->type);
+    GGML_ASSERT(src1_0->type == GGML_TYPE_I64 || src1_0->type == GGML_TYPE_I32);
     GGML_ASSERT(dst0->type == dst1->type);
 
-    if (src1->type == GGML_TYPE_I64) {
-        set_rows_pair_cuda<float, int64_t>(ctx, src0_0, src0_1, src1, dst0, dst1);
+    if (src1_0->type == GGML_TYPE_I64) {
+        set_rows_pair_cuda<float, int64_t>(ctx, src0_0, src0_1, src1_0, src1_1, dst0, dst1);
     } else {
-        set_rows_pair_cuda<float, int32_t>(ctx, src0_0, src0_1, src1, dst0, dst1);
+        set_rows_pair_cuda<float, int32_t>(ctx, src0_0, src0_1, src1_0, src1_1, dst0, dst1);
     }
 }
