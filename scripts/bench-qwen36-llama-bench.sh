@@ -18,20 +18,20 @@ OUT_FORMAT="${OUT_FORMAT:-md}"
 
 case "$TQKV_PROFILE" in
     fast)
-        CACHE_TYPE_K="tqkv_fast"
-        CACHE_TYPE_V="tqkv_fast"
+        CACHE_TYPE_K="tqkv_4_0"
+        CACHE_TYPE_V="tqkv_4_0"
         ;;
     compact)
-        CACHE_TYPE_K="tqkv_compact"
-        CACHE_TYPE_V="tqkv_compact"
+        CACHE_TYPE_K="tqkv_2_0"
+        CACHE_TYPE_V="tqkv_2_0"
         ;;
     quality)
-        CACHE_TYPE_K="tqkv_quality"
-        CACHE_TYPE_V="tqkv_quality"
+        CACHE_TYPE_K="tqkv_3_5_ip"
+        CACHE_TYPE_V="tqkv_3_5_ip"
         ;;
     custom)
-        CACHE_TYPE_K="${CACHE_TYPE_K:-tqkv_fast}"
-        CACHE_TYPE_V="${CACHE_TYPE_V:-tqkv_fast}"
+        CACHE_TYPE_K="${CACHE_TYPE_K:-tqkv_4_0}"
+        CACHE_TYPE_V="${CACHE_TYPE_V:-tqkv_4_0}"
         ;;
     *)
         echo "Unsupported TQKV_PROFILE=$TQKV_PROFILE" >&2
