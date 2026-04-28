@@ -354,6 +354,22 @@ static int64_t ggml_cuda_fattn_env_i64(const char * name, const int64_t default_
     return parsed;
 }
 
+int ggml_cuda_rdna3_tqkv_fattn_kq_lanes(const int cc) {
+    if (!GGML_CUDA_CC_IS_RDNA3(cc)) {
+        return 2;
+    }
+
+    const int64_t requested = ggml_cuda_fattn_env_i64("GGML_CUDA_RDNA3_TQKV_FATTN_KQ_LANES", 2);
+    switch (requested) {
+        case 2:
+        case 4:
+        case 8:
+            return int(requested);
+        default:
+            return 2;
+    }
+}
+
 static bool ggml_cuda_rdna3_tqkv_fattn_force_tile(const int cc, const ggml_tensor * Q, const ggml_tensor * K) {
     if (!GGML_CUDA_CC_IS_RDNA3(cc) || Q->ne[1] > 2) {
         return false;
@@ -616,8 +632,23 @@ const char * ggml_cuda_flash_attn_ext_kernel_name(int device, const ggml_tensor 
     const ggml_tensor * V = dst->src[2];
     const bool tqkv = (K != nullptr && ggml_cuda_fattn_type_is_tqkv(K->type)) ||
         (V != nullptr && ggml_cuda_fattn_type_is_tqkv(V->type));
+    const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, dst);
 
-    return ggml_cuda_fattn_kernel_name(ggml_cuda_get_best_fattn_kernel(device, dst), tqkv);
+    if (kernel == BEST_FATTN_KERNEL_VEC && K != nullptr && V != nullptr &&
+            K->type == GGML_TYPE_TQKV_4_0 && V->type == GGML_TYPE_TQKV_4_0 &&
+            GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[device].cc)) {
+        switch (ggml_cuda_rdna3_tqkv_fattn_kq_lanes(ggml_cuda_info().devices[device].cc)) {
+            case 4:
+                return "FLASH_ATTN_TQKV_VEC_KQ4";
+            case 8:
+                return "FLASH_ATTN_TQKV_VEC_KQ8";
+            case 2:
+            default:
+                return "FLASH_ATTN_TQKV_VEC_KQ2";
+        }
+    }
+
+    return ggml_cuda_fattn_kernel_name(kernel, tqkv);
 #endif // FLASH_ATTN_AVAILABLE
 }
 

@@ -343,6 +343,20 @@ static void ggml_cuda_rdna3_op_profile_set_path(const char * path) {
     }
 }
 
+static size_t ggml_cuda_rdna3_op_profile_row_limit(const char * env_name, const size_t default_value, const size_t available) {
+    const char * env = getenv(env_name);
+    if (env == nullptr || env[0] == '\0') {
+        return std::min(default_value, available);
+    }
+
+    const int64_t requested = ggml_cuda_env_i64(env_name, int64_t(default_value));
+    if (requested <= 0) {
+        return available;
+    }
+
+    return std::min(size_t(requested), available);
+}
+
 static void ggml_cuda_rdna3_op_profile_print(const ggml_cuda_rdna3_op_profile_state & profile, const int64_t n_tokens) {
     if (profile.records.empty()) {
         GGML_LOG_INFO("rdna3_op_profile: no GPU ops recorded\n");
@@ -359,9 +373,37 @@ static void ggml_cuda_rdna3_op_profile_print(const ggml_cuda_rdna3_op_profile_st
     } else {
         GGML_LOG_INFO("rdna3_op_profile: top GPU op costs for this graph evaluation (tokens=unknown)\n");
     }
+
+    std::unordered_map<std::string, ggml_cuda_rdna3_op_profile_record> by_path;
+    for (const auto & row : rows) {
+        const size_t sep = row.first.find(" | ");
+        const std::string path = sep == std::string::npos ? row.first : row.first.substr(0, sep);
+        ggml_cuda_rdna3_op_profile_record & rec = by_path[path];
+        rec.calls += row.second.calls;
+        rec.total_ms += row.second.total_ms;
+        rec.max_ms = std::max(rec.max_ms, row.second.max_ms);
+    }
+
+    std::vector<std::pair<std::string, ggml_cuda_rdna3_op_profile_record>> path_rows(by_path.begin(), by_path.end());
+    std::sort(path_rows.begin(), path_rows.end(), [](const auto & a, const auto & b) {
+        return a.second.total_ms > b.second.total_ms;
+    });
+
+    const size_t max_summary_rows =
+        ggml_cuda_rdna3_op_profile_row_limit("GGML_CUDA_RDNA3_OP_PROFILE_SUMMARY_ROWS", 16, path_rows.size());
+    GGML_LOG_INFO("rdna3_op_profile: totals by path\n");
+    GGML_LOG_INFO("rdna3_op_profile: %-9s %-9s %-9s %-9s %s\n", "calls", "total_ms", "avg_ms", "max_ms", "path");
+    for (size_t i = 0; i < path_rows.size() && i < max_summary_rows; ++i) {
+        const auto & row = path_rows[i];
+        const auto & rec = row.second;
+        const double avg_ms = rec.calls > 0 ? rec.total_ms / double(rec.calls) : 0.0;
+        GGML_LOG_INFO("rdna3_op_profile: %-9" PRId64 " %-9.3f %-9.3f %-9.3f %s\n",
+                rec.calls, rec.total_ms, avg_ms, rec.max_ms, row.first.c_str());
+    }
+
     GGML_LOG_INFO("rdna3_op_profile: %-9s %-9s %-9s %-9s %s\n", "calls", "total_ms", "avg_ms", "max_ms", "path | op | tensor");
 
-    const size_t max_rows = 64;
+    const size_t max_rows = ggml_cuda_rdna3_op_profile_row_limit("GGML_CUDA_RDNA3_OP_PROFILE_MAX_ROWS", 64, rows.size());
     for (size_t i = 0; i < rows.size() && i < max_rows; ++i) {
         const auto & row = rows[i];
         const auto & rec = row.second;
@@ -3259,6 +3301,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_gated_linear_attn(ctx, dst);
             break;
         case GGML_OP_GATED_DELTA_NET:
+            ggml_cuda_rdna3_op_profile_set_path(ggml_cuda_gated_delta_net_kernel_name(ctx.device, dst));
             ggml_cuda_op_gated_delta_net(ctx, dst);
             break;
         case GGML_OP_RWKV_WKV7:

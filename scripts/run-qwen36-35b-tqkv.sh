@@ -24,8 +24,11 @@ CACHE_IDLE_SLOTS="${CACHE_IDLE_SLOTS:-}"
 RDNA3_PROFILE_LOG="${RDNA3_PROFILE_LOG:-0}"
 RDNA3_OP_PROFILE="${RDNA3_OP_PROFILE:-0}"
 RDNA3_OP_PROFILE_MAX_TOKENS="${RDNA3_OP_PROFILE_MAX_TOKENS:-}"
+RDNA3_OP_PROFILE_MAX_ROWS="${RDNA3_OP_PROFILE_MAX_ROWS:-}"
+RDNA3_OP_PROFILE_SUMMARY_ROWS="${RDNA3_OP_PROFILE_SUMMARY_ROWS:-}"
 RDNA3_GRAPH_LOG="${RDNA3_GRAPH_LOG:-0}"
 RDNA3_FAIL_ON_HOST_SYNC="${RDNA3_FAIL_ON_HOST_SYNC:-0}"
+RDNA3_KERNEL_PRESET="${RDNA3_KERNEL_PRESET:-auto}"
 RDNA3_DISABLE_QWEN_TOPK="${RDNA3_DISABLE_QWEN_TOPK:-${RDNA3_DISABLE_QWEN35_TOPK:-0}}"
 RDNA3_DISABLE_QWEN35_TOPK="${RDNA3_DISABLE_QWEN35_TOPK:-$RDNA3_DISABLE_QWEN_TOPK}"
 RDNA3_DISABLE_MOE_GATE_UP_FUSED="${RDNA3_DISABLE_MOE_GATE_UP_FUSED:-0}"
@@ -36,10 +39,33 @@ RDNA3_QWEN36_FASTPATH="${RDNA3_QWEN36_FASTPATH:-1}"
 RDNA3_QWEN36_TOPK_RPB="${RDNA3_QWEN36_TOPK_RPB:-}"
 RDNA3_TQKV_FATTN_TILE="${RDNA3_TQKV_FATTN_TILE:-0}"
 RDNA3_TQKV_FATTN_TILE_MIN_CTX="${RDNA3_TQKV_FATTN_TILE_MIN_CTX:-}"
+RDNA3_TQKV_FATTN_KQ_LANES="${RDNA3_TQKV_FATTN_KQ_LANES:-}"
 RDNA3_MOE_MMVQ_RPB="${RDNA3_MOE_MMVQ_RPB:-}"
 RDNA3_MOE_GATE_UP_RPB="${RDNA3_MOE_GATE_UP_RPB:-}"
 RDNA3_GDN_WARPS="${RDNA3_GDN_WARPS:-}"
 RDNA3_GDN_AR_COLS="${RDNA3_GDN_AR_COLS:-}"
+
+case "$RDNA3_KERNEL_PRESET" in
+    auto)
+        ;;
+    attn-kq4)
+        RDNA3_TQKV_FATTN_KQ_LANES="${RDNA3_TQKV_FATTN_KQ_LANES:-4}"
+        ;;
+    attn-kq8)
+        RDNA3_TQKV_FATTN_KQ_LANES="${RDNA3_TQKV_FATTN_KQ_LANES:-8}"
+        ;;
+    decode-wide)
+        RDNA3_TQKV_FATTN_KQ_LANES="${RDNA3_TQKV_FATTN_KQ_LANES:-4}"
+        RDNA3_GDN_AR_COLS="${RDNA3_GDN_AR_COLS:-16}"
+        RDNA3_MOE_MMVQ_RPB="${RDNA3_MOE_MMVQ_RPB:-8}"
+        RDNA3_MOE_GATE_UP_RPB="${RDNA3_MOE_GATE_UP_RPB:-8}"
+        ;;
+    *)
+        echo "Unsupported RDNA3_KERNEL_PRESET=$RDNA3_KERNEL_PRESET" >&2
+        echo "Allowed values: auto, attn-kq4, attn-kq8, decode-wide" >&2
+        exit 1
+        ;;
+esac
 
 case "$TQKV_PROFILE" in
     fast)
@@ -137,6 +163,14 @@ if [[ -n "$RDNA3_OP_PROFILE_MAX_TOKENS" ]]; then
     export GGML_CUDA_RDNA3_OP_PROFILE_MAX_TOKENS="$RDNA3_OP_PROFILE_MAX_TOKENS"
 fi
 
+if [[ -n "$RDNA3_OP_PROFILE_MAX_ROWS" ]]; then
+    export GGML_CUDA_RDNA3_OP_PROFILE_MAX_ROWS="$RDNA3_OP_PROFILE_MAX_ROWS"
+fi
+
+if [[ -n "$RDNA3_OP_PROFILE_SUMMARY_ROWS" ]]; then
+    export GGML_CUDA_RDNA3_OP_PROFILE_SUMMARY_ROWS="$RDNA3_OP_PROFILE_SUMMARY_ROWS"
+fi
+
 if [[ "$RDNA3_GRAPH_LOG" == "1" ]]; then
     export GGML_CUDA_RDNA3_GRAPH_LOG=1
 fi
@@ -182,6 +216,10 @@ if [[ -n "$RDNA3_TQKV_FATTN_TILE_MIN_CTX" ]]; then
     export GGML_CUDA_RDNA3_TQKV_FATTN_TILE_MIN_CTX="$RDNA3_TQKV_FATTN_TILE_MIN_CTX"
 fi
 
+if [[ -n "$RDNA3_TQKV_FATTN_KQ_LANES" ]]; then
+    export GGML_CUDA_RDNA3_TQKV_FATTN_KQ_LANES="$RDNA3_TQKV_FATTN_KQ_LANES"
+fi
+
 if [[ -n "$RDNA3_MOE_MMVQ_RPB" ]]; then
     export GGML_CUDA_RDNA3_MOE_MMVQ_RPB="$RDNA3_MOE_MMVQ_RPB"
 fi
@@ -209,8 +247,11 @@ echo "  prompt cache RAM: ${PROMPT_CACHE_MB} MiB"
 echo "  rdna3 profile log: $RDNA3_PROFILE_LOG"
 echo "  rdna3 op profile: $RDNA3_OP_PROFILE"
 echo "  rdna3 op profile max tokens: ${RDNA3_OP_PROFILE_MAX_TOKENS:-all}"
+echo "  rdna3 op profile max rows: ${RDNA3_OP_PROFILE_MAX_ROWS:-64}"
+echo "  rdna3 op profile summary rows: ${RDNA3_OP_PROFILE_SUMMARY_ROWS:-16}"
 echo "  rdna3 graph log: $RDNA3_GRAPH_LOG"
 echo "  rdna3 fail on host sync: $RDNA3_FAIL_ON_HOST_SYNC"
+echo "  rdna3 kernel preset: $RDNA3_KERNEL_PRESET"
 echo "  rdna3 disable qwen topk: $RDNA3_DISABLE_QWEN_TOPK"
 echo "  rdna3 disable moe gate_up fused: $RDNA3_DISABLE_MOE_GATE_UP_FUSED"
 echo "  rdna3 disable moe down fused: $RDNA3_DISABLE_MOE_DOWN_FUSED"
@@ -220,6 +261,7 @@ echo "  rdna3 qwen36 fastpath: $RDNA3_QWEN36_FASTPATH"
 echo "  rdna3 qwen36 topk rows/block: ${RDNA3_QWEN36_TOPK_RPB:-auto}"
 echo "  rdna3 tqkv fattn tile: $RDNA3_TQKV_FATTN_TILE"
 echo "  rdna3 tqkv fattn tile min ctx: ${RDNA3_TQKV_FATTN_TILE_MIN_CTX:-off}"
+echo "  rdna3 tqkv fattn KQ lanes: ${RDNA3_TQKV_FATTN_KQ_LANES:-auto}"
 echo "  rdna3 moe mmvq rows/block: ${RDNA3_MOE_MMVQ_RPB:-auto}"
 echo "  rdna3 moe gate_up rows/block: ${RDNA3_MOE_GATE_UP_RPB:-auto}"
 echo "  rdna3 gated delta net warps: ${RDNA3_GDN_WARPS:-auto}"

@@ -4,6 +4,64 @@
 #include <cstdlib>
 #include <type_traits>
 
+static int ggml_cuda_rdna3_gdn_ar_cols() {
+    int cols_per_block = 8;
+    if (const char * env = getenv("GGML_CUDA_RDNA3_GDN_AR_COLS")) {
+        const int requested = atoi(env);
+        if (requested == 4 || requested == 8 || requested == 16) {
+            cols_per_block = requested;
+        }
+    }
+
+    return cols_per_block;
+}
+
+static bool ggml_cuda_gated_delta_net_uses_ar_tiled(const int device, const ggml_tensor * dst) {
+    if (dst == nullptr || dst->src[2] == nullptr) {
+        return false;
+    }
+
+    const ggml_tensor * src_v = dst->src[2];
+    return GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[device].cc) &&
+        getenv("GGML_CUDA_RDNA3_DISABLE_GDN_AR_TILED") == nullptr &&
+        src_v->ne[0] == 128 && src_v->ne[2] == 1;
+}
+
+static const char * ggml_cuda_gated_delta_net_ar_tiled_name(const bool kda, const int cols_per_block) {
+    if (kda) {
+        switch (cols_per_block) {
+            case 4:
+                return "GDN_AR_TILED_KDA_C4";
+            case 16:
+                return "GDN_AR_TILED_KDA_C16";
+            case 8:
+            default:
+                return "GDN_AR_TILED_KDA_C8";
+        }
+    }
+
+    switch (cols_per_block) {
+        case 4:
+            return "GDN_AR_TILED_C4";
+        case 16:
+            return "GDN_AR_TILED_C16";
+        case 8:
+        default:
+            return "GDN_AR_TILED_C8";
+    }
+}
+
+const char * ggml_cuda_gated_delta_net_kernel_name(int device, const ggml_tensor * dst) {
+    if (ggml_cuda_gated_delta_net_uses_ar_tiled(device, dst)) {
+        const ggml_tensor * src_v = dst->src[2];
+        const ggml_tensor * src_g = dst->src[3];
+        const bool kda = src_g != nullptr && src_g->ne[0] == src_v->ne[0];
+        return ggml_cuda_gated_delta_net_ar_tiled_name(kda, ggml_cuda_rdna3_gdn_ar_cols());
+    }
+
+    return "GATED_DELTA_NET";
+}
+
 template <int S_v, bool KDA, int COLS_PER_BLOCK>
 __global__ void __launch_bounds__(ggml_cuda_get_physical_warp_size() * COLS_PER_BLOCK, COLS_PER_BLOCK <= 8 ? 2 : 1)
 gated_delta_net_ar_tiled_cuda(const float * q,
@@ -336,13 +394,7 @@ static void launch_gated_delta_net(
 
     if (GGML_CUDA_CC_IS_RDNA3(cc) && n_tokens == 1 && S_v == 128 &&
             getenv("GGML_CUDA_RDNA3_DISABLE_GDN_AR_TILED") == nullptr) {
-        int cols_per_block = 8;
-        if (const char * env = getenv("GGML_CUDA_RDNA3_GDN_AR_COLS")) {
-            const int requested = atoi(env);
-            if (requested == 4 || requested == 8 || requested == 16) {
-                cols_per_block = requested;
-            }
-        }
+        const int cols_per_block = ggml_cuda_rdna3_gdn_ar_cols();
 
         if (getenv("GGML_CUDA_RDNA3_PROFILE_LOG") != nullptr) {
             GGML_LOG_INFO("launch_gated_delta_net: GDN_AR_TILED S_v=%" PRId64 ", KDA=%d, cols/block=%d, H=%" PRId64
