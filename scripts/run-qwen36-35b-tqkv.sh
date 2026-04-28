@@ -29,6 +29,7 @@ RDNA3_DISABLE_MOE_DOWN_FUSED="${RDNA3_DISABLE_MOE_DOWN_FUSED:-0}"
 RDNA3_DISABLE_MOE_COMBINE="${RDNA3_DISABLE_MOE_COMBINE:-0}"
 RDNA3_MOE_MMVQ_RPB="${RDNA3_MOE_MMVQ_RPB:-}"
 RDNA3_MOE_GATE_UP_RPB="${RDNA3_MOE_GATE_UP_RPB:-}"
+RDNA3_GDN_WARPS="${RDNA3_GDN_WARPS:-}"
 
 case "$TQKV_PROFILE" in
     fast)
@@ -146,6 +147,10 @@ if [[ -n "$RDNA3_MOE_GATE_UP_RPB" ]]; then
     export GGML_CUDA_RDNA3_MOE_GATE_UP_RPB="$RDNA3_MOE_GATE_UP_RPB"
 fi
 
+if [[ -n "$RDNA3_GDN_WARPS" ]]; then
+    export GGML_CUDA_RDNA3_GDN_WARPS="$RDNA3_GDN_WARPS"
+fi
+
 echo "Starting TQKV server"
 echo "  model: $MODEL"
 echo "  profile: $TQKV_PROFILE ($PROFILE_NOTE)"
@@ -162,6 +167,7 @@ echo "  rdna3 disable moe down fused: $RDNA3_DISABLE_MOE_DOWN_FUSED"
 echo "  rdna3 disable moe combine: $RDNA3_DISABLE_MOE_COMBINE"
 echo "  rdna3 moe mmvq rows/block: ${RDNA3_MOE_MMVQ_RPB:-auto}"
 echo "  rdna3 moe gate_up rows/block: ${RDNA3_MOE_GATE_UP_RPB:-auto}"
+echo "  rdna3 gated delta net warps: ${RDNA3_GDN_WARPS:-auto}"
 echo "  bin:   $SERVER_BIN"
 echo "  url:   http://$HOST:$PORT"
 

@@ -1,7 +1,13 @@
 #include "gated_delta_net.cuh"
 
-template <int S_v, bool KDA>
-__global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
+#include <cinttypes>
+#include <cstdlib>
+#include <type_traits>
+
+template <int S_v, bool KDA, int N_WARPS, bool CACHE_G>
+__global__ void __launch_bounds__(
+        (ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * N_WARPS,
+        N_WARPS <= 4 ? 2 : 1)
 gated_delta_net_cuda(const float * q,
                                      const float * k,
                                      const float * v,
@@ -33,6 +39,8 @@ gated_delta_net_cuda(const float * q,
     const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
     const uint32_t iq3 = fastdiv(sequence, rq3_magic);
 
+    static_assert(S_v % N_WARPS == 0, "S_v must be a multiple of N_WARPS");
+
     const int64_t attn_score_elems = S_v * H * n_tokens * n_seqs;
     float *       attn_data        = dst;
     float *       state            = dst + attn_score_elems;
@@ -47,6 +55,9 @@ gated_delta_net_cuda(const float * q,
     constexpr int rows_per_lane = (S_v + warp_size - 1) / warp_size;
     float         s_shard[rows_per_lane];
     // state is stored transposed: M[col][i] = S[i][col], row col is contiguous
+
+    __shared__ float g_shared[S_v];
+    __shared__ float g_scalar_shared;
 
 #pragma unroll
     for (int r = 0; r < rows_per_lane; r++) {
@@ -65,6 +76,21 @@ gated_delta_net_cuda(const float * q,
 
         const float beta_val = *beta_t;
 
+        if constexpr (CACHE_G) {
+            if constexpr (KDA) {
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    const int i = r * warp_size + lane;
+                    if (threadIdx.y == 0) {
+                        g_shared[i] = expf(g_t[i]);
+                    }
+                }
+            } else if (threadIdx.x == 0 && threadIdx.y == 0) {
+                g_scalar_shared = expf(*g_t);
+            }
+            __syncthreads();
+        }
+
         // Cache k and q in registers
         float k_reg[rows_per_lane];
         float q_reg[rows_per_lane];
@@ -76,7 +102,7 @@ gated_delta_net_cuda(const float * q,
         }
 
         if constexpr (!KDA) {
-            const float g_val = expf(*g_t);
+            const float g_val = CACHE_G ? g_scalar_shared : expf(*g_t);
 
             // kv[col] = (S^T @ k)[col] = sum_i S[i][col] * k[i]
             float kv_shard = 0.0f;
@@ -109,7 +135,7 @@ gated_delta_net_cuda(const float * q,
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
                 const int i = r * warp_size + lane;
-                kv_shard += expf(g_t[i]) * s_shard[r] * k_reg[r];
+                kv_shard += (CACHE_G ? g_shared[i] : expf(g_t[i])) * s_shard[r] * k_reg[r];
             }
 
             float kv_col = warp_reduce_sum<warp_size>(kv_shard);
@@ -123,7 +149,7 @@ gated_delta_net_cuda(const float * q,
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
                 const int i = r * warp_size + lane;
-                s_shard[r]  = expf(g_t[i]) * s_shard[r] + k_reg[r] * delta_col;
+                s_shard[r]  = (CACHE_G ? g_shared[i] : expf(g_t[i])) * s_shard[r] + k_reg[r] * delta_col;
                 attn_partial += s_shard[r] * q_reg[r];
             }
 
@@ -158,45 +184,78 @@ static void launch_gated_delta_net(
         float scale, cudaStream_t stream) {
     //TODO: Add chunked kernel for even faster pre-fill
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
-    const int num_warps = 4;
-    dim3      grid_dims(H, n_seqs, (S_v + num_warps - 1) / num_warps);
-    dim3      block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
-
     const uint3 neqk1_magic = init_fastdiv_values(neqk1);
     const uint3 rq3_magic   = init_fastdiv_values(rq3);
 
-    int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
-    switch (S_v) {
-        case 16:
-            gated_delta_net_cuda<16, KDA><<<grid_dims, block_dims, 0, stream>>>(
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
-            break;
-        case 32:
-            gated_delta_net_cuda<32, KDA><<<grid_dims, block_dims, 0, stream>>>(
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
-            break;
-        case 64: {
-            gated_delta_net_cuda<64, KDA><<<grid_dims, block_dims, 0, stream>>>(
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
-            break;
+    int num_warps = 4;
+    if (GGML_CUDA_CC_IS_RDNA3(cc) && n_tokens == 1 && S_v >= 64) {
+        num_warps = 8;
+    }
+    if (const char * env = getenv("GGML_CUDA_RDNA3_GDN_WARPS")) {
+        const int requested = atoi(env);
+        if (requested == 4 || requested == 8) {
+            num_warps = requested;
         }
-        case 128: {
-            gated_delta_net_cuda<128, KDA><<<grid_dims, block_dims, 0, stream>>>(
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
-            break;
+    }
+
+    if (getenv("GGML_CUDA_RDNA3_PROFILE_LOG") != nullptr) {
+        GGML_LOG_INFO("launch_gated_delta_net: GATED_DELTA_NET S_v=%" PRId64 ", KDA=%d, warps=%d, cache_g=%d, H=%" PRId64
+                ", tokens=%" PRId64 ", seqs=%" PRId64 "\n",
+            S_v, int(KDA), num_warps, int(n_tokens == 1), H, n_tokens, n_seqs);
+    }
+
+    auto launch = [&](auto warps_tag, auto cache_g_tag) {
+        constexpr int num_warps_ct = decltype(warps_tag)::value;
+        constexpr bool cache_g_ct  = decltype(cache_g_tag)::value;
+
+        dim3 grid_dims(H, n_seqs, (S_v + num_warps_ct - 1) / num_warps_ct);
+        dim3 block_dims(warp_size <= S_v ? warp_size : S_v, num_warps_ct, 1);
+
+        switch (S_v) {
+            case 16:
+                gated_delta_net_cuda<16, KDA, num_warps_ct, cache_g_ct><<<grid_dims, block_dims, 0, stream>>>(
+                    q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
+                    n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                break;
+            case 32:
+                gated_delta_net_cuda<32, KDA, num_warps_ct, cache_g_ct><<<grid_dims, block_dims, 0, stream>>>(
+                    q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
+                    n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                break;
+            case 64:
+                gated_delta_net_cuda<64, KDA, num_warps_ct, cache_g_ct><<<grid_dims, block_dims, 0, stream>>>(
+                    q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
+                    n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                break;
+            case 128:
+                gated_delta_net_cuda<128, KDA, num_warps_ct, cache_g_ct><<<grid_dims, block_dims, 0, stream>>>(
+                    q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
+                    n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                break;
+            default:
+                GGML_ABORT("fatal error");
+                break;
         }
-        default:
-            GGML_ABORT("fatal error");
-            break;
+    };
+
+    if (num_warps == 8) {
+        if (n_tokens == 1) {
+            launch(std::integral_constant<int, 8>{}, std::true_type{});
+        } else {
+            launch(std::integral_constant<int, 8>{}, std::false_type{});
+        }
+    } else {
+        if (n_tokens == 1) {
+            launch(std::integral_constant<int, 4>{}, std::true_type{});
+        } else {
+            launch(std::integral_constant<int, 4>{}, std::false_type{});
+        }
     }
 }
 
