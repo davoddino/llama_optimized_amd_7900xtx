@@ -111,7 +111,13 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
         wt[i / WARP_SIZE] = (n_experts % WARP_SIZE == 0 || expert < n_experts) ? logits[expert] : -INFINITY;
     }
 
-    if (!config.delayed_softmax) {
+    // If softmax gating is followed by top-k weight normalization, the full
+    // softmax denominator cancels out. Select on raw logits and softmax only
+    // the selected experts; this is equivalent for the no-bias softmax path
+    // used by Qwen MoE and avoids exponentiating all experts every token.
+    const bool selected_softmax = !has_bias && !config.use_sigmoid && config.with_norm && !config.delayed_softmax;
+
+    if (!config.delayed_softmax && !selected_softmax) {
         if (config.use_sigmoid) {
            sigmoid_warp_inplace<experts_per_thread, false>(wt, n_experts, threadIdx.x);
         } else {
@@ -230,7 +236,7 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
         }
     }
 
-    if (config.with_norm) {
+    if (config.with_norm && !selected_softmax) {
         wt_sum              = warp_reduce_sum(wt_sum);
         wt_sum              = max(wt_sum, clamp_val);
         const float inv_sum = 1.0f / wt_sum;
@@ -240,7 +246,7 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
         }
     }
 
-    if (config.delayed_softmax) {
+    if (config.delayed_softmax || selected_softmax) {
         softmax_warp_inplace<experts_per_thread, true>(output_weights, n_expert_used, threadIdx.x);
     }
 
@@ -267,7 +273,7 @@ static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
                                  const topk_moe_config       config) {
     GGML_ASSERT(!(config.with_norm && config.delayed_softmax) &&
                 "delayed softmax is not supported with weight normalization");
-    const int    rows_per_block = 4;
+    const int    rows_per_block = n_rows <= 1 ? 1 : (n_rows < 4 ? n_rows : 4);
     dim3         grid_dims((n_rows + rows_per_block - 1) / rows_per_block, 1, 1);
     dim3         block_dims(WARP_SIZE, rows_per_block, 1);
     cudaStream_t stream = ctx.stream();

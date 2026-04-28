@@ -5,6 +5,10 @@
 
 #include <cstdint>
 
+#ifndef GGML_CUDA_RDNA3_MOE_TOP8_MMVQ
+#define GGML_CUDA_RDNA3_MOE_TOP8_MMVQ 1
+#endif
+
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
@@ -202,9 +206,18 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna3(ggml_type
         case GGML_TYPE_IQ3_XXS: return 4;
         case GGML_TYPE_IQ4_NL:  return 6;
         case GGML_TYPE_IQ4_XS:  return 6;
+#if GGML_CUDA_RDNA3_MOE_TOP8_MMVQ
+        // Qwen3.6-35B-A3B selects 8 experts/token. On RDNA3/gfx1100, allowing
+        // K-quants to stay on the MMVQ MUL_MAT_ID path avoids an early fallback
+        // for the common top-8 MoE decode case.
+        case GGML_TYPE_Q4_K:    return 8;
+        case GGML_TYPE_Q5_K:    return 8;
+        case GGML_TYPE_Q6_K:    return 8;
+#else
         case GGML_TYPE_Q4_K:    return 4;
         case GGML_TYPE_Q5_K:    return 4;
         case GGML_TYPE_Q6_K:    return 4;
+#endif
         default:                return MMVQ_MAX_BATCH_SIZE;
     }
 }
