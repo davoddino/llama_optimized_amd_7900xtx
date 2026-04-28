@@ -5547,8 +5547,17 @@ struct ggml_tensor * ggml_ssm_conv(
         struct ggml_context * ctx,
         struct ggml_tensor  * sx,
         struct ggml_tensor  * c) {
+    return ggml_ssm_conv_ext(ctx, sx, c, NULL);
+}
+
+struct ggml_tensor * ggml_ssm_conv_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * sx,
+        struct ggml_tensor  * c,
+        struct ggml_tensor  * state_out) {
     GGML_ASSERT(ggml_is_3d(sx));
     GGML_ASSERT(ggml_is_matrix(c));
+    GGML_ASSERT(state_out == NULL || state_out->type == GGML_TYPE_F32);
 
     const int64_t d_conv  = c->ne[0];
     const int64_t d_inner = c->ne[1];
@@ -5559,12 +5568,17 @@ struct ggml_tensor * ggml_ssm_conv(
     GGML_ASSERT(sx->ne[0] == d_conv - 1 + n_t);
     GGML_ASSERT(sx->ne[1] == d_inner);
     GGML_ASSERT(n_t >= 0);
+    GGML_ASSERT(state_out == NULL || ggml_is_contiguous(state_out));
+    GGML_ASSERT(state_out == NULL || ggml_nelements(state_out) == (d_conv - 1) * d_inner * n_s);
+    GGML_ASSERT(state_out == NULL || n_t == 1);
 
     struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_inner, n_t, n_s);
 
     result->op     = GGML_OP_SSM_CONV;
     result->src[0] = sx;
     result->src[1] = c;
+    result->src[2] = state_out;
+    ggml_set_op_params_i32(result, 0, state_out != NULL ? 1 : 0);
 
     return result;
 }
@@ -6252,6 +6266,18 @@ struct ggml_tensor * ggml_gated_delta_net(
         struct ggml_tensor  * g,
         struct ggml_tensor  * beta,
         struct ggml_tensor  * state) {
+    return ggml_gated_delta_net_ext(ctx, q, k, v, g, beta, state, NULL);
+}
+
+struct ggml_tensor * ggml_gated_delta_net_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * state_out) {
     GGML_ASSERT(ggml_is_contiguous_rows(q));
     GGML_ASSERT(ggml_is_contiguous_rows(k));
     GGML_ASSERT(ggml_is_contiguous_rows(v));
@@ -6265,21 +6291,26 @@ struct ggml_tensor * ggml_gated_delta_net(
     GGML_ASSERT(g->type == GGML_TYPE_F32);
     GGML_ASSERT(beta->type == GGML_TYPE_F32);
     GGML_ASSERT(state->type == GGML_TYPE_F32);
+    GGML_ASSERT(state_out == NULL || state_out->type == GGML_TYPE_F32);
 
     const int64_t S_v      = v->ne[0];
     const int64_t H        = v->ne[1];
     const int64_t n_tokens = v->ne[2];
     const int64_t n_seqs   = v->ne[3];
+    const bool    state_inplace = state_out != NULL;
 
     // gate: scalar [1, H, T, B] or vector [S_v, H, T, B] (KDA)
     GGML_ASSERT(g->ne[0] == 1 || g->ne[0] == S_v);
     GGML_ASSERT(beta->ne[0] == 1);
 
     GGML_ASSERT(ggml_nelements(state) == S_v * S_v * H * n_seqs);
+    GGML_ASSERT(state_out == NULL || ggml_is_contiguous(state_out));
+    GGML_ASSERT(state_out == NULL || ggml_nelements(state_out) == S_v * S_v * H * n_seqs);
+    GGML_ASSERT(!state_inplace || n_tokens == 1);
 
     // concat output and new_state into a single tensor
     // output: S_v * H * n_tokens * n_seqs, state: S_v * S_v * H * n_seqs
-    const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + S_v * n_seqs, 1, 1 };
+    const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + (state_inplace ? 0 : S_v * n_seqs), 1, 1 };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
     result->op     = GGML_OP_GATED_DELTA_NET;
@@ -6289,6 +6320,8 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[3] = g;
     result->src[4] = beta;
     result->src[5] = state;
+    result->src[6] = state_out;
+    ggml_set_op_params_i32(result, 0, state_inplace ? 1 : 0);
 
     return result;
 }

@@ -2,6 +2,8 @@
 
 #include "llama-impl.h"
 
+#include <cstdlib>
+
 // utility to get one slice from the third dimension
 // input dim:  [x, y, c, b]
 // output dim: [x, y, 1, b]
@@ -11,6 +13,11 @@ static ggml_tensor * get_slice_2d(ggml_context * ctx0, ggml_tensor * t, int64_t 
 }
 
 llm_build_delta_net_base::llm_build_delta_net_base(const llm_graph_params & params) : llm_graph_context(params) {}
+
+static bool delta_net_cuda_rdna3_state_inplace_enabled() {
+    const char * env = std::getenv("GGML_CUDA_RDNA3_GDN_STATE_INPLACE");
+    return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
 
 std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_net_chunking(
         ggml_tensor * q,
@@ -376,7 +383,8 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         ggml_tensor * g,
         ggml_tensor * b,
         ggml_tensor * s,
-        int           il) {
+        int           il,
+        ggml_tensor * state_out) {
     const int64_t S_k      = q->ne[0];
     const int64_t H_k      = q->ne[1];
     const int64_t n_tokens = q->ne[2];
@@ -396,8 +404,10 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     GGML_ASSERT(                   g->ne[1] == H_v && g->ne[2] == n_tokens && g->ne[3] == n_seqs);
     GGML_ASSERT(b->ne[0] == 1   && b->ne[1] == H_v && b->ne[2] == n_tokens && b->ne[3] == n_seqs);
     GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v      && s->ne[3] == n_seqs);
+    GGML_ASSERT(state_out == nullptr || ggml_nelements(state_out) == S_v * S_v * H_v * n_seqs);
 
-    ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s);
+    const bool state_inplace = state_out != nullptr && n_tokens == 1 && delta_net_cuda_rdna3_state_inplace_enabled();
+    ggml_tensor * result = ggml_gated_delta_net_ext(ctx0, q, k, v, g, b, s, state_inplace ? state_out : nullptr);
     if (n_tokens == 1) {
         cb(result, LLAMA_TENSOR_NAME_FGDN_AR, il);
     } else {
@@ -410,12 +420,13 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
             ggml_row_size(result->type, S_v * H_v),
             ggml_row_size(result->type, S_v * H_v * n_tokens), 0);
 
-    ggml_tensor * new_state = ggml_view_4d(ctx0, result,
-            S_v, S_v, H_v, n_seqs,
-            ggml_row_size(result->type, S_v),
-            ggml_row_size(result->type, S_v * S_v),
-            ggml_row_size(result->type, S_v * S_v * H_v),
-            ggml_row_size(result->type, S_v * H_v * n_tokens * n_seqs));
+    ggml_tensor * new_state = state_inplace ? state_out :
+        ggml_view_4d(ctx0, result,
+                S_v, S_v, H_v, n_seqs,
+                ggml_row_size(result->type, S_v),
+                ggml_row_size(result->type, S_v * S_v),
+                ggml_row_size(result->type, S_v * S_v * H_v),
+                ggml_row_size(result->type, S_v * H_v * n_tokens * n_seqs));
 
     return {output, new_state};
 }
@@ -427,12 +438,13 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         ggml_tensor * g,
         ggml_tensor * b,
         ggml_tensor * s,
-        int           il) {
+        int           il,
+        ggml_tensor * state_out) {
     const int64_t n_seq_tokens = q->ne[2];
 
     if (n_seq_tokens == 1) {
         if (cparams.fused_gdn_ar) {
-            return build_delta_net_fused(q, k, v, g, b, s, il);
+            return build_delta_net_fused(q, k, v, g, b, s, il, state_out);
         }
         return build_delta_net_autoregressive(q, k, v, g, b, s, il);
     }

@@ -21,7 +21,7 @@ UBATCH_SIZE="${UBATCH_SIZE:-1024}"
 PROMPT_CACHE_MB="${PROMPT_CACHE_MB:-0}"
 CTX_CHECKPOINTS="${CTX_CHECKPOINTS:-0}"
 CHECKPOINT_EVERY_NT="${CHECKPOINT_EVERY_NT:--1}"
-BACKEND_SAMPLING="${BACKEND_SAMPLING:-1}"
+BACKEND_SAMPLING="${BACKEND_SAMPLING:-0}"
 KV_UNIFIED="${KV_UNIFIED:-}"
 CACHE_IDLE_SLOTS="${CACHE_IDLE_SLOTS:-}"
 RDNA3_PROFILE_LOG="${RDNA3_PROFILE_LOG:-0}"
@@ -49,6 +49,8 @@ RDNA3_MOE_MMVQ_RPB="${RDNA3_MOE_MMVQ_RPB:-}"
 RDNA3_MOE_GATE_UP_RPB="${RDNA3_MOE_GATE_UP_RPB:-}"
 RDNA3_GDN_WARPS="${RDNA3_GDN_WARPS:-}"
 RDNA3_GDN_AR_COLS="${RDNA3_GDN_AR_COLS:-}"
+RDNA3_GDN_STATE_INPLACE="${RDNA3_GDN_STATE_INPLACE:-1}"
+RDNA3_SSM_CONV_STATE_INPLACE="${RDNA3_SSM_CONV_STATE_INPLACE:-1}"
 
 case "$RDNA3_KERNEL_PRESET" in
     auto)
@@ -248,6 +250,14 @@ if [[ -n "$RDNA3_GDN_AR_COLS" ]]; then
     export GGML_CUDA_RDNA3_GDN_AR_COLS="$RDNA3_GDN_AR_COLS"
 fi
 
+if [[ "$RDNA3_GDN_STATE_INPLACE" == "1" ]]; then
+    export GGML_CUDA_RDNA3_GDN_STATE_INPLACE=1
+fi
+
+if [[ "$RDNA3_SSM_CONV_STATE_INPLACE" == "1" ]]; then
+    export GGML_CUDA_RDNA3_SSM_CONV_STATE_INPLACE=1
+fi
+
 echo "Starting TQKV server"
 echo "  model: $MODEL"
 echo "  profile: $TQKV_PROFILE ($PROFILE_NOTE)"
@@ -283,6 +293,8 @@ echo "  rdna3 moe mmvq rows/block: ${RDNA3_MOE_MMVQ_RPB:-auto}"
 echo "  rdna3 moe gate_up rows/block: ${RDNA3_MOE_GATE_UP_RPB:-auto}"
 echo "  rdna3 gated delta net warps: ${RDNA3_GDN_WARPS:-auto}"
 echo "  rdna3 gated delta net ar cols/block: ${RDNA3_GDN_AR_COLS:-auto}"
+echo "  rdna3 gated delta net state inplace: $RDNA3_GDN_STATE_INPLACE"
+echo "  rdna3 ssm conv state inplace: $RDNA3_SSM_CONV_STATE_INPLACE"
 echo "  bin:   $SERVER_BIN"
 echo "  url:   http://$HOST:$PORT"
 

@@ -2429,6 +2429,12 @@ extern "C" {
             struct ggml_tensor  * sx,
             struct ggml_tensor  * c);
 
+    GGML_API struct ggml_tensor * ggml_ssm_conv_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * sx,
+            struct ggml_tensor  * c,
+            struct ggml_tensor  * state_out);
+
     GGML_API struct ggml_tensor * ggml_ssm_scan(
             struct ggml_context * ctx,
             struct ggml_tensor  * s,
@@ -2548,6 +2554,16 @@ extern "C" {
             struct ggml_tensor  * g,
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state);
+
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * state_out);
 
     // custom operators
 

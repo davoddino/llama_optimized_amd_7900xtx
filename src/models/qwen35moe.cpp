@@ -2,6 +2,13 @@
 
 #include "llama-memory-recurrent.h"
 
+#include <cstdlib>
+
+static bool qwen35moe_rdna3_ssm_conv_state_inplace_enabled() {
+    const char * env = std::getenv("GGML_CUDA_RDNA3_SSM_CONV_STATE_INPLACE");
+    return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
 llm_build_qwen35moe::llm_build_qwen35moe(const llama_model & model, const llm_graph_params & params) :
     llm_build_delta_net_base(params), model(model) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
@@ -274,13 +281,16 @@ ggml_tensor * llm_build_qwen35moe ::build_layer_attn_linear(
                      kv_head * (conv_kernel_size - 1) * conv_channels * ggml_element_size(conv_states_all));
     cb(state_update_target, "state_update_target", il);
 
-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, last_conv_states, state_update_target));
+    const bool conv_state_inplace = n_seq_tokens == 1 && qwen35moe_rdna3_ssm_conv_state_inplace_enabled();
+    if (!conv_state_inplace) {
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, last_conv_states, state_update_target));
+    }
 
     ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
-    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+    ggml_tensor * conv_output_proper = ggml_ssm_conv_ext(ctx0, conv_input, conv_kernel, conv_state_inplace ? state_update_target : nullptr);
     cb(conv_output_proper, "conv_output_raw", il);
 
     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
@@ -336,18 +346,22 @@ ggml_tensor * llm_build_qwen35moe ::build_layer_attn_linear(
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
-    auto attn_out = build_delta_net(q_conv, k_conv, v_conv, gate, beta, state, il);
+    ggml_tensor * recurrent_state_update_target =
+        ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
+            kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all));
+
+    auto attn_out = build_delta_net(q_conv, k_conv, v_conv, gate, beta, state, il, recurrent_state_update_target);
 
     ggml_tensor * output    = attn_out.first;
     ggml_tensor * new_state = attn_out.second;
     cb(output, "attn_output", il);
     cb(new_state, "new_state", il);
 
-    // Update the recurrent states
-    ggml_build_forward_expand(gf,
-            ggml_cpy(ctx0, new_state,
-                ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
-                    kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+    // The RDNA3 autoregressive fused GDN path can update the recurrent state cache directly.
+    if (new_state != recurrent_state_update_target) {
+        ggml_build_forward_expand(gf,
+                ggml_cpy(ctx0, new_state, recurrent_state_update_target));
+    }
 
     // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
