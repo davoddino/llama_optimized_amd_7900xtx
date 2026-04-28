@@ -1196,7 +1196,7 @@ static void mul_mat_vec_q_moe_weighted_launch(
         "GGML_CUDA_RDNA3_MOE_DOWN_RPB" : "GGML_CUDA_RDNA3_MOE_MMVQ_RPB";
     const int rows_per_block = rdna3_mmvq_rows_per_block(
         rpb_env, type, cc, ncols_x, nrows_x, n_expert_used, ncols_dst,
-        /*rdna3_default=*/ 4, /*generic_default=*/ 2, /*qwen36_default=*/ 4);
+        /*rdna3_default=*/ 4, /*generic_default=*/ 2, /*qwen36_default=*/ 8);
     if (getenv("GGML_CUDA_RDNA3_PROFILE_LOG") != nullptr) {
         GGML_LOG_INFO("%s: MMVQ_MOE_WEIGHTED type=%s, rows_per_block=%d, env=%s, nrows=%u, tokens=%u, experts=%u, scales=%d, qwen36_fast=%d\n",
                 __func__, ggml_type_name(type), rows_per_block, rpb_env, nrows_x, ncols_dst, n_expert_used,

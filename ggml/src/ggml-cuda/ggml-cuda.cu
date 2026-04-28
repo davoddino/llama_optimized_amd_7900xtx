@@ -3693,11 +3693,7 @@ static bool ggml_cuda_should_fuse_set_rows_pair(const ggml_tensor * set_rows0, c
         return false;
     }
 
-    if (idx0->type != idx1->type || (idx0->type != GGML_TYPE_I64 && idx0->type != GGML_TYPE_I32)) {
-        return false;
-    }
-
-    if (!ggml_are_same_shape(idx0, idx1)) {
+    if (idx0 != idx1 || (idx0->type != GGML_TYPE_I64 && idx0->type != GGML_TYPE_I32)) {
         return false;
     }
 
@@ -3707,12 +3703,6 @@ static bool ggml_cuda_should_fuse_set_rows_pair(const ggml_tensor * set_rows0, c
 
     if (!ggml_are_same_shape(src00, src01) || !ggml_are_same_shape(set_rows0, set_rows1)) {
         return false;
-    }
-
-    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
-        if (idx0->nb[i] != idx1->nb[i]) {
-            return false;
-        }
     }
 
     for (int i = 1; i < GGML_MAX_DIMS; ++i) {
@@ -3728,11 +3718,9 @@ static bool ggml_cuda_should_fuse_set_rows_pair(const ggml_tensor * set_rows0, c
     if (ggml_cuda_tensor_logical_ranges_overlap(set_rows0, src00) ||
         ggml_cuda_tensor_logical_ranges_overlap(set_rows0, src01) ||
         ggml_cuda_tensor_logical_ranges_overlap(set_rows0, idx0)  ||
-        ggml_cuda_tensor_logical_ranges_overlap(set_rows0, idx1)  ||
         ggml_cuda_tensor_logical_ranges_overlap(set_rows1, src00) ||
         ggml_cuda_tensor_logical_ranges_overlap(set_rows1, src01) ||
-        ggml_cuda_tensor_logical_ranges_overlap(set_rows1, idx0)  ||
-        ggml_cuda_tensor_logical_ranges_overlap(set_rows1, idx1)) {
+        ggml_cuda_tensor_logical_ranges_overlap(set_rows1, idx0)) {
         return false;
     }
 
