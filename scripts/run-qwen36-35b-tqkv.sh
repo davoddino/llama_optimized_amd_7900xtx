@@ -24,6 +24,7 @@ CACHE_IDLE_SLOTS="${CACHE_IDLE_SLOTS:-}"
 RDNA3_PROFILE_LOG="${RDNA3_PROFILE_LOG:-0}"
 RDNA3_FAIL_ON_HOST_SYNC="${RDNA3_FAIL_ON_HOST_SYNC:-0}"
 RDNA3_DISABLE_QWEN35_TOPK="${RDNA3_DISABLE_QWEN35_TOPK:-0}"
+RDNA3_DISABLE_MOE_DOWN_FUSED="${RDNA3_DISABLE_MOE_DOWN_FUSED:-0}"
 RDNA3_DISABLE_MOE_COMBINE="${RDNA3_DISABLE_MOE_COMBINE:-0}"
 RDNA3_MOE_MMVQ_RPB="${RDNA3_MOE_MMVQ_RPB:-}"
 
@@ -123,6 +124,10 @@ if [[ "$RDNA3_DISABLE_QWEN35_TOPK" == "1" ]]; then
     export GGML_CUDA_RDNA3_DISABLE_QWEN35_TOPK=1
 fi
 
+if [[ "$RDNA3_DISABLE_MOE_DOWN_FUSED" == "1" ]]; then
+    export GGML_CUDA_RDNA3_DISABLE_MOE_DOWN_FUSED=1
+fi
+
 if [[ "$RDNA3_DISABLE_MOE_COMBINE" == "1" ]]; then
     export GGML_CUDA_RDNA3_DISABLE_MOE_COMBINE=1
 fi
@@ -142,6 +147,7 @@ echo "  prompt cache RAM: ${PROMPT_CACHE_MB} MiB"
 echo "  rdna3 profile log: $RDNA3_PROFILE_LOG"
 echo "  rdna3 fail on host sync: $RDNA3_FAIL_ON_HOST_SYNC"
 echo "  rdna3 disable qwen35 topk: $RDNA3_DISABLE_QWEN35_TOPK"
+echo "  rdna3 disable moe down fused: $RDNA3_DISABLE_MOE_DOWN_FUSED"
 echo "  rdna3 disable moe combine: $RDNA3_DISABLE_MOE_COMBINE"
 echo "  rdna3 moe mmvq rows/block: ${RDNA3_MOE_MMVQ_RPB:-auto}"
 echo "  bin:   $SERVER_BIN"
