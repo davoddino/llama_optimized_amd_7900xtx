@@ -25,6 +25,9 @@ BACKEND_SAMPLING="${BACKEND_SAMPLING:-0}"
 SAMPLING_TEMP="${SAMPLING_TEMP:-1}"
 SAMPLING_TOP_K="${SAMPLING_TOP_K:-20}"
 SAMPLING_TOP_P="${SAMPLING_TOP_P:-0.95}"
+REASONING_MODE="${REASONING_MODE:-auto}"
+REASONING_FORMAT="${REASONING_FORMAT:-deepseek}"
+REASONING_BUDGET="${REASONING_BUDGET:--1}"
 KV_UNIFIED="${KV_UNIFIED:-}"
 CACHE_IDLE_SLOTS="${CACHE_IDLE_SLOTS:-}"
 RDNA3_PROFILE_LOG="${RDNA3_PROFILE_LOG:-0}"
@@ -300,6 +303,7 @@ echo "  ctx checkpoints: $CTX_CHECKPOINTS"
 echo "  checkpoint every n tokens: $CHECKPOINT_EVERY_NT"
 echo "  backend sampling: $BACKEND_SAMPLING"
 echo "  default sampling: temp=$SAMPLING_TEMP top-k=$SAMPLING_TOP_K top-p=$SAMPLING_TOP_P"
+echo "  reasoning: mode=$REASONING_MODE format=$REASONING_FORMAT budget=$REASONING_BUDGET"
 echo "  rdna3 profile log: $RDNA3_PROFILE_LOG"
 echo "  rdna3 op profile: $RDNA3_OP_PROFILE"
 echo "  rdna3 op profile max tokens: ${RDNA3_OP_PROFILE_MAX_TOKENS:-all}"
@@ -344,9 +348,9 @@ exec "$SERVER_BIN" \
     --cache-type-k "$CACHE_TYPE_K" \
     --cache-type-v "$CACHE_TYPE_V" \
     --jinja \
-    --reasoning off \
-    --reasoning-format none \
-    --reasoning-budget 0 \
+    --reasoning "$REASONING_MODE" \
+    --reasoning-format "$REASONING_FORMAT" \
+    --reasoning-budget "$REASONING_BUDGET" \
     --temp "$SAMPLING_TEMP" \
     --top-k "$SAMPLING_TOP_K" \
     --top-p "$SAMPLING_TOP_P" \

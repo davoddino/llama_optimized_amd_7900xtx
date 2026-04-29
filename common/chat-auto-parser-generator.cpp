@@ -121,7 +121,16 @@ common_peg_arena autoparser::build_parser(const generation_params & inputs) cons
         } else {
             parser = content.build_parser(ctx);
         }
-        return pure_content ? p.prefix(inputs.generation_prompt, reasoning.start) + parser : p.prefix(inputs.generation_prompt, reasoning.start) << parser;
+        if (!extract_reasoning && !inputs.enable_thinking) {
+            // Keep the disabled-thinking prefill out of the returned content;
+            // if the model emits its own tags after the prompt, parser still sees them.
+            return pure_content
+                ? p.prefix(inputs.generation_prompt) + parser
+                : p.prefix(inputs.generation_prompt) << parser;
+        }
+        return pure_content
+            ? p.prefix(inputs.generation_prompt, reasoning.start) + parser
+            : p.prefix(inputs.generation_prompt, reasoning.start) << parser;
     });
 }
 

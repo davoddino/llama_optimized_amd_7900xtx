@@ -1695,9 +1695,10 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
         auto reasoning = p.eps();
         if (extract_reasoning && inputs.enable_thinking) {
             reasoning = p.optional(THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END);
-        } else if (extract_reasoning) {
-            // Thinking disabled but reasoning extraction requested: the generation prompt
-            // contains an empty <think></think> pair that must still be consumed.
+        } else if (!inputs.enable_thinking) {
+            // Thinking disabled: the generation prompt can contain an empty
+            // <think></think> pair. Consume that template prefill even when
+            // reasoning extraction is disabled, because it is not generated text.
             reasoning = p.optional(p.literal(THINK_START) + p.until(THINK_END) + p.literal(THINK_END));
         }
 
