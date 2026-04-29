@@ -100,6 +100,7 @@ static bool rdna3_qwen36_linear_mmvq_decode_shape(
     }
 
     switch (type) {
+        case GGML_TYPE_Q8_0:
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
@@ -111,6 +112,7 @@ static bool rdna3_qwen36_linear_mmvq_decode_shape(
     const bool qwen36_in =
         ncols_x == 512 || ncols_x == 2048 || ncols_x == 4096;
     const bool qwen36_out =
+        nrows_x == 1 || nrows_x == 32 || nrows_x == 256 ||
         nrows_x == 512 || nrows_x == 2048 || nrows_x == 4096 ||
         nrows_x == 8192 || nrows_x == 12288;
 

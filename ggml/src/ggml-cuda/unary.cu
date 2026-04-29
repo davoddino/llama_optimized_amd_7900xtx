@@ -621,6 +621,94 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
     }
 }
 
+/* fused add + unary + mul */
+
+template <float (*op)(float), typename T>
+static __global__ void add_unary_gated_op_kernel(
+        const T * x0, const T * x1, const T * g, T * dst,
+        const int64_t k, const int64_t n,
+        const int64_t o0, const int64_t o1, const int64_t og) {
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    const int64_t col = i % n;
+    const int64_t row = i / n;
+    const int64_t j0  = row * o0 + col;
+    const int64_t j1  = row * o1 + col;
+    const int64_t jg  = row * og + col;
+
+    dst[i] = (T)(op((float) x0[j0] + (float) x1[j1]) * (float) g[jg]);
+}
+
+template <float (*op)(float), typename T>
+static void add_unary_gated_cuda(
+        const T * x0, const T * x1, const T * g, T * dst,
+        const int64_t k, const int64_t n,
+        const int64_t o0, const int64_t o1, const int64_t og,
+        cudaStream_t stream) {
+    const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+    add_unary_gated_op_kernel<op><<<num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream>>>(x0, x1, g, dst, k, n, o0, o1, og);
+}
+
+template <float (*op)(float)>
+static void ggml_cuda_op_add_unary_mul_impl(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * add_node,
+        ggml_tensor * unary_node,
+        ggml_tensor * mul_node) {
+    GGML_ASSERT(unary_node->src[0] == add_node);
+    GGML_ASSERT(mul_node->src[0] == unary_node || mul_node->src[1] == unary_node);
+
+    const ggml_tensor * add_src0  = add_node->src[0];
+    const ggml_tensor * add_src1  = add_node->src[1];
+    const ggml_tensor * other_src = (mul_node->src[0] == unary_node) ? mul_node->src[1] : mul_node->src[0];
+
+    GGML_ASSERT(ggml_is_contiguous_1(add_src0));
+    GGML_ASSERT(ggml_is_contiguous_1(add_src1));
+    GGML_ASSERT(ggml_is_contiguous_1(other_src));
+    GGML_ASSERT(add_src0->nb[0] == ggml_element_size(add_src0));
+    GGML_ASSERT(add_src1->nb[0] == ggml_element_size(add_src1));
+    GGML_ASSERT(other_src->nb[0] == ggml_element_size(other_src));
+    GGML_ASSERT(ggml_are_same_shape(add_src0, add_node));
+    GGML_ASSERT(ggml_are_same_shape(add_src1, add_node));
+    GGML_ASSERT(ggml_are_same_shape(add_node, unary_node));
+    GGML_ASSERT(ggml_are_same_shape(unary_node, mul_node));
+    GGML_ASSERT(ggml_are_same_shape(other_src, mul_node));
+
+    GGML_ASSERT(add_src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(add_src0->type == add_src1->type);
+    GGML_ASSERT(add_src0->type == other_src->type);
+    GGML_ASSERT(add_src0->type == add_node->type);
+    GGML_ASSERT(add_src0->type == unary_node->type);
+    GGML_ASSERT(add_src0->type == mul_node->type);
+
+    cudaStream_t stream = ctx.stream();
+
+    const int64_t k  = ggml_nelements(mul_node);
+    const int64_t nc = add_node->ne[0];
+
+    add_unary_gated_cuda<op>(
+            (const float *) add_src0->data, (const float *) add_src1->data, (const float *) other_src->data, (float *) mul_node->data,
+            k, nc, add_src0->nb[1] / sizeof(float), add_src1->nb[1] / sizeof(float), other_src->nb[1] / sizeof(float), stream);
+}
+
+void ggml_cuda_op_add_unary_mul(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * add_node,
+        ggml_tensor * unary_node,
+        ggml_tensor * mul_node) {
+    switch (ggml_get_unary_op(unary_node)) {
+        case GGML_UNARY_OP_SOFTPLUS:
+            ggml_cuda_op_add_unary_mul_impl<op_softplus>(ctx, add_node, unary_node, mul_node);
+            break;
+        default:
+            GGML_ABORT("Unsupported unary op for fused add+unary+mul");
+    }
+}
+
 /* fused relu + sqr */
 
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node) {

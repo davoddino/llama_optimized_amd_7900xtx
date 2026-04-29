@@ -183,6 +183,7 @@ static bool ggml_cuda_rdna3_qwen36_linear_mmvq_decode_shape(
     }
 
     switch (src0->type) {
+        case GGML_TYPE_Q8_0:
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
@@ -194,6 +195,7 @@ static bool ggml_cuda_rdna3_qwen36_linear_mmvq_decode_shape(
     const bool qwen36_in =
         src0->ne[0] == 512 || src0->ne[0] == 2048 || src0->ne[0] == 4096;
     const bool qwen36_out =
+        src0->ne[1] == 1 || src0->ne[1] == 32 || src0->ne[1] == 256 ||
         src0->ne[1] == 512 || src0->ne[1] == 2048 || src0->ne[1] == 4096 ||
         src0->ne[1] == 8192 || src0->ne[1] == 12288;
 
@@ -4842,6 +4844,50 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return true;
     }
 
+    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_ADD && ops.begin()[1] == GGML_OP_UNARY && ops.begin()[2] == GGML_OP_MUL
+     && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SOFTPLUS &&
+        ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 2 })) {
+        const ggml_tensor * add   = cgraph->nodes[node_idx];
+        const ggml_tensor * unary = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * mul   = cgraph->nodes[node_idx + 2];
+
+        if (ggml_get_unary_op(unary) != GGML_UNARY_OP_SOFTPLUS || unary->src[0] != add) {
+            return false;
+        }
+
+        if (mul->src[0] != unary && mul->src[1] != unary) {
+            return false;
+        }
+
+        const ggml_tensor * other = (mul->src[0] == unary) ? mul->src[1] : mul->src[0];
+
+        if (add->type != GGML_TYPE_F32) {
+            return false;
+        }
+
+        if (add->src[0]->type != add->type || add->src[1]->type != add->type ||
+            unary->type != add->type || mul->type != add->type || other->type != add->type) {
+            return false;
+        }
+
+        if (!ggml_are_same_shape(add->src[0], add) ||
+            !ggml_are_same_shape(add->src[1], add) ||
+            !ggml_are_same_shape(add, unary) ||
+            !ggml_are_same_shape(unary, mul) ||
+            !ggml_are_same_shape(other, mul)) {
+            return false;
+        }
+
+        if (!ggml_is_contiguous_1(add->src[0]) ||
+            !ggml_is_contiguous_1(add->src[1]) ||
+            !ggml_is_contiguous_1(other)) {
+            return false;
+        }
+
+        int out_nodes[] = { node_idx + 2 };
+        return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int) ops.size(), out_nodes, 1);
+    }
+
     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_SSM_CONV && ops.begin()[1] == GGML_OP_UNARY
      && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SILU) {
         const ggml_tensor * ssm_conv = cgraph->nodes[node_idx];
@@ -5565,6 +5611,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         op_timer.set_path("SSM_CONV_SILU_FUSED");
                         ggml_cuda_op_ssm_conv(*cuda_ctx, node, cgraph->nodes[i+1]);
                         i++;
+                        continue;
+                    }
+
+                    if (can_fuse_linear_stream_region(3) &&
+                            ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
+                        op_timer.set_path("ADD_UNARY_MUL_FUSED");
+                        ggml_cuda_op_add_unary_mul(*cuda_ctx, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+                        i += 2;
                         continue;
                     }
 
