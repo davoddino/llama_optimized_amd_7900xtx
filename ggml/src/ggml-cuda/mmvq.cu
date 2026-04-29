@@ -43,6 +43,97 @@ static bool rdna3_qwen36_linear_mmvq_fast_enabled() {
     return enabled;
 }
 
+static bool rdna3_mmvq_q8_cache_enabled() {
+    static const bool enabled =
+        !rdna3_mmvq_env_enabled("GGML_CUDA_RDNA3_DISABLE_MMVQ_Q8_CACHE") &&
+        (rdna3_qwen36_fastpath_enabled() || rdna3_mmvq_env_enabled("GGML_CUDA_RDNA3_MMVQ_Q8_CACHE"));
+    return enabled;
+}
+
+static char * ggml_cuda_mmvq_get_src1_q8_1(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src1,
+        const ggml_type src0_type,
+        const int64_t ne0_padded,
+        cudaStream_t stream,
+        ggml_cuda_pool_alloc<char> & fallback) {
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+
+    const int64_t ne0 = src1->ne[0];
+    const int64_t ne1 = src1->ne[1];
+    const int64_t ne2 = src1->ne[2];
+    const int64_t ne3 = src1->ne[3];
+
+    const size_t ts_src1 = ggml_type_size(src1->type);
+    const int64_t s1 = src1->nb[1] / ts_src1;
+    const int64_t s2 = src1->nb[2] / ts_src1;
+    const int64_t s3 = src1->nb[3] / ts_src1;
+
+    const size_t nbytes = ne3*ne2 * ne1*ne0_padded * sizeof(block_q8_1)/QK8_1;
+
+    auto quantize = [&](char * dst) {
+        quantize_row_q8_1_cuda((const float *) src1->data, nullptr, dst, src0_type,
+                ne0, s1, s2, s3, ne0_padded, ne1, ne2, ne3, stream);
+    };
+
+    if (!rdna3_mmvq_q8_cache_enabled() || ctx.mmvq_q8_cache_eval_id == 0) {
+        fallback.alloc(ctx.pool(), nbytes);
+        quantize(fallback.get());
+        return fallback.get();
+    }
+
+    auto matches = [&](const ggml_cuda_mmvq_q8_cache_entry & entry) {
+        return entry.src1       == src1 &&
+               entry.src1_data  == src1->data &&
+               entry.src0_type  == src0_type &&
+               entry.stream_no  == ctx.curr_stream_no &&
+               entry.ne[0]      == ne0 &&
+               entry.ne[1]      == ne1 &&
+               entry.ne[2]      == ne2 &&
+               entry.ne[3]      == ne3 &&
+               entry.nb[0]      == src1->nb[0] &&
+               entry.nb[1]      == src1->nb[1] &&
+               entry.nb[2]      == src1->nb[2] &&
+               entry.nb[3]      == src1->nb[3] &&
+               entry.ne0_padded == ne0_padded &&
+               entry.nbytes     == nbytes;
+    };
+
+    for (std::unique_ptr<ggml_cuda_mmvq_q8_cache_entry> & entry : ctx.mmvq_q8_cache) {
+        if (!matches(*entry)) {
+            continue;
+        }
+        if (entry->last_eval_id != ctx.mmvq_q8_cache_eval_id) {
+            quantize(entry->data.get());
+            entry->last_eval_id = ctx.mmvq_q8_cache_eval_id;
+        }
+        return entry->data.get();
+    }
+
+    auto entry = std::make_unique<ggml_cuda_mmvq_q8_cache_entry>();
+    entry->src1       = src1;
+    entry->src1_data  = src1->data;
+    entry->src0_type  = src0_type;
+    entry->stream_no  = ctx.curr_stream_no;
+    entry->ne[0]      = ne0;
+    entry->ne[1]      = ne1;
+    entry->ne[2]      = ne2;
+    entry->ne[3]      = ne3;
+    entry->nb[0]      = src1->nb[0];
+    entry->nb[1]      = src1->nb[1];
+    entry->nb[2]      = src1->nb[2];
+    entry->nb[3]      = src1->nb[3];
+    entry->ne0_padded = ne0_padded;
+    entry->nbytes     = nbytes;
+    entry->last_eval_id = ctx.mmvq_q8_cache_eval_id;
+    entry->data.alloc(ctx.pool(), nbytes);
+
+    char * data = entry->data.get();
+    quantize(data);
+    ctx.mmvq_q8_cache.emplace_back(std::move(entry));
+    return data;
+}
+
 static bool rdna3_qwen36_moe_decode_shape(
         const ggml_type type, const int cc, const uint32_t ncols_x, const uint32_t nrows,
         const uint32_t n_expert_used, const uint32_t ncols_dst) {
@@ -1786,7 +1877,6 @@ void ggml_cuda_mul_mat_vec_q(
 
     GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE);
 
-    const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
     float         *  dst_d =       (float         *)  dst->data;
 
@@ -1827,13 +1917,8 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
-        const int64_t s11 = src1->nb[1] / ts_src1;
-        const int64_t s12 = src1->nb[2] / ts_src1;
-        const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
-    }
+    ggml_cuda_pool_alloc<char> src1_q8_1_fallback(ctx.pool());
+    char * src1_q8_1 = ggml_cuda_mmvq_get_src1_q8_1(ctx, src1, src0->type, ne10_padded, stream, src1_q8_1_fallback);
 
     const int64_t s01 = src0->nb[1] / ts_src0;
     const int64_t s11 = ne10_padded / QK8_1;
@@ -1858,7 +1943,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, src1_q8_1, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
@@ -1957,20 +2042,14 @@ void ggml_cuda_mul_mat_vec_q_moe_weighted(
     GGML_ASSERT(dst->ne[0] == src0->ne[1]);
     GGML_ASSERT(dst->ne[1] == n_tokens);
 
-    const float   * src1_d     = (const float   *) src1->data;
     const int32_t * ids_d      = (const int32_t *) ids->data;
     const float   * weights0_d = (const float   *) weights0->data;
     const float   * weights1_d = weights1 ? (const float *) weights1->data : nullptr;
     float         * dst_d      = (float         *) dst->data;
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
-        const int64_t s11 = src1->nb[1] / ts_src1;
-        const int64_t s12 = src1->nb[2] / ts_src1;
-        const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
-    }
+    ggml_cuda_pool_alloc<char> src1_q8_1_fallback(ctx.pool());
+    char * src1_q8_1 = ggml_cuda_mmvq_get_src1_q8_1(ctx, src1, src0->type, ne10_padded, stream, src1_q8_1_fallback);
 
     const int64_t s01 = src0->nb[1] / ts_src0;
     const int64_t s02 = src0->nb[2] / ts_src0;
@@ -1989,7 +2068,7 @@ void ggml_cuda_mul_mat_vec_q_moe_weighted(
     const int64_t weights1_stride_col     = weights1 ? weights1->nb[2] / sizeof(float) : 0;
 
     mul_mat_vec_q_moe_weighted_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, weights0_d, weights1_d, dst_d,
+        src0->data, src0->type, src1_q8_1, ids_d, weights0_d, weights1_d, dst_d,
         ne00, ne01, n_tokens, s01, stride_col_y, stride_col_dst,
         ne11, n_expert_used, s02, stride_channel_y,
         weights0_stride_channel, weights0_stride_col,
@@ -2128,19 +2207,13 @@ void ggml_cuda_mul_mat_vec_q_moe_gate_up(
     GGML_ASSERT(dst->ne[1] == n_expert_used);
     GGML_ASSERT(!scale || (scale->ne[0] == 1 && scale->ne[1] == n_expert_used && scale->ne[2] == n_tokens));
 
-    const float   * src1_d  = (const float   *) src1->data;
     const int32_t * ids_d   = (const int32_t *) ids->data;
     const float   * scale_d = scale ? (const float *) scale->data : nullptr;
     float         * dst_d   = (float         *) dst->data;
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
-        const int64_t s11 = src1->nb[1] / ts_src1;
-        const int64_t s12 = src1->nb[2] / ts_src1;
-        const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
-    }
+    ggml_cuda_pool_alloc<char> src1_q8_1_fallback(ctx.pool());
+    char * src1_q8_1 = ggml_cuda_mmvq_get_src1_q8_1(ctx, src1, src0->type, ne10_padded, stream, src1_q8_1_fallback);
 
     const int64_t s01 = src0->nb[1] / ts_src0;
     const int64_t s02 = src0->nb[2] / ts_src0;
@@ -2158,7 +2231,7 @@ void ggml_cuda_mul_mat_vec_q_moe_gate_up(
     const int64_t scale_stride_col     = scale ? scale->nb[2] / sizeof(float) : 0;
 
     mul_mat_vec_q_moe_gate_up_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, scale_d, dst_d,
+        src0->data, src0->type, src1_q8_1, ids_d, scale_d, dst_d,
         ne00, nrows_dst, n_tokens, s01, stride_col_y, stride_col_dst,
         ne11, n_expert_used, s02, stride_channel_y, stride_channel_dst,
         scale_stride_channel, scale_stride_col,
@@ -2205,18 +2278,12 @@ void ggml_cuda_mul_mat_vec_q_moe_gate_up_split(
     GGML_ASSERT(src1->ne[1] == 1);
     GGML_ASSERT(src1->ne[2] == n_tokens);
 
-    const float   * src1_d = (const float   *) src1->data;
     const int32_t * ids_d  = (const int32_t *) ids->data;
     float         * dst_d  = (float         *) dst->data;
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
-        const int64_t s11 = src1->nb[1] / ts_src1;
-        const int64_t s12 = src1->nb[2] / ts_src1;
-        const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
-    }
+    ggml_cuda_pool_alloc<char> src1_q8_1_fallback(ctx.pool());
+    char * src1_q8_1 = ggml_cuda_mmvq_get_src1_q8_1(ctx, src1, src0->type, ne10_padded, stream, src1_q8_1_fallback);
 
     const int64_t s01 = src0->nb[1] / ts_src0;
     const int64_t s02 = src0->nb[2] / ts_src0;
@@ -2231,7 +2298,7 @@ void ggml_cuda_mul_mat_vec_q_moe_gate_up_split(
     const int64_t ids_stride         = ids->nb[1] / ggml_type_size(ids->type);
 
     mul_mat_vec_q_moe_gate_up_split_switch_type(
-        gate->data, up->data, src0->type, src1_q8_1.get(), ids_d, dst_d,
+        gate->data, up->data, src0->type, src1_q8_1, ids_d, dst_d,
         ne00, nrows_dst, n_tokens, s01, stride_col_y, stride_col_dst,
         ne11, n_expert_used, s02, stride_channel_y, stride_channel_dst,
         ids_stride, stream);

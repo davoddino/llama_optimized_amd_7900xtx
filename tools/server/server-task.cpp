@@ -256,7 +256,7 @@ task_params server_task::params_from_json_cmpl(
     defaults.antiprompt    = params_base.antiprompt;
 
     // enabling this will output extra debug information in the HTTP responses from the server
-    params.verbose           = params_base.verbosity > 9;
+    params.verbose           = json_value(data, "verbose", params_base.verbosity > 9);
     params.timings_per_token = json_value(data, "timings_per_token", false);
 
     params.stream           = json_value(data,       "stream",             false);
@@ -628,6 +628,10 @@ json result_timings::to_json() const {
         {"predicted_ms",           predicted_ms},
         {"predicted_per_token_ms", predicted_per_token_ms},
         {"predicted_per_second",   predicted_per_second},
+
+        {"predicted_conservative_n",            predicted_conservative_n},
+        {"predicted_conservative_per_token_ms", predicted_conservative_per_token_ms},
+        {"predicted_conservative_per_second",   predicted_conservative_per_second},
     };
 
     if (draft_n > 0) {

@@ -1153,6 +1153,19 @@ struct ggml_cuda_pool_alloc {
     ggml_cuda_pool_alloc& operator=(ggml_cuda_pool_alloc &&) = delete;
 };
 
+struct ggml_cuda_mmvq_q8_cache_entry {
+    const ggml_tensor * src1 = nullptr;
+    const void *        src1_data = nullptr;
+    ggml_type           src0_type = GGML_TYPE_COUNT;
+    int                 stream_no = 0;
+    int64_t             ne[4] = {};
+    size_t              nb[4] = {};
+    int64_t             ne0_padded = 0;
+    size_t              nbytes = 0;
+    uint64_t            last_eval_id = 0;
+    ggml_cuda_pool_alloc<char> data;
+};
+
 
 // backend interface
 
@@ -1359,6 +1372,16 @@ struct ggml_backend_cuda_context {
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
 
     int curr_stream_no = 0;
+
+    uint64_t mmvq_q8_cache_eval_id = 0;
+    std::vector<std::unique_ptr<ggml_cuda_mmvq_q8_cache_entry>> mmvq_q8_cache;
+
+    void begin_mmvq_q8_cache_eval() {
+        if (++mmvq_q8_cache_eval_id == 0) {
+            mmvq_q8_cache.clear();
+            mmvq_q8_cache_eval_id = 1;
+        }
+    }
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context

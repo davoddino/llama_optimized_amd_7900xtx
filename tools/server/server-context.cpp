@@ -435,13 +435,23 @@ struct server_slot {
 
         timings.prompt_n            = n_prompt_tokens_processed;
         timings.prompt_ms           = t_prompt_processing;
-        timings.prompt_per_token_ms = t_prompt_processing / n_prompt_tokens_processed;
-        timings.prompt_per_second   = 1e3 / t_prompt_processing * n_prompt_tokens_processed;
+        if (n_prompt_tokens_processed > 0 && t_prompt_processing > 0.0) {
+            timings.prompt_per_token_ms = t_prompt_processing / n_prompt_tokens_processed;
+            timings.prompt_per_second   = 1e3 / t_prompt_processing * n_prompt_tokens_processed;
+        }
 
         timings.predicted_n            = n_decoded;
         timings.predicted_ms           = t_token_generation;
-        timings.predicted_per_token_ms = t_token_generation / n_decoded;
-        timings.predicted_per_second   = 1e3 / t_token_generation * n_decoded;
+        if (n_decoded > 0 && t_token_generation > 0.0) {
+            timings.predicted_per_token_ms = t_token_generation / n_decoded;
+            timings.predicted_per_second   = 1e3 / t_token_generation * n_decoded;
+        }
+
+        timings.predicted_conservative_n = std::max(0, n_decoded - 1);
+        if (timings.predicted_conservative_n > 0 && t_token_generation > 0.0) {
+            timings.predicted_conservative_per_token_ms = t_token_generation / timings.predicted_conservative_n;
+            timings.predicted_conservative_per_second   = 1e3 / t_token_generation * timings.predicted_conservative_n;
+        }
 
         // Add speculative metrics
         if (n_draft_total > 0) {
@@ -484,11 +494,11 @@ struct server_slot {
     }
 
     void print_timings() const {
-        const double t_prompt        =       t_prompt_processing / n_prompt_tokens_processed;
-        const double n_prompt_second = 1e3 / t_prompt_processing * n_prompt_tokens_processed;
+        const double t_prompt        = n_prompt_tokens_processed > 0 && t_prompt_processing > 0.0 ? t_prompt_processing / n_prompt_tokens_processed : 0.0;
+        const double n_prompt_second = n_prompt_tokens_processed > 0 && t_prompt_processing > 0.0 ? 1e3 / t_prompt_processing * n_prompt_tokens_processed : 0.0;
 
-        const double t_gen        =       t_token_generation / n_decoded;
-        const double n_gen_second = 1e3 / t_token_generation * n_decoded;
+        const double t_gen        = n_decoded > 0 && t_token_generation > 0.0 ? t_token_generation / n_decoded : 0.0;
+        const double n_gen_second = n_decoded > 0 && t_token_generation > 0.0 ? 1e3 / t_token_generation * n_decoded : 0.0;
 
         SLT_INF(*this,
                 "\n"

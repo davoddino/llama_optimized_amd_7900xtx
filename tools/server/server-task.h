@@ -272,6 +272,12 @@ struct result_timings {
     double predicted_per_token_ms = 0.0;
     double predicted_per_second = 0.0;
 
+    // Generation timing starts after the first sampled token. These fields
+    // expose the token count actually covered by the generation timer.
+    int32_t predicted_conservative_n = -1;
+    double predicted_conservative_per_token_ms = 0.0;
+    double predicted_conservative_per_second = 0.0;
+
     // Optional speculative metrics - only included when > 0
     int32_t draft_n = 0;
     int32_t draft_n_accepted = 0;
