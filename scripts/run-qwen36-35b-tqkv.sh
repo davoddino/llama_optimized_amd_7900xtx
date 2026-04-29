@@ -22,6 +22,9 @@ PROMPT_CACHE_MB="${PROMPT_CACHE_MB:-0}"
 CTX_CHECKPOINTS="${CTX_CHECKPOINTS:-0}"
 CHECKPOINT_EVERY_NT="${CHECKPOINT_EVERY_NT:--1}"
 BACKEND_SAMPLING="${BACKEND_SAMPLING:-0}"
+SAMPLING_TEMP="${SAMPLING_TEMP:-1}"
+SAMPLING_TOP_K="${SAMPLING_TOP_K:-20}"
+SAMPLING_TOP_P="${SAMPLING_TOP_P:-0.95}"
 KV_UNIFIED="${KV_UNIFIED:-}"
 CACHE_IDLE_SLOTS="${CACHE_IDLE_SLOTS:-}"
 RDNA3_PROFILE_LOG="${RDNA3_PROFILE_LOG:-0}"
@@ -296,6 +299,7 @@ echo "  prompt cache RAM: ${PROMPT_CACHE_MB} MiB"
 echo "  ctx checkpoints: $CTX_CHECKPOINTS"
 echo "  checkpoint every n tokens: $CHECKPOINT_EVERY_NT"
 echo "  backend sampling: $BACKEND_SAMPLING"
+echo "  default sampling: temp=$SAMPLING_TEMP top-k=$SAMPLING_TOP_K top-p=$SAMPLING_TOP_P"
 echo "  rdna3 profile log: $RDNA3_PROFILE_LOG"
 echo "  rdna3 op profile: $RDNA3_OP_PROFILE"
 echo "  rdna3 op profile max tokens: ${RDNA3_OP_PROFILE_MAX_TOKENS:-all}"
@@ -343,9 +347,9 @@ exec "$SERVER_BIN" \
     --reasoning off \
     --reasoning-format none \
     --reasoning-budget 0 \
-    --temp 0 \
-    --top-k 1 \
-    --top-p 1 \
+    --temp "$SAMPLING_TEMP" \
+    --top-k "$SAMPLING_TOP_K" \
+    --top-p "$SAMPLING_TOP_P" \
     --ctx-size "$CTX_SIZE" \
     --batch-size "$BATCH_SIZE" \
     --ubatch-size "$UBATCH_SIZE" \

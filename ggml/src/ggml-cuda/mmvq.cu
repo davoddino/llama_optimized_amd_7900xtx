@@ -73,7 +73,7 @@ static bool rdna3_qwen36_output_decode_shape(
         return false;
     }
 
-    if (ncols_dst != 1 || ncols_x == 0 || ncols_x > 4096 || nrows_x < 32768) {
+    if (ncols_dst != 1 || ncols_x == 0 || ncols_x > 4096 || nrows_x < 32768 || nrows_x % 8 != 0) {
         return false;
     }
 
@@ -112,7 +112,7 @@ static bool rdna3_qwen36_linear_mmvq_decode_shape(
     const bool qwen36_in =
         ncols_x == 512 || ncols_x == 2048 || ncols_x == 4096;
     const bool qwen36_out =
-        nrows_x == 1 || nrows_x == 32 || nrows_x == 256 ||
+        nrows_x == 32 || nrows_x == 256 ||
         nrows_x == 512 || nrows_x == 2048 || nrows_x == 4096 ||
         nrows_x == 8192 || nrows_x == 12288;
 

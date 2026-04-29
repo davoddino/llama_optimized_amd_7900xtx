@@ -160,7 +160,7 @@ static bool ggml_cuda_rdna3_qwen36_output_decode_shape(
         const int device, const ggml_tensor * src0, const ggml_tensor * dst) {
     if (!ggml_cuda_rdna3_qwen36_fastpath_enabled(device) || src0 == nullptr || dst == nullptr ||
             !ggml_cuda_rdna3_tensor_name_starts_with(dst, "result_output") || dst->ne[1] != 1 ||
-            src0->ne[0] <= 0 || src0->ne[0] > 4096 || src0->ne[1] < 32768) {
+            src0->ne[0] <= 0 || src0->ne[0] > 4096 || src0->ne[1] < 32768 || src0->ne[1] % 8 != 0) {
         return false;
     }
 
@@ -195,7 +195,7 @@ static bool ggml_cuda_rdna3_qwen36_linear_mmvq_decode_shape(
     const bool qwen36_in =
         src0->ne[0] == 512 || src0->ne[0] == 2048 || src0->ne[0] == 4096;
     const bool qwen36_out =
-        src0->ne[1] == 1 || src0->ne[1] == 32 || src0->ne[1] == 256 ||
+        src0->ne[1] == 32 || src0->ne[1] == 256 ||
         src0->ne[1] == 512 || src0->ne[1] == 2048 || src0->ne[1] == 4096 ||
         src0->ne[1] == 8192 || src0->ne[1] == 12288;
 
@@ -4889,7 +4889,8 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     }
 
     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_SSM_CONV && ops.begin()[1] == GGML_OP_UNARY
-     && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SILU) {
+     && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SILU &&
+        ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 1 })) {
         const ggml_tensor * ssm_conv = cgraph->nodes[node_idx];
         const ggml_tensor * silu     = cgraph->nodes[node_idx+1];
 
@@ -4897,7 +4898,8 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
             return false;
         }
 
-        return true;
+        int out_nodes[] = { node_idx + 1 };
+        return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int) ops.size(), out_nodes, 1);
     }
 
     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_UNARY && ops.begin()[1] == GGML_OP_MUL
@@ -4974,6 +4976,37 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     }
 
     return false;
+}
+
+static bool ggml_cuda_should_skip_ssm_conv_state_token_concat(const struct ggml_cgraph * cgraph, const int node_idx) {
+    const ggml_tensor * concat = cgraph->nodes[node_idx];
+    if (concat->op != GGML_OP_CONCAT) {
+        return false;
+    }
+    if (concat->flags & GGML_TENSOR_FLAG_OUTPUT) {
+        return false;
+    }
+    if (concat->view_src != nullptr || ggml_node_get_use_count(cgraph, node_idx) != 1) {
+        return false;
+    }
+
+    int ssm_conv_users = 0;
+    for (int i = node_idx + 1; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * user = cgraph->nodes[i];
+        for (int isrc = 0; isrc < GGML_MAX_SRC; ++isrc) {
+            if (user->src[isrc] != concat) {
+                continue;
+            }
+
+            if (isrc != 0 || user->op != GGML_OP_SSM_CONV ||
+                    !ggml_cuda_ssm_conv_uses_state_token_concat(user)) {
+                return false;
+            }
+            ++ssm_conv_users;
+        }
+    }
+
+    return ssm_conv_users == 1;
 }
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
@@ -5119,6 +5152,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                    continue;
+                }
+
+                if (!is_concurrent_event_active &&
+                        stream_ctx.concurrent_events.find(node) == stream_ctx.concurrent_events.end() &&
+                        ggml_cuda_should_skip_ssm_conv_state_token_concat(cgraph, i)) {
                     continue;
                 }
 
@@ -5608,7 +5647,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
 
                     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
-                        op_timer.set_path("SSM_CONV_SILU_FUSED");
+                        op_timer.set_path(ggml_cuda_ssm_conv_uses_state_token_concat(node, cgraph->nodes[i+1]) ?
+                                "SSM_CONV_STATE_TOKEN_SILU_FUSED" : "SSM_CONV_SILU_FUSED");
                         ggml_cuda_op_ssm_conv(*cuda_ctx, node, cgraph->nodes[i+1]);
                         i++;
                         continue;

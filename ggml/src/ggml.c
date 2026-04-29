@@ -5578,6 +5578,10 @@ struct ggml_tensor * ggml_ssm_conv_ext(
     result->src[0] = sx;
     result->src[1] = c;
     result->src[2] = state_out;
+    if (state_out != NULL && sx->op == GGML_OP_CONCAT && ggml_get_op_params_i32(sx, 0) == 0) {
+        result->src[3] = sx->src[0];
+        result->src[4] = sx->src[1];
+    }
     ggml_set_op_params_i32(result, 0, state_out != NULL ? 1 : 0);
 
     return result;
