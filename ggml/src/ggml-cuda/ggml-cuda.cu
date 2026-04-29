@@ -173,11 +173,6 @@ static bool ggml_cuda_rdna3_qwen36_one_layer_mega_required(const int device) {
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_MEGA_REQUIRED");
 }
 
-static bool ggml_cuda_rdna3_qwen36_one_layer_mega_identity_enabled(const int device) {
-    return ggml_cuda_rdna3_qwen36_one_layer_mega_enabled(device) &&
-        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_MEGA_IDENTITY");
-}
-
 static int ggml_cuda_rdna3_qwen36_one_layer_mega_layer() {
     return (int) std::max<int64_t>(0, ggml_cuda_env_i64("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_MEGA_LAYER", 0));
 }
@@ -3126,6 +3121,12 @@ struct ggml_cuda_rdna3_qwen36_mega_plan {
 
 struct ggml_cuda_rdna3_qwen36_one_layer_mega_plan {
     int layer            = 0;
+    int rms              = -1;
+    int attn_norm        = -1;
+    int qkv              = -1;
+    int qkv_out          = -1;
+    int qkv_math         = -1;
+    int qkv_skip_end     = -1;
     int start            = -1;
     int end              = -1;
     int n_nodes          = 0;
@@ -3196,7 +3197,8 @@ static ggml_cuda_rdna3_qwen36_one_layer_mega_plan ggml_cuda_rdna3_qwen36_one_lay
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         if (ggml_cuda_rdna3_tensor_name_matches_layer(cgraph->nodes[i], "attn_norm", layer)) {
-            plan.start = i;
+            plan.attn_norm = i;
+            plan.start     = i;
             break;
         }
     }
@@ -3232,6 +3234,88 @@ static ggml_cuda_rdna3_qwen36_one_layer_mega_plan ggml_cuda_rdna3_qwen36_one_lay
         plan.blocker = "layer end not found";
         return plan;
     }
+
+    ggml_tensor * attn_norm = cgraph->nodes[plan.attn_norm];
+    ggml_tensor * rms       = nullptr;
+    if (attn_norm != nullptr && attn_norm->op == GGML_OP_MUL) {
+        if (attn_norm->src[0] != nullptr && attn_norm->src[0]->op == GGML_OP_RMS_NORM) {
+            rms = attn_norm->src[0];
+        } else if (attn_norm->src[1] != nullptr && attn_norm->src[1]->op == GGML_OP_RMS_NORM) {
+            rms = attn_norm->src[1];
+        }
+    } else if (attn_norm != nullptr && attn_norm->op == GGML_OP_RMS_NORM) {
+        rms = attn_norm;
+    }
+
+    if (rms == nullptr) {
+        plan.blocker = "attn_norm is not RMS_NORM or RMS_NORM*MUL";
+        return plan;
+    }
+
+    for (int i = 0; i <= plan.attn_norm; ++i) {
+        if (cgraph->nodes[i] == rms) {
+            plan.rms = i;
+            break;
+        }
+    }
+    if (plan.rms < 0) {
+        plan.blocker = "RMS_NORM node for attn_norm not found in graph";
+        return plan;
+    }
+    plan.start = plan.rms;
+
+    for (int i = plan.attn_norm + 1; i <= plan.end; ++i) {
+        if (ggml_cuda_rdna3_tensor_name_matches_layer(cgraph->nodes[i], "linear_attn_qkv_mixed", layer)) {
+            plan.qkv = i;
+            break;
+        }
+    }
+    if (plan.qkv < 0) {
+        plan.blocker = "linear_attn_qkv_mixed node not found";
+        return plan;
+    }
+
+    ggml_tensor * qkv_out = cgraph->nodes[plan.qkv];
+    for (int depth = 0; qkv_out != nullptr && depth < 8; ++depth) {
+        switch (qkv_out->op) {
+            case GGML_OP_RESHAPE:
+            case GGML_OP_VIEW:
+            case GGML_OP_PERMUTE:
+            case GGML_OP_TRANSPOSE:
+            case GGML_OP_CONT:
+                qkv_out = qkv_out->src[0];
+                break;
+            default:
+                depth = 8;
+                break;
+        }
+    }
+    ggml_tensor * qkv_math = qkv_out;
+    if (qkv_out != nullptr && qkv_out->op == GGML_OP_MUL) {
+        if (qkv_out->src[0] != nullptr && qkv_out->src[0]->op == GGML_OP_MUL_MAT) {
+            qkv_math = qkv_out->src[0];
+        } else if (qkv_out->src[1] != nullptr && qkv_out->src[1]->op == GGML_OP_MUL_MAT) {
+            qkv_math = qkv_out->src[1];
+        }
+    }
+    if (qkv_math == nullptr || qkv_math->op != GGML_OP_MUL_MAT) {
+        plan.blocker = "linear_attn_qkv_mixed does not resolve to MUL_MAT";
+        return plan;
+    }
+
+    for (int i = plan.attn_norm; i <= plan.qkv; ++i) {
+        if (cgraph->nodes[i] == qkv_out) {
+            plan.qkv_out = i;
+        }
+        if (cgraph->nodes[i] == qkv_math) {
+            plan.qkv_math = i;
+        }
+    }
+    if (plan.qkv_out < 0 || plan.qkv_math < 0) {
+        plan.blocker = "QKV MUL_MAT node not found in graph span";
+        return plan;
+    }
+    plan.qkv_skip_end = std::max(plan.qkv, std::max(plan.qkv_out, plan.qkv_math));
 
     for (int i = plan.start; i <= plan.end; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
@@ -3301,106 +3385,363 @@ static void ggml_cuda_rdna3_qwen36_one_layer_mega_report(
         const ggml_cuda_rdna3_qwen36_one_layer_mega_plan & plan, const uint64_t uid, const bool ok) {
     GGML_LOG_INFO(
             "rdna3_qwen36_one_layer_mega: uid=%" PRIu64 " layer=%d status=%s span=[%d,%d]"
+            " qkv_stage=[rms=%d attn_norm=%d qkv_math=%d qkv_out=%d qkv=%d skip_end=%d]"
             " nodes=%d kind=%s fattn=%d gdn=%d ssm_conv=%d topk=%d moe_gate_up=%d"
             " moe_down=%d mmid=%d mmid_host_sync=%d blocker=%s\n",
-            uid, plan.layer, ok ? "stage0-ready" : "blocked", plan.start, plan.end,
+            uid, plan.layer, ok ? "qkv-ready" : "blocked", plan.start, plan.end,
+            plan.rms, plan.attn_norm, plan.qkv_math, plan.qkv_out, plan.qkv, plan.qkv_skip_end,
             plan.n_nodes, plan.is_recurrent ? "recurrent" : "attention",
             plan.n_fattn, plan.n_gdn, plan.n_ssm_conv, plan.n_topk_moe,
             plan.n_moe_gate_up, plan.n_moe_down, plan.n_mmid, plan.n_mmid_host_sync,
             plan.blocker.empty() ? "none" : plan.blocker.c_str());
 }
 
-static __global__ void ggml_cuda_rdna3_qwen36_one_layer_mega_stage0_kernel() {
-}
-
-static __global__ void ggml_cuda_rdna3_qwen36_one_layer_mega_identity_kernel(
-        const float * __restrict__ src,
-        float * __restrict__ dst,
-        const int64_t n) {
-    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
-    if (i < n) {
-        dst[i] = src[i];
+static __device__ __forceinline__ void ggml_cuda_rdna3_qwen36_one_layer_get_scale_min_k4(
+        const int j,
+        const uint8_t * __restrict__ q,
+        uint8_t & d,
+        uint8_t & m) {
+    if (j < 4) {
+        d = q[j] & 63;
+        m = q[j + 4] & 63;
+    } else {
+        d = (q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4);
+        m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
     }
 }
 
-static void ggml_cuda_rdna3_qwen36_one_layer_mega_stage0_launch(
-        ggml_backend_cuda_context * cuda_ctx,
-        const ggml_cuda_rdna3_qwen36_one_layer_mega_plan & plan) {
-    GGML_UNUSED(plan);
-    ggml_cuda_rdna3_qwen36_one_layer_mega_stage0_kernel<<<1, 32, 0, cuda_ctx->stream()>>>();
-    CUDA_CHECK(cudaGetLastError());
+static __device__ __forceinline__ float ggml_cuda_rdna3_qwen36_one_layer_dequant_q4_k(
+        const char * __restrict__ row,
+        const int64_t col) {
+    const block_q4_K * blocks = (const block_q4_K *) row;
+    const block_q4_K & b = blocks[col / QK_K];
+    const int k = (int) (col % QK_K);
+    const int g64 = k >> 6;
+    const int in64 = k & 63;
+    const int half = in64 >> 5;
+    const int q_index = 32*g64 + (in64 & 31);
+
+    uint8_t sc;
+    uint8_t m;
+    ggml_cuda_rdna3_qwen36_one_layer_get_scale_min_k4(2*g64 + half, b.scales, sc, m);
+
+    const uint8_t q_byte = b.qs[q_index];
+    const int q = half == 0 ? (q_byte & 0x0F) : (q_byte >> 4);
+    const float d_all = __low2half(b.dm);
+    const float m_all = __high2half(b.dm);
+    return d_all * sc * q - m_all * m;
 }
 
-static bool ggml_cuda_rdna3_qwen36_one_layer_mega_identity_launch(
+static __device__ __forceinline__ float ggml_cuda_rdna3_qwen36_one_layer_dequant_q6_k(
+        const char * __restrict__ row,
+        const int64_t col) {
+    const block_q6_K * blocks = (const block_q6_K *) row;
+    const block_q6_K & b = blocks[col / QK_K];
+    const int k = (int) (col % QK_K);
+    const int ip = k >> 7;
+    const int in128 = k & 127;
+    const int il = in128 & 31;
+    const uint8_t qh = b.qh[32*ip + il];
+    const int scale_base = 8*ip + il/16;
+    int q;
+    int scale_index;
+
+    if (in128 < 32) {
+        q = (b.ql[64*ip + il] & 0x0F) | (((qh >> 0) & 3) << 4);
+        scale_index = scale_base + 0;
+    } else if (in128 < 64) {
+        q = (b.ql[64*ip + il + 32] & 0x0F) | (((qh >> 2) & 3) << 4);
+        scale_index = scale_base + 2;
+    } else if (in128 < 96) {
+        q = (b.ql[64*ip + il] >> 4) | (((qh >> 4) & 3) << 4);
+        scale_index = scale_base + 4;
+    } else {
+        q = (b.ql[64*ip + il + 32] >> 4) | (((qh >> 6) & 3) << 4);
+        scale_index = scale_base + 6;
+    }
+
+    return (float) b.d * b.scales[scale_index] * ((int8_t) q - 32);
+}
+
+static __device__ __forceinline__ float ggml_cuda_rdna3_qwen36_one_layer_dequant_weight(
+        const char * __restrict__ w,
+        const ggml_type wtype,
+        const int64_t w_nb1,
+        const int64_t row,
+        const int64_t col) {
+    const char * wrow = w + row*w_nb1;
+    switch (wtype) {
+        case GGML_TYPE_Q4_K:
+            return ggml_cuda_rdna3_qwen36_one_layer_dequant_q4_k(wrow, col);
+        case GGML_TYPE_Q6_K:
+            return ggml_cuda_rdna3_qwen36_one_layer_dequant_q6_k(wrow, col);
+        case GGML_TYPE_Q8_0: {
+            const block_q8_0 * blocks = (const block_q8_0 *) wrow;
+            const block_q8_0 & b = blocks[col / QK8_0];
+            return (float) b.d * b.qs[col % QK8_0];
+        }
+        case GGML_TYPE_F16:
+            return (float) ((const ggml_half *) wrow)[col];
+        case GGML_TYPE_F32:
+            return ((const float *) wrow)[col];
+        default:
+            return 0.0f;
+    }
+}
+
+static __global__ void ggml_cuda_rdna3_qwen36_one_layer_mega_kernel(
+        const char * __restrict__ x_base,
+        const int64_t x_nb1,
+        const int64_t x_nb2,
+        const int64_t x_nb3,
+        const int64_t x_ne1,
+        const int64_t x_ne2,
+        const float * __restrict__ norm_w,
+        const float * __restrict__ qkv_scale,
+        const int64_t qkv_scale_n,
+        const char * __restrict__ wqkv,
+        const ggml_type wqkv_type,
+        const int64_t wqkv_nb1,
+        char * __restrict__ norm_base,
+        const int64_t norm_nb1,
+        const int64_t norm_nb2,
+        const int64_t norm_nb3,
+        char * __restrict__ qkv_base,
+        const int64_t qkv_nb1,
+        const int64_t qkv_nb2,
+        const int64_t qkv_nb3,
+        const int64_t qkv_ne1,
+        const int64_t qkv_ne2,
+        const int n_embd,
+        const int n_out,
+        const float eps) {
+    constexpr int block_size = 256;
+    __shared__ float reduce[block_size];
+
+    const int tid = threadIdx.x;
+    const int64_t token = blockIdx.y;
+    const int64_t i1 = token % x_ne1;
+    const int64_t token_hi = token / x_ne1;
+    const int64_t i2 = token_hi % x_ne2;
+    const int64_t i3 = token_hi / x_ne2;
+    const int64_t q_i1 = token % qkv_ne1;
+    const int64_t q_token_hi = token / qkv_ne1;
+    const int64_t q_i2 = q_token_hi % qkv_ne2;
+    const int64_t q_i3 = q_token_hi / qkv_ne2;
+
+    const float * x = (const float *) (x_base + i1*x_nb1 + i2*x_nb2 + i3*x_nb3);
+    float * norm = (float *) (norm_base + i1*norm_nb1 + i2*norm_nb2 + i3*norm_nb3);
+    float * qkv = (float *) (qkv_base + q_i1*qkv_nb1 + q_i2*qkv_nb2 + q_i3*qkv_nb3);
+
+    float ss = 0.0f;
+    for (int k = tid; k < n_embd; k += blockDim.x) {
+        const float v = x[k];
+        ss += v*v;
+    }
+    reduce[tid] = ss;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            reduce[tid] += reduce[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    const float inv_rms = rsqrtf(reduce[0] / (float) n_embd + eps);
+
+    if ((int) blockIdx.x == n_out) {
+        for (int k = tid; k < n_embd; k += blockDim.x) {
+            norm[k] = x[k] * inv_rms * (norm_w == nullptr ? 1.0f : norm_w[k]);
+        }
+        return;
+    }
+
+    const int row = blockIdx.x;
+    float acc = 0.0f;
+    for (int k = tid; k < n_embd; k += blockDim.x) {
+        const float xn = x[k] * inv_rms * (norm_w == nullptr ? 1.0f : norm_w[k]);
+        const float w = ggml_cuda_rdna3_qwen36_one_layer_dequant_weight(
+                wqkv, wqkv_type, wqkv_nb1, row, k);
+        acc += xn*w;
+    }
+
+    reduce[tid] = acc;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            reduce[tid] += reduce[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        const float scale = qkv_scale == nullptr ? 1.0f : qkv_scale[qkv_scale_n == 1 ? 0 : row];
+        qkv[row] = reduce[0] * scale;
+    }
+}
+
+static bool ggml_cuda_rdna3_qwen36_one_layer_mega_launch(
         ggml_backend_cuda_context * cuda_ctx,
         const ggml_cgraph * cgraph,
         const ggml_cuda_rdna3_qwen36_one_layer_mega_plan & plan,
         std::string * blocker) {
-    if (cgraph == nullptr || plan.start < 0 || plan.end < plan.start || plan.end >= cgraph->n_nodes) {
+    if (cgraph == nullptr || plan.rms < 0 || plan.attn_norm < 0 || plan.qkv_out < 0 || plan.qkv_math < 0 ||
+            plan.qkv_skip_end < plan.qkv_math || plan.qkv_skip_end >= cgraph->n_nodes) {
         if (blocker) {
-            *blocker = "invalid one-layer span";
+            *blocker = "invalid one-layer QKV stage";
         }
         return false;
     }
 
-    const ggml_tensor * start = cgraph->nodes[plan.start];
-    ggml_tensor *       dst   = nullptr;
-    for (int i = plan.end; i >= plan.start; --i) {
-        if (ggml_cuda_rdna3_tensor_name_matches_layer(cgraph->nodes[i], "l_out", plan.layer)) {
-            dst = cgraph->nodes[i];
-            break;
+    ggml_tensor * rms       = cgraph->nodes[plan.rms];
+    ggml_tensor * attn_norm = cgraph->nodes[plan.attn_norm];
+    ggml_tensor * qkv_out   = cgraph->nodes[plan.qkv_out];
+    ggml_tensor * qkv_math  = cgraph->nodes[plan.qkv_math];
+    if (rms == nullptr || attn_norm == nullptr || qkv_out == nullptr || qkv_math == nullptr ||
+            rms->op != GGML_OP_RMS_NORM || qkv_math->op != GGML_OP_MUL_MAT ||
+            rms->src[0] == nullptr || qkv_math->src[0] == nullptr || qkv_math->src[1] == nullptr) {
+        if (blocker) {
+            *blocker = "missing RMS_NORM or QKV MUL_MAT operands";
         }
+        return false;
     }
-    if (dst == nullptr) {
-        for (int i = plan.end; i >= plan.start; --i) {
-            if (ggml_cuda_rdna3_tensor_name_matches_layer(cgraph->nodes[i], "post_moe", plan.layer)) {
-                dst = cgraph->nodes[i];
-                break;
+
+    const ggml_tensor * x = rms->src[0];
+    const ggml_tensor * norm_w = nullptr;
+    if (attn_norm->op == GGML_OP_MUL) {
+        if (attn_norm->src[0] == rms) {
+            norm_w = attn_norm->src[1];
+        } else if (attn_norm->src[1] == rms) {
+            norm_w = attn_norm->src[0];
+        } else {
+            if (blocker) {
+                *blocker = "attn_norm MUL does not consume the selected RMS_NORM";
             }
+            return false;
         }
-    }
-    if (start == nullptr || start->src[0] == nullptr || dst == nullptr) {
+    } else if (attn_norm != rms) {
         if (blocker) {
-            *blocker = "missing layer input or output";
+            *blocker = "attn_norm is neither RMS_NORM nor RMS_NORM*MUL";
         }
         return false;
     }
 
-    const ggml_tensor * src = start->src[0];
-    if (src->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+    const ggml_tensor * wqkv = qkv_math->src[0];
+    const ggml_tensor * qkv_scale = nullptr;
+    if (qkv_out->op == GGML_OP_MUL) {
+        if (qkv_out->src[0] == qkv_math) {
+            qkv_scale = qkv_out->src[1];
+        } else if (qkv_out->src[1] == qkv_math) {
+            qkv_scale = qkv_out->src[0];
+        } else {
+            if (blocker) {
+                *blocker = "QKV scale MUL does not consume the selected MUL_MAT";
+            }
+            return false;
+        }
+    } else if (qkv_out != qkv_math) {
         if (blocker) {
-            *blocker = "identity mega only supports f32 layer tensors";
+            *blocker = "QKV output is neither MUL_MAT nor scaled MUL_MAT";
         }
         return false;
     }
-    if (!ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
+    if (qkv_math->src[1] != attn_norm) {
         if (blocker) {
-            *blocker = "identity mega requires contiguous tensors";
+            *blocker = "QKV MUL_MAT input is not the selected attn_norm";
         }
         return false;
     }
-    if (ggml_nelements(src) != ggml_nelements(dst)) {
+    if (x->type != GGML_TYPE_F32 || rms->type != GGML_TYPE_F32 || attn_norm->type != GGML_TYPE_F32 ||
+            qkv_math->type != GGML_TYPE_F32 || qkv_out->type != GGML_TYPE_F32 ||
+            (norm_w != nullptr && norm_w->type != GGML_TYPE_F32) ||
+            (qkv_scale != nullptr && qkv_scale->type != GGML_TYPE_F32)) {
         if (blocker) {
-            *blocker = "identity mega input/output shape mismatch";
+            *blocker = "QKV mega stage only supports f32 activations and scales";
+        }
+        return false;
+    }
+    if (!ggml_is_contiguous_1(x) || !ggml_is_contiguous_1(attn_norm) || !ggml_is_contiguous_1(qkv_out) ||
+            (norm_w != nullptr && !ggml_is_contiguous(norm_w)) ||
+            (qkv_scale != nullptr && !ggml_is_contiguous(qkv_scale))) {
+        if (blocker) {
+            *blocker = "QKV mega stage requires row-contiguous tensors";
+        }
+        return false;
+    }
+    if (x->ne[0] != attn_norm->ne[0] || x->ne[0] != wqkv->ne[0] ||
+            qkv_math->ne[0] != wqkv->ne[1] || qkv_out->ne[0] != qkv_math->ne[0]) {
+        if (blocker) {
+            *blocker = "QKV mega stage tensor dimensions do not match";
+        }
+        return false;
+    }
+    if (ggml_nelements(attn_norm) != ggml_nelements(x) ||
+            ggml_nelements(qkv_math) != ggml_nelements(qkv_out) ||
+            ggml_nelements(qkv_out) / qkv_out->ne[0] != ggml_nelements(x) / x->ne[0]) {
+        if (blocker) {
+            *blocker = "QKV mega stage token dimensions do not match";
+        }
+        return false;
+    }
+    if (norm_w != nullptr && ggml_nelements(norm_w) != x->ne[0]) {
+        if (blocker) {
+            *blocker = "attn_norm weight has unexpected size";
+        }
+        return false;
+    }
+    if (qkv_scale != nullptr && ggml_nelements(qkv_scale) != 1 && ggml_nelements(qkv_scale) != qkv_out->ne[0]) {
+        if (blocker) {
+            *blocker = "QKV scale has unexpected size";
         }
         return false;
     }
 
-    const int64_t n = ggml_nelements(dst);
-    const int block = 256;
-    const int grid = (int) ((n + block - 1) / block);
-    ggml_cuda_rdna3_qwen36_one_layer_mega_identity_kernel<<<grid, block, 0, cuda_ctx->stream()>>>(
-            (const float *) src->data, (float *) dst->data, n);
+    switch (wqkv->type) {
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_F16:
+        case GGML_TYPE_F32:
+            break;
+        default:
+            if (blocker) {
+                *blocker = "QKV weight type is not implemented in the one-layer mega kernel";
+            }
+            return false;
+    }
+
+    float eps;
+    std::memcpy(&eps, rms->op_params, sizeof(eps));
+
+    const int64_t n_tokens = ggml_nelements(x) / x->ne[0];
+    const int n_embd = (int) x->ne[0];
+    const int n_out  = (int) qkv_out->ne[0];
+    dim3 block(256, 1, 1);
+    dim3 grid((unsigned int) (n_out + 1), (unsigned int) n_tokens, 1);
+    ggml_cuda_rdna3_qwen36_one_layer_mega_kernel<<<grid, block, 0, cuda_ctx->stream()>>>(
+            (const char *) x->data, x->nb[1], x->nb[2], x->nb[3], x->ne[1], x->ne[2],
+            norm_w == nullptr ? nullptr : (const float *) norm_w->data,
+            qkv_scale == nullptr ? nullptr : (const float *) qkv_scale->data,
+            qkv_scale == nullptr ? 0 : ggml_nelements(qkv_scale),
+            (const char *) wqkv->data, wqkv->type, wqkv->nb[1],
+            (char *) attn_norm->data, attn_norm->nb[1], attn_norm->nb[2], attn_norm->nb[3],
+            (char *) qkv_out->data, qkv_out->nb[1], qkv_out->nb[2], qkv_out->nb[3],
+            qkv_out->ne[1], qkv_out->ne[2],
+            n_embd, n_out, eps);
     CUDA_CHECK(cudaGetLastError());
 
-    static std::atomic<int64_t> identity_report_count{0};
-    const int64_t report_id = identity_report_count.fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<int64_t> qkv_report_count{0};
+    const int64_t report_id = qkv_report_count.fetch_add(1, std::memory_order_relaxed);
     if (report_id < 16 || ggml_cuda_rdna3_graph_log_enabled(cuda_ctx->device)) {
         GGML_LOG_INFO(
-                "rdna3_qwen36_one_layer_mega: executed-identity layer=%d skipped_nodes=%d"
-                " span=[%d,%d] src=%s dst=%s elems=%" PRId64 "\n",
-                plan.layer, plan.end - plan.start + 1, plan.start, plan.end,
-                src->name, dst->name, n);
+                "rdna3_qwen36_one_layer_mega: executed-qkv layer=%d skipped_nodes=%d"
+                " span=[%d,%d] rms=%s attn_norm=%s wqkv=%s qkv=%s qkv_scale=%s"
+                " tokens=%" PRId64 " n_embd=%d n_out=%d type=%s\n",
+                plan.layer, plan.qkv_skip_end - plan.rms + 1, plan.rms, plan.qkv_skip_end,
+                rms->name, attn_norm->name, wqkv->name, qkv_out->name,
+                qkv_scale == nullptr ? "none" : qkv_scale->name,
+                n_tokens, n_embd, n_out, ggml_type_name(wqkv->type));
     }
 
     return true;
@@ -5710,21 +6051,20 @@ static void ggml_cuda_graph_evaluate_and_capture(
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
-                const bool qwen36_identity_layer_hit =
+                const bool qwen36_one_layer_qkv_hit =
                     one_layer_plan != nullptr &&
-                    ggml_cuda_rdna3_qwen36_one_layer_mega_identity_enabled(cuda_ctx->device) &&
-                    i == one_layer_plan->start;
+                    i == one_layer_plan->rms;
 
-                if (qwen36_identity_layer_hit) {
-                    std::string identity_blocker;
-                    const bool identity_ok = ggml_cuda_rdna3_qwen36_one_layer_mega_identity_launch(
-                            cuda_ctx, cgraph, *one_layer_plan, &identity_blocker);
-                    if (!identity_ok) {
-                        GGML_ABORT("%s: Qwen3.6 RDNA3 one-layer identity mega failed: %s",
-                                __func__, identity_blocker.c_str());
+                if (qwen36_one_layer_qkv_hit) {
+                    std::string qkv_blocker;
+                    const bool qkv_ok = ggml_cuda_rdna3_qwen36_one_layer_mega_launch(
+                            cuda_ctx, cgraph, *one_layer_plan, &qkv_blocker);
+                    if (!qkv_ok) {
+                        GGML_ABORT("%s: Qwen3.6 RDNA3 one-layer QKV mega failed: %s",
+                                __func__, qkv_blocker.c_str());
                     }
-                    prev_i = one_layer_plan->end;
-                    i = one_layer_plan->end;
+                    prev_i = one_layer_plan->qkv_skip_end;
+                    i = one_layer_plan->qkv_skip_end;
                     continue;
                 }
 
@@ -6535,8 +6875,6 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     const bool qwen36_one_layer_mega = ggml_cuda_rdna3_qwen36_one_layer_mega_enabled(cuda_ctx->device);
     const bool qwen36_one_layer_mega_required =
         ggml_cuda_rdna3_qwen36_one_layer_mega_required(cuda_ctx->device);
-    const bool qwen36_one_layer_mega_identity =
-        ggml_cuda_rdna3_qwen36_one_layer_mega_identity_enabled(cuda_ctx->device);
     ggml_cuda_rdna3_qwen36_one_layer_mega_plan qwen36_one_layer_plan;
     bool qwen36_one_layer_mega_ready = false;
     bool qwen36_mega_contract_this_eval = false;
@@ -6716,10 +7054,6 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_rdna3_qwen36_mega_decode_contract_current =
         qwen36_mega_required && qwen36_mega_contract_this_eval;
-    if (qwen36_one_layer_mega_ready && !qwen36_one_layer_mega_identity &&
-            (!use_cuda_graph || cuda_graph_update_required)) {
-        ggml_cuda_rdna3_qwen36_one_layer_mega_stage0_launch(cuda_ctx, qwen36_one_layer_plan);
-    }
     ggml_cuda_graph_evaluate_and_capture(
             cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key,
             qwen36_one_layer_mega_ready ? &qwen36_one_layer_plan : nullptr);
