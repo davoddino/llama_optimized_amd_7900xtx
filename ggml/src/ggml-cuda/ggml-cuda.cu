@@ -51,6 +51,7 @@
 #include "ggml-cuda/topk-moe.cuh"
 #include "ggml-cuda/unary.cuh"
 #include "ggml-cuda/upscale.cuh"
+#include "ggml-cuda/vecdotq.cuh"
 #include "ggml-cuda/wkv.cuh"
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
@@ -62,6 +63,12 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml.h"
+
+#ifdef GGML_USE_HIP
+#include <hip/hip_cooperative_groups.h>
+#else
+#include <cooperative_groups.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -3489,6 +3496,38 @@ static __device__ __forceinline__ float ggml_cuda_rdna3_qwen36_one_layer_dequant
     }
 }
 
+struct ggml_cuda_rdna3_qwen36_one_layer_mega_kernel_params {
+    const char * x_base;
+    int64_t x_nb1;
+    int64_t x_nb2;
+    int64_t x_nb3;
+    int64_t x_ne1;
+    int64_t x_ne2;
+    const float * norm_w;
+    const float * qkv_scale;
+    int64_t qkv_scale_n;
+    const char * wqkv;
+    ggml_type wqkv_type;
+    int64_t wqkv_nb1;
+    char * norm_base;
+    int64_t norm_nb1;
+    int64_t norm_nb2;
+    int64_t norm_nb3;
+    char * qkv_base;
+    int64_t qkv_nb1;
+    int64_t qkv_nb2;
+    int64_t qkv_nb3;
+    int64_t qkv_ne1;
+    int64_t qkv_ne2;
+    int n_embd;
+    int n_out;
+    float eps;
+    float * partial_sums;
+    float * inv_rms;
+    block_q8_1 * x_q8_1;
+    int n_q8_1;
+};
+
 static __global__ void ggml_cuda_rdna3_qwen36_one_layer_mega_kernel(
         const char * __restrict__ x_base,
         const int64_t x_nb1,
@@ -3578,6 +3617,146 @@ static __global__ void ggml_cuda_rdna3_qwen36_one_layer_mega_kernel(
     if (tid == 0) {
         const float scale = qkv_scale == nullptr ? 1.0f : qkv_scale[qkv_scale_n == 1 ? 0 : row];
         qkv[row] = reduce[0] * scale;
+    }
+}
+
+static __global__ void ggml_cuda_rdna3_qwen36_one_layer_mega_coop_kernel(
+        ggml_cuda_rdna3_qwen36_one_layer_mega_kernel_params p) {
+    namespace cg = cooperative_groups;
+    constexpr int block_size = 256;
+    __shared__ float reduce[block_size];
+
+    cg::grid_group grid = cg::this_grid();
+    const int tid = threadIdx.x;
+    const int bid = blockIdx.x;
+    const int n_blocks = gridDim.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    constexpr int nwarps = block_size / 32;
+
+    const float * x = (const float *) p.x_base;
+    float * norm = (float *) p.norm_base;
+    float * qkv = (float *) p.qkv_base;
+    const bool q8_0_dot = p.wqkv_type == GGML_TYPE_Q8_0 && p.x_q8_1 != nullptr && p.n_q8_1 > 0;
+
+    float ss = 0.0f;
+    for (int k = bid*blockDim.x + tid; k < p.n_embd; k += n_blocks*blockDim.x) {
+        const float v = x[k];
+        ss += v*v;
+    }
+    reduce[tid] = ss;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            reduce[tid] += reduce[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        p.partial_sums[bid] = reduce[0];
+    }
+
+    grid.sync();
+
+    if (bid == 0) {
+        float total = 0.0f;
+        for (int i = tid; i < n_blocks; i += blockDim.x) {
+            total += p.partial_sums[i];
+        }
+        reduce[tid] = total;
+        __syncthreads();
+        for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                reduce[tid] += reduce[tid + stride];
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            p.inv_rms[0] = rsqrtf(reduce[0] / (float) p.n_embd + p.eps);
+        }
+    }
+
+    grid.sync();
+
+    const float inv_rms = p.inv_rms[0];
+    if (q8_0_dot) {
+        for (int ib = bid*nwarps + warp; ib < p.n_q8_1; ib += n_blocks*nwarps) {
+            const int k = ib*QK8_1 + lane;
+            const float xn = k < p.n_embd ? x[k] * inv_rms * (p.norm_w == nullptr ? 1.0f : p.norm_w[k]) : 0.0f;
+            if (k < p.n_embd) {
+                norm[k] = xn;
+            }
+
+            float amax = fabsf(xn);
+            float sum = xn;
+#pragma unroll
+            for (int mask = 16; mask > 0; mask >>= 1) {
+                amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, mask, 32));
+                sum += __shfl_xor_sync(0xFFFFFFFF, sum, mask, 32);
+            }
+
+            const float d = amax / 127.0f;
+            const int8_t q = amax == 0.0f ? 0 : (int8_t) roundf(xn / d);
+            p.x_q8_1[ib].qs[lane] = q;
+            if (lane == 0) {
+                p.x_q8_1[ib].ds = make_half2(d, sum);
+            }
+        }
+    } else {
+        for (int k = bid*blockDim.x + tid; k < p.n_embd; k += n_blocks*blockDim.x) {
+            norm[k] = x[k] * inv_rms * (p.norm_w == nullptr ? 1.0f : p.norm_w[k]);
+        }
+    }
+
+    grid.sync();
+
+    if (q8_0_dot) {
+        constexpr int vdr = VDR_Q8_0_Q8_1_MMVQ;
+        constexpr int qi = QI8_0;
+        constexpr int blocks_per_iter = vdr*32/qi;
+
+        for (int row = bid*nwarps + warp; row < p.n_out; row += n_blocks*nwarps) {
+            const char * wrow = p.wqkv + (int64_t) row*p.wqkv_nb1;
+            float acc = 0.0f;
+            for (int kbx = lane / (qi/vdr); kbx < p.n_q8_1; kbx += blocks_per_iter) {
+                const int kqs = vdr * (lane % (qi/vdr));
+                acc += vec_dot_q8_0_q8_1(wrow, p.x_q8_1 + kbx, kbx, kqs);
+            }
+
+            acc = warp_reduce_sum<32>(acc);
+            if (lane == 0) {
+                const float scale = p.qkv_scale == nullptr ? 1.0f :
+                    p.qkv_scale[p.qkv_scale_n == 1 ? 0 : row];
+                qkv[row] = acc * scale;
+            }
+        }
+    } else {
+        for (int row = bid; row < p.n_out; row += n_blocks) {
+            float acc = 0.0f;
+            for (int k = tid; k < p.n_embd; k += blockDim.x) {
+                const float xn = x[k] * inv_rms * (p.norm_w == nullptr ? 1.0f : p.norm_w[k]);
+                const float w = ggml_cuda_rdna3_qwen36_one_layer_dequant_weight(
+                        p.wqkv, p.wqkv_type, p.wqkv_nb1, row, k);
+                acc += xn*w;
+            }
+
+            reduce[tid] = acc;
+            __syncthreads();
+            for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+                if (tid < stride) {
+                    reduce[tid] += reduce[tid + stride];
+                }
+                __syncthreads();
+            }
+
+            if (tid == 0) {
+                const float scale = p.qkv_scale == nullptr ? 1.0f :
+                    p.qkv_scale[p.qkv_scale_n == 1 ? 0 : row];
+                qkv[row] = reduce[0] * scale;
+            }
+            __syncthreads();
+        }
     }
 }
 
@@ -3718,17 +3897,68 @@ static bool ggml_cuda_rdna3_qwen36_one_layer_mega_launch(
     const int n_embd = (int) x->ne[0];
     const int n_out  = (int) qkv_out->ne[0];
     dim3 block(256, 1, 1);
-    dim3 grid((unsigned int) (n_out + 1), (unsigned int) n_tokens, 1);
-    ggml_cuda_rdna3_qwen36_one_layer_mega_kernel<<<grid, block, 0, cuda_ctx->stream()>>>(
-            (const char *) x->data, x->nb[1], x->nb[2], x->nb[3], x->ne[1], x->ne[2],
-            norm_w == nullptr ? nullptr : (const float *) norm_w->data,
-            qkv_scale == nullptr ? nullptr : (const float *) qkv_scale->data,
-            qkv_scale == nullptr ? 0 : ggml_nelements(qkv_scale),
-            (const char *) wqkv->data, wqkv->type, wqkv->nb[1],
-            (char *) attn_norm->data, attn_norm->nb[1], attn_norm->nb[2], attn_norm->nb[3],
-            (char *) qkv_out->data, qkv_out->nb[1], qkv_out->nb[2], qkv_out->nb[3],
-            qkv_out->ne[1], qkv_out->ne[2],
-            n_embd, n_out, eps);
+    bool used_coop_kernel = false;
+    bool used_q8_dp4a = false;
+    if (n_tokens == 1 && ggml_cuda_info().devices[cuda_ctx->device].supports_cooperative_launch) {
+        const int coop_blocks = std::max(1, std::min(ggml_cuda_info().devices[cuda_ctx->device].nsm, n_out));
+        ggml_cuda_pool_alloc<float> coop_scratch(cuda_ctx->pool(), coop_blocks + 1);
+
+        ggml_cuda_rdna3_qwen36_one_layer_mega_kernel_params params;
+        params.x_base       = (const char *) x->data;
+        params.x_nb1        = x->nb[1];
+        params.x_nb2        = x->nb[2];
+        params.x_nb3        = x->nb[3];
+        params.x_ne1        = x->ne[1];
+        params.x_ne2        = x->ne[2];
+        params.norm_w       = norm_w == nullptr ? nullptr : (const float *) norm_w->data;
+        params.qkv_scale    = qkv_scale == nullptr ? nullptr : (const float *) qkv_scale->data;
+        params.qkv_scale_n  = qkv_scale == nullptr ? 0 : ggml_nelements(qkv_scale);
+        params.wqkv         = (const char *) wqkv->data;
+        params.wqkv_type    = wqkv->type;
+        params.wqkv_nb1     = wqkv->nb[1];
+        params.norm_base    = (char *) attn_norm->data;
+        params.norm_nb1     = attn_norm->nb[1];
+        params.norm_nb2     = attn_norm->nb[2];
+        params.norm_nb3     = attn_norm->nb[3];
+        params.qkv_base     = (char *) qkv_out->data;
+        params.qkv_nb1      = qkv_out->nb[1];
+        params.qkv_nb2      = qkv_out->nb[2];
+        params.qkv_nb3      = qkv_out->nb[3];
+        params.qkv_ne1      = qkv_out->ne[1];
+        params.qkv_ne2      = qkv_out->ne[2];
+        params.n_embd       = n_embd;
+        params.n_out        = n_out;
+        params.eps          = eps;
+        params.partial_sums = coop_scratch.ptr;
+        params.inv_rms      = coop_scratch.ptr + coop_blocks;
+        params.x_q8_1       = nullptr;
+        params.n_q8_1       = 0;
+
+        ggml_cuda_pool_alloc<block_q8_1> x_q8_1(cuda_ctx->pool());
+        if (wqkv->type == GGML_TYPE_Q8_0 && n_embd % QK8_1 == 0) {
+            params.n_q8_1 = n_embd / QK8_1;
+            params.x_q8_1 = x_q8_1.alloc(params.n_q8_1);
+            used_q8_dp4a = true;
+        }
+
+        void * kernel_args[] = { (void *) &params };
+        CUDA_CHECK(cudaLaunchCooperativeKernel(
+                (void *) ggml_cuda_rdna3_qwen36_one_layer_mega_coop_kernel,
+                dim3((unsigned int) coop_blocks, 1, 1), block, kernel_args, 0, cuda_ctx->stream()));
+        used_coop_kernel = true;
+    } else {
+        dim3 grid((unsigned int) (n_out + 1), (unsigned int) n_tokens, 1);
+        ggml_cuda_rdna3_qwen36_one_layer_mega_kernel<<<grid, block, 0, cuda_ctx->stream()>>>(
+                (const char *) x->data, x->nb[1], x->nb[2], x->nb[3], x->ne[1], x->ne[2],
+                norm_w == nullptr ? nullptr : (const float *) norm_w->data,
+                qkv_scale == nullptr ? nullptr : (const float *) qkv_scale->data,
+                qkv_scale == nullptr ? 0 : ggml_nelements(qkv_scale),
+                (const char *) wqkv->data, wqkv->type, wqkv->nb[1],
+                (char *) attn_norm->data, attn_norm->nb[1], attn_norm->nb[2], attn_norm->nb[3],
+                (char *) qkv_out->data, qkv_out->nb[1], qkv_out->nb[2], qkv_out->nb[3],
+                qkv_out->ne[1], qkv_out->ne[2],
+                n_embd, n_out, eps);
+    }
     CUDA_CHECK(cudaGetLastError());
 
     static std::atomic<int64_t> qkv_report_count{0};
@@ -3743,12 +3973,13 @@ static bool ggml_cuda_rdna3_qwen36_one_layer_mega_launch(
         GGML_LOG_INFO(
                 "rdna3_qwen36_one_layer_mega: executed-qkv layer=%d skipped_nodes=%d"
                 " skip_indices=[%d,%d,%d,%d,%d] rms=%s attn_norm=%s wqkv=%s qkv=%s qkv_scale=%s"
-                " tokens=%" PRId64 " n_embd=%d n_out=%d type=%s\n",
+                " tokens=%" PRId64 " n_embd=%d n_out=%d type=%s mode=%s\n",
                 plan.layer, skipped_nodes,
                 plan.rms, plan.attn_norm, plan.qkv_math, plan.qkv_out, plan.qkv,
                 rms->name, attn_norm->name, wqkv->name, qkv_out->name,
                 qkv_scale == nullptr ? "none" : qkv_scale->name,
-                n_tokens, n_embd, n_out, ggml_type_name(wqkv->type));
+                n_tokens, n_embd, n_out, ggml_type_name(wqkv->type),
+                used_q8_dp4a ? "coop-q8dp4a" : (used_coop_kernel ? "coop-float" : "row-block"));
     }
 
     return true;
