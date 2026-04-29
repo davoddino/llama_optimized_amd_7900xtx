@@ -23,6 +23,8 @@ The server helper exposes this as:
 RDNA3_KERNEL_PRESET=mega-contract scripts/run-qwen36-35b-tqkv.sh
 ```
 
+If the default port `8002` is already busy and `TQKV_PORT` was not set explicitly, the helper picks the next free port and prints the effective URL. Set `TQKV_PORT=8003` to force a specific port, or `TQKV_PORT_AUTO=0` to fail instead of auto-selecting.
+
 The `mega-contract` preset now forces backend sampling and blocks raw logits readback:
 
 ```bash

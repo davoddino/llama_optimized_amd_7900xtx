@@ -12,7 +12,19 @@ ALIAS="${ALIAS:-qwen3.6-35b}"
 DOWNLOAD_URL="${DOWNLOAD_URL:-https://huggingface.co/unsloth/Qwen3.6-35B-A3B-UD-GGUF/resolve/main/$MODEL_FILE}"
 
 HOST="${HOST:-0.0.0.0}"
+TQKV_PORT_WAS_SET=0
+if [[ -n "${TQKV_PORT+x}" ]]; then
+    TQKV_PORT_WAS_SET=1
+fi
 PORT="${TQKV_PORT:-8002}"
+if [[ -z "${TQKV_PORT_AUTO+x}" ]]; then
+    if [[ "$TQKV_PORT_WAS_SET" == "0" ]]; then
+        TQKV_PORT_AUTO=1
+    else
+        TQKV_PORT_AUTO=0
+    fi
+fi
+TQKV_PORT_AUTO_LIMIT="${TQKV_PORT_AUTO_LIMIT:-32}"
 CTX_SIZE="${CTX_SIZE:-128000}"
 PARALLEL="${PARALLEL:-${N_PARALLEL:-1}}"
 TQKV_PROFILE="${TQKV_PROFILE:-fast}"
@@ -188,6 +200,60 @@ else
         echo "Expected one of:" >&2
         printf '  %s\n' "${SERVER_CANDIDATES[@]}" >&2
         echo "Or set SERVER_BIN=/full/path/to/llama-server." >&2
+        exit 1
+    fi
+fi
+
+port_listener_info() {
+    local port="$1"
+
+    if command -v ss >/dev/null 2>&1; then
+        ss -H -ltnp "sport = :$port" 2>/dev/null || ss -H -ltn "sport = :$port" 2>/dev/null || true
+    elif command -v lsof >/dev/null 2>&1; then
+        lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null || true
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -ltnp 2>/dev/null | awk -v port=":$port" '$4 ~ port "$" {print}' || true
+    fi
+}
+
+port_is_busy() {
+    local port="$1"
+
+    if [[ -n "$(port_listener_info "$port")" ]]; then
+        return 0
+    fi
+
+    if (echo > "/dev/tcp/127.0.0.1/$port") >/dev/null 2>&1; then
+        return 0
+    fi
+
+    return 1
+}
+
+if port_is_busy "$PORT"; then
+    if [[ "$TQKV_PORT_AUTO" == "1" ]]; then
+        start_port="$PORT"
+        max_port=$((PORT + TQKV_PORT_AUTO_LIMIT))
+        next_port=$((PORT + 1))
+
+        while (( next_port <= max_port )); do
+            if ! port_is_busy "$next_port"; then
+                PORT="$next_port"
+                echo "Port $start_port is already in use; using $PORT instead." >&2
+                break
+            fi
+            next_port=$((next_port + 1))
+        done
+
+        if [[ "$PORT" == "$start_port" ]]; then
+            echo "Port $start_port is already in use and no free port was found in [$((start_port + 1)), $max_port]." >&2
+            echo "Set TQKV_PORT to a free port, or increase TQKV_PORT_AUTO_LIMIT." >&2
+            exit 1
+        fi
+    else
+        echo "Port $PORT is already in use." >&2
+        port_listener_info "$PORT" | sed 's/^/  /' >&2
+        echo "Stop the existing server or set TQKV_PORT to a free port." >&2
         exit 1
     fi
 fi
