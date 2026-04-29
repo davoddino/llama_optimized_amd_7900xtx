@@ -1523,6 +1523,27 @@ private:
         }
     }
 
+    llama_token replace_empty_first_chat_eog(const server_slot & slot, llama_token id) const {
+        if (slot.task->params.res_type != TASK_RESPONSE_TYPE_OAI_CHAT || slot.n_decoded != 0 || !llama_vocab_is_eog(vocab, id)) {
+            return id;
+        }
+
+        const auto * cur_p = common_sampler_get_candidates(slot.smpl.get(), true);
+        if (cur_p == nullptr) {
+            return id;
+        }
+
+        for (size_t i = 0; i < cur_p->size; ++i) {
+            const llama_token candidate = cur_p->data[i].id;
+            if (candidate != LLAMA_TOKEN_NULL && !llama_vocab_is_eog(vocab, candidate)) {
+                SLT_DBG(slot, "replacing empty first chat EOG token %d with %d\n", id, candidate);
+                return candidate;
+            }
+        }
+
+        return id;
+    }
+
     void send_error(const server_task & task, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER) {
         send_error(task.id, error, type);
     }
@@ -2913,6 +2934,7 @@ private:
                 const int tok_idx = slot.i_batch - i;
 
                 llama_token id = common_sampler_sample(slot.smpl.get(), slot.ctx, tok_idx);
+                id = replace_empty_first_chat_eog(slot, id);
 
                 slot.i_batch = -1;
 

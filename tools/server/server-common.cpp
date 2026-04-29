@@ -1197,7 +1197,7 @@ json oaicompat_chat_params_parse(
             reasoning_budget = json_value(body, "thinking_budget_tokens", -1);
         }
 
-        if (!chat_params.thinking_end_tag.empty()) {
+        if (inputs.enable_thinking && !chat_params.thinking_end_tag.empty()) {
             llama_params["reasoning_budget_tokens"] = reasoning_budget;
             llama_params["reasoning_budget_start_tag"] = chat_params.thinking_start_tag;
             llama_params["reasoning_budget_end_tag"] = chat_params.thinking_end_tag;

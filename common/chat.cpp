@@ -2189,9 +2189,6 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
     std::string gen_prompt       = common_chat_template_direct_apply_impl(tmpl, params);
     auto        diff             = calculate_diff_split(no_gen_prompt, gen_prompt);
     params.generation_prompt     = diff.right + diff.suffix;
-    if (!inputs.enable_thinking) {
-        common_chat_strip_empty_thinking_suffix(params.generation_prompt, "<think>", "</think>");
-    }
 
     params.add_generation_prompt = inputs.add_generation_prompt;
 
@@ -2238,9 +2235,6 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
 
     if (auto result = common_chat_try_specialized_template(tmpl, src, params)) {
         result->generation_prompt = params.generation_prompt;
-        if (!inputs.enable_thinking) {
-            common_chat_strip_empty_thinking_suffix(result->prompt, result->thinking_start_tag, result->thinking_end_tag);
-        }
         return *result;
     }
 
@@ -2255,9 +2249,6 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
             auto_params.thinking_end_tag   = autoparser.reasoning.end;
         }
         auto_params.generation_prompt = params.generation_prompt;
-        if (!inputs.enable_thinking) {
-            common_chat_strip_empty_thinking_suffix(auto_params.prompt, auto_params.thinking_start_tag, auto_params.thinking_end_tag);
-        }
         common_peg_arena arena;
         arena.load(auto_params.parser);
         LOG_DBG("%s: generated parser:\n%s\n\nparser generation prompt: %s\n", __func__, arena.dump(arena.root()).c_str(), auto_params.generation_prompt.c_str());
