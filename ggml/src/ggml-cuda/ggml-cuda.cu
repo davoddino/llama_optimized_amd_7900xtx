@@ -137,6 +137,10 @@ static bool ggml_cuda_rdna3_qwen36_fastpath_enabled(const int device) {
         GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[device].cc);
 }
 
+static bool ggml_cuda_rdna3_mmvq_q8_cache_log_enabled() {
+    return ggml_cuda_env_enabled("GGML_CUDA_RDNA3_MMVQ_Q8_CACHE_LOG");
+}
+
 static bool ggml_cuda_rdna3_qwen36_moe_decode_shape(const ggml_tensor * src0, const ggml_tensor * ids, const int64_t n_tokens) {
     if (src0 == nullptr || ids == nullptr || ids->type != GGML_TYPE_I32 || ids->ne[0] != 8 || n_tokens != 1) {
         return false;
@@ -5864,7 +5868,19 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         ggml_cuda_rdna3_op_profile_current = &rdna3_profile;
     }
 
+    const uint64_t mmvq_q8_cache_eval_before = cuda_ctx->mmvq_q8_cache_eval_id;
+
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+    if (ggml_cuda_rdna3_mmvq_q8_cache_log_enabled() &&
+            cuda_ctx->mmvq_q8_cache_eval_id != mmvq_q8_cache_eval_before) {
+        GGML_LOG_INFO(
+                "rdna3_mmvq_q8_cache: eval=%" PRIu64 " entries=%zu hits=%" PRIu64 " misses=%" PRIu64
+                " requantizes=%" PRIu64 "\n",
+                cuda_ctx->mmvq_q8_cache_eval_id, cuda_ctx->mmvq_q8_cache.size(),
+                cuda_ctx->mmvq_q8_cache_hits, cuda_ctx->mmvq_q8_cache_misses,
+                cuda_ctx->mmvq_q8_cache_requantizes);
+    }
 
     if (rdna3_op_profile_this_eval) {
         ggml_cuda_rdna3_op_profile_current = nullptr;

@@ -77,6 +77,7 @@ static char * ggml_cuda_mmvq_get_src1_q8_1(
     };
 
     if (!rdna3_mmvq_q8_cache_enabled() || ctx.mmvq_q8_cache_eval_id == 0) {
+        ctx.mmvq_q8_cache_misses++;
         fallback.alloc(ctx.pool(), nbytes);
         quantize(fallback.get());
         return fallback.get();
@@ -104,11 +105,16 @@ static char * ggml_cuda_mmvq_get_src1_q8_1(
             continue;
         }
         if (entry->last_eval_id != ctx.mmvq_q8_cache_eval_id) {
+            ctx.mmvq_q8_cache_requantizes++;
             quantize(entry->data.get());
             entry->last_eval_id = ctx.mmvq_q8_cache_eval_id;
+        } else {
+            ctx.mmvq_q8_cache_hits++;
         }
         return entry->data.get();
     }
+
+    ctx.mmvq_q8_cache_misses++;
 
     auto entry = std::make_unique<ggml_cuda_mmvq_q8_cache_entry>();
     entry->src1       = src1;

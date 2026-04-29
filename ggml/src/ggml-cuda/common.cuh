@@ -1374,6 +1374,9 @@ struct ggml_backend_cuda_context {
     int curr_stream_no = 0;
 
     uint64_t mmvq_q8_cache_eval_id = 0;
+    uint64_t mmvq_q8_cache_hits = 0;
+    uint64_t mmvq_q8_cache_misses = 0;
+    uint64_t mmvq_q8_cache_requantizes = 0;
     std::vector<std::unique_ptr<ggml_cuda_mmvq_q8_cache_entry>> mmvq_q8_cache;
 
     void begin_mmvq_q8_cache_eval() {
@@ -1381,6 +1384,9 @@ struct ggml_backend_cuda_context {
             mmvq_q8_cache.clear();
             mmvq_q8_cache_eval_id = 1;
         }
+        mmvq_q8_cache_hits = 0;
+        mmvq_q8_cache_misses = 0;
+        mmvq_q8_cache_requantizes = 0;
     }
 
 #ifdef USE_CUDA_GRAPH
