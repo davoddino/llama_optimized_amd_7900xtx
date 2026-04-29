@@ -1740,9 +1740,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         auto * t_logits = res->get_logits();
         auto * t_embd   = cparams.embeddings ? res->get_embd() : nullptr;
+        const bool sample_token_only = qwen36_mega_sample_token_only_enabled();
 
         if (t_embd && res->get_embd_pooled()) {
             t_embd = res->get_embd_pooled();
+        }
+
+        if (has_samplers && sample_token_only && n_outputs > 0 && res->t_sampled.empty()) {
+            LLAMA_LOG_ERROR("%s: backend sampling did not produce a sampled token while"
+                    " GGML_CUDA_RDNA3_QWEN36_MEGA_SAMPLE_TOKEN_ONLY=1; use a backend-compatible"
+                    " sampler chain or unset token-only mode\n", __func__);
+            return -1;
         }
 
         // extract logits
@@ -1831,7 +1839,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
         if (has_samplers && (!res->t_sampled.empty() || !res->t_sampled_probs.empty() || !res->t_sampled_logits.empty())) {
             const auto seq_to_output_row = build_seq_to_output_row(ubatch, n_outputs_prev);
             const auto stride = n_vocab;
-            const bool sample_token_only = qwen36_mega_sample_token_only_enabled();
 
             // async copy the sampling data from the backend to the host
             copy_tensor_async_ints(res->t_sampled, sampling.sampled, seq_to_output_row, sched.get());

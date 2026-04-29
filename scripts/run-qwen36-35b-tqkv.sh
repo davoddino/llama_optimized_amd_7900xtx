@@ -37,6 +37,8 @@ BACKEND_SAMPLING="${BACKEND_SAMPLING:-0}"
 SAMPLING_TEMP="${SAMPLING_TEMP:-1}"
 SAMPLING_TOP_K="${SAMPLING_TOP_K:-20}"
 SAMPLING_TOP_P="${SAMPLING_TOP_P:-0.95}"
+SAMPLING_MIN_P="${SAMPLING_MIN_P:-0.05}"
+SAMPLERS="${SAMPLERS:-}"
 REASONING_MODE="${REASONING_MODE:-auto}"
 REASONING_FORMAT="${REASONING_FORMAT:-deepseek}"
 REASONING_BUDGET="${REASONING_BUDGET:--1}"
@@ -125,6 +127,9 @@ case "$RDNA3_KERNEL_PRESET" in
         RDNA3_QWEN36_MEGA_NO_RAW_LOGITS=1
         RDNA3_QWEN36_MEGA_ASYNC_INPUTS=1
         BACKEND_SAMPLING=1
+        SAMPLING_TOP_K=0
+        SAMPLING_TOP_P=1
+        SAMPLERS="${SAMPLERS:-min_p;temperature}"
         ;;
     *)
         echo "Unsupported RDNA3_KERNEL_PRESET=$RDNA3_KERNEL_PRESET" >&2
@@ -273,6 +278,10 @@ fi
 
 if [[ "$BACKEND_SAMPLING" == "1" ]]; then
     SERVER_EXTRA_ARGS+=(--backend-sampling)
+fi
+
+if [[ -n "$SAMPLERS" ]]; then
+    SERVER_EXTRA_ARGS+=(--samplers "$SAMPLERS")
 fi
 
 if [[ "$RDNA3_PROFILE_LOG" == "1" ]]; then
@@ -448,7 +457,8 @@ echo "  prompt cache RAM: ${PROMPT_CACHE_MB} MiB"
 echo "  ctx checkpoints: $CTX_CHECKPOINTS"
 echo "  checkpoint every n tokens: $CHECKPOINT_EVERY_NT"
 echo "  backend sampling: $BACKEND_SAMPLING"
-echo "  default sampling: temp=$SAMPLING_TEMP top-k=$SAMPLING_TOP_K top-p=$SAMPLING_TOP_P"
+echo "  default sampling: temp=$SAMPLING_TEMP top-k=$SAMPLING_TOP_K top-p=$SAMPLING_TOP_P min-p=$SAMPLING_MIN_P"
+echo "  sampler chain override: ${SAMPLERS:-default}"
 echo "  reasoning: mode=$REASONING_MODE format=$REASONING_FORMAT budget=$REASONING_BUDGET"
 echo "  rdna3 profile log: $RDNA3_PROFILE_LOG"
 echo "  rdna3 op profile: $RDNA3_OP_PROFILE"
@@ -512,6 +522,7 @@ exec "$SERVER_BIN" \
     --temp "$SAMPLING_TEMP" \
     --top-k "$SAMPLING_TOP_K" \
     --top-p "$SAMPLING_TOP_P" \
+    --min-p "$SAMPLING_MIN_P" \
     --ctx-size "$CTX_SIZE" \
     --batch-size "$BATCH_SIZE" \
     --ubatch-size "$UBATCH_SIZE" \
