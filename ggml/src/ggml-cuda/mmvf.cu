@@ -49,16 +49,26 @@ static __global__ void mul_mat_vec_f(
 
     bool use_gate = false;
     bool use_bias = false;
+    bool use_scale = false;
+    bool x_scale_scalar = false;
     bool use_gate_bias = false;
+    bool use_gate_scale = false;
+    bool gate_scale_scalar = false;
     ggml_glu_op glu_op = ggml_glu_op::GGML_GLU_OP_SWIGLU;
     const T * gate_x = nullptr;
     const float * x_bias = nullptr;
+    const float * x_scale = nullptr;
     const float * gate_bias = nullptr;
+    const float * gate_scale = nullptr;
 
     if constexpr (has_fusion) {
         use_gate = fusion.gate != nullptr;
         use_bias = fusion.x_bias != nullptr;
-        use_gate_bias = fusion.gate_bias != nullptr;
+        use_scale = fusion.x_scale != nullptr;
+        x_scale_scalar = fusion.x_scale_scalar;
+        use_gate_bias = fusion.gate_bias != nullptr && use_gate;
+        use_gate_scale = fusion.gate_scale != nullptr && use_gate;
+        gate_scale_scalar = fusion.gate_scale_scalar;
         glu_op = fusion.glu_op;
 
         if (use_gate) {
@@ -67,11 +77,14 @@ static __global__ void mul_mat_vec_f(
         if (use_bias) {
             x_bias = static_cast<const float *>(fusion.x_bias);
         }
+        if (use_scale) {
+            x_scale = static_cast<const float *>(fusion.x_scale);
+        }
         if (use_gate_bias) {
             gate_bias = static_cast<const float *>(fusion.gate_bias);
-            use_gate_bias = use_gate;
-        } else {
-            use_gate_bias = false;
+        }
+        if (use_gate_scale) {
+            gate_scale = static_cast<const float *>(fusion.gate_scale);
         }
     }
 
@@ -85,8 +98,14 @@ static __global__ void mul_mat_vec_f(
         if (use_bias) {
             x_bias += int64_t(sample_dst)*stride_sample_dst + channel_bias*stride_channel_dst;
         }
+        if (use_scale && !x_scale_scalar) {
+            x_scale += int64_t(sample_dst)*stride_sample_dst + channel_bias*stride_channel_dst;
+        }
         if (use_gate_bias) {
             gate_bias += int64_t(sample_dst)*stride_sample_dst + channel_bias*stride_channel_dst;
+        }
+        if (use_gate_scale && !gate_scale_scalar) {
+            gate_scale += int64_t(sample_dst)*stride_sample_dst + channel_bias*stride_channel_dst;
         }
     }
 
@@ -343,11 +362,17 @@ static __global__ void mul_mat_vec_f(
         if (use_bias) {
             value += x_bias[tid*stride_col_dst + row];
         }
+        if (use_scale) {
+            value *= x_scale_scalar ? x_scale[0] : x_scale[tid*stride_col_dst + row];
+        }
 
         if (use_gate) {
             float gate_value = sumf_gate[tid];
             if (use_gate_bias) {
                 gate_value += gate_bias[tid*stride_col_dst + row];
+            }
+            if (use_gate_scale) {
+                gate_value *= gate_scale_scalar ? gate_scale[0] : gate_scale[tid*stride_col_dst + row];
             }
             switch (glu_op) {
                 case GGML_GLU_OP_SWIGLU:
@@ -369,7 +394,8 @@ static __global__ void mul_mat_vec_f(
     dst[tid*stride_col_dst + row] = value;
 
     if constexpr (!has_fusion) {
-        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, glu_op, gate_x, x_bias, gate_bias, sumf_gate);
+        GGML_UNUSED_VARS(use_gate, use_bias, use_scale, x_scale_scalar, use_gate_bias, use_gate_scale, gate_scale_scalar, glu_op,
+                gate_x, x_bias, x_scale, gate_bias, gate_scale, sumf_gate);
     }
 }
 
@@ -382,7 +408,8 @@ static void mul_mat_vec_f_switch_fusion(
         const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
         const dim3 & block_dims, const dim3 & block_nums, const int nbytes_shared, const int ids_stride, const cudaStream_t stream) {
 
-    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.x_scale != nullptr ||
+        fusion.gate_bias != nullptr || fusion.gate_scale != nullptr;
     if constexpr (ncols_dst == 1) {
         if (has_fusion) {
             mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, is_multi_token_id><<<block_nums, block_dims, nbytes_shared, stream>>>
@@ -437,7 +464,8 @@ void launch_mul_mat_vec_f_cuda(
         }
     }
 
-    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.x_scale != nullptr ||
+        fusion.gate_bias != nullptr || fusion.gate_scale != nullptr;
 
     const int nbytes_shared = warp_size*sizeof(float) + (has_fusion ? warp_size*sizeof(float) : 0);
     const dim3 block_nums(nrows, nchannels_dst, nsamples_or_ntokens);
@@ -657,6 +685,14 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
             GGML_ASSERT(!ids || fusion->x_bias->ne[1] == src0->ne[2]);
             fusion_local.x_bias = fusion->x_bias->data;
         }
+        if (fusion->x_scale) {
+            const bool x_scale_scalar = ggml_nelements(fusion->x_scale) == 1;
+            GGML_ASSERT(fusion->x_scale->type == GGML_TYPE_F32);
+            GGML_ASSERT(x_scale_scalar || fusion->x_scale->ne[0] == dst->ne[0]);
+            GGML_ASSERT(x_scale_scalar || !ids || fusion->x_scale->ne[1] == src0->ne[2]);
+            fusion_local.x_scale = fusion->x_scale->data;
+            fusion_local.x_scale_scalar = x_scale_scalar;
+        }
         if (fusion->gate) {
             GGML_ASSERT(fusion->gate->type == src0->type && ggml_are_same_stride(fusion->gate, src0));
             fusion_local.gate = fusion->gate->data;
@@ -666,6 +702,14 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
             GGML_ASSERT(fusion->gate_bias->ne[0] == dst->ne[0]);
             GGML_ASSERT(!ids || fusion->gate_bias->ne[1] == src0->ne[2]);
             fusion_local.gate_bias = fusion->gate_bias->data;
+        }
+        if (fusion->gate_scale) {
+            const bool gate_scale_scalar = ggml_nelements(fusion->gate_scale) == 1;
+            GGML_ASSERT(fusion->gate_scale->type == GGML_TYPE_F32);
+            GGML_ASSERT(gate_scale_scalar || fusion->gate_scale->ne[0] == dst->ne[0]);
+            GGML_ASSERT(gate_scale_scalar || !ids || fusion->gate_scale->ne[1] == src0->ne[2]);
+            fusion_local.gate_scale = fusion->gate_scale->data;
+            fusion_local.gate_scale_scalar = gate_scale_scalar;
         }
         fusion_local.glu_op = fusion->glu_op;
     }
