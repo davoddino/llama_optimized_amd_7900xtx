@@ -173,6 +173,11 @@ static bool ggml_cuda_rdna3_qwen36_one_layer_mega_required(const int device) {
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_MEGA_REQUIRED");
 }
 
+static bool ggml_cuda_rdna3_qwen36_one_layer_mega_identity_enabled(const int device) {
+    return ggml_cuda_rdna3_qwen36_one_layer_mega_enabled(device) &&
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_MEGA_IDENTITY");
+}
+
 static int ggml_cuda_rdna3_qwen36_one_layer_mega_layer() {
     return (int) std::max<int64_t>(0, ggml_cuda_env_i64("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_MEGA_LAYER", 0));
 }
@@ -3308,12 +3313,97 @@ static void ggml_cuda_rdna3_qwen36_one_layer_mega_report(
 static __global__ void ggml_cuda_rdna3_qwen36_one_layer_mega_stage0_kernel() {
 }
 
+static __global__ void ggml_cuda_rdna3_qwen36_one_layer_mega_identity_kernel(
+        const float * __restrict__ src,
+        float * __restrict__ dst,
+        const int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[i] = src[i];
+    }
+}
+
 static void ggml_cuda_rdna3_qwen36_one_layer_mega_stage0_launch(
         ggml_backend_cuda_context * cuda_ctx,
         const ggml_cuda_rdna3_qwen36_one_layer_mega_plan & plan) {
     GGML_UNUSED(plan);
     ggml_cuda_rdna3_qwen36_one_layer_mega_stage0_kernel<<<1, 32, 0, cuda_ctx->stream()>>>();
     CUDA_CHECK(cudaGetLastError());
+}
+
+static bool ggml_cuda_rdna3_qwen36_one_layer_mega_identity_launch(
+        ggml_backend_cuda_context * cuda_ctx,
+        const ggml_cgraph * cgraph,
+        const ggml_cuda_rdna3_qwen36_one_layer_mega_plan & plan,
+        std::string * blocker) {
+    if (cgraph == nullptr || plan.start < 0 || plan.end < plan.start || plan.end >= cgraph->n_nodes) {
+        if (blocker) {
+            *blocker = "invalid one-layer span";
+        }
+        return false;
+    }
+
+    const ggml_tensor * start = cgraph->nodes[plan.start];
+    ggml_tensor *       dst   = nullptr;
+    for (int i = plan.end; i >= plan.start; --i) {
+        if (ggml_cuda_rdna3_tensor_name_matches_layer(cgraph->nodes[i], "l_out", plan.layer)) {
+            dst = cgraph->nodes[i];
+            break;
+        }
+    }
+    if (dst == nullptr) {
+        for (int i = plan.end; i >= plan.start; --i) {
+            if (ggml_cuda_rdna3_tensor_name_matches_layer(cgraph->nodes[i], "post_moe", plan.layer)) {
+                dst = cgraph->nodes[i];
+                break;
+            }
+        }
+    }
+    if (start == nullptr || start->src[0] == nullptr || dst == nullptr) {
+        if (blocker) {
+            *blocker = "missing layer input or output";
+        }
+        return false;
+    }
+
+    const ggml_tensor * src = start->src[0];
+    if (src->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        if (blocker) {
+            *blocker = "identity mega only supports f32 layer tensors";
+        }
+        return false;
+    }
+    if (!ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
+        if (blocker) {
+            *blocker = "identity mega requires contiguous tensors";
+        }
+        return false;
+    }
+    if (ggml_nelements(src) != ggml_nelements(dst)) {
+        if (blocker) {
+            *blocker = "identity mega input/output shape mismatch";
+        }
+        return false;
+    }
+
+    const int64_t n = ggml_nelements(dst);
+    const int block = 256;
+    const int grid = (int) ((n + block - 1) / block);
+    ggml_cuda_rdna3_qwen36_one_layer_mega_identity_kernel<<<grid, block, 0, cuda_ctx->stream()>>>(
+            (const float *) src->data, (float *) dst->data, n);
+    CUDA_CHECK(cudaGetLastError());
+
+    static std::atomic<int64_t> identity_report_count{0};
+    const int64_t report_id = identity_report_count.fetch_add(1, std::memory_order_relaxed);
+    if (report_id < 16 || ggml_cuda_rdna3_graph_log_enabled(cuda_ctx->device)) {
+        GGML_LOG_INFO(
+                "rdna3_qwen36_one_layer_mega: executed-identity layer=%d skipped_nodes=%d"
+                " span=[%d,%d] src=%s dst=%s elems=%" PRId64 "\n",
+                plan.layer, plan.end - plan.start + 1, plan.start, plan.end,
+                src->name, dst->name, n);
+    }
+
+    return true;
 }
 
 static ggml_cuda_rdna3_qwen36_mega_plan ggml_cuda_rdna3_qwen36_mega_decode_plan(
@@ -5513,7 +5603,13 @@ static bool ggml_cuda_should_skip_ssm_conv_state_token_concat(const struct ggml_
     return ssm_conv_users == 1;
 }
 
-static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+static void ggml_cuda_graph_evaluate_and_capture(
+        ggml_backend_cuda_context * cuda_ctx,
+        ggml_cgraph * cgraph,
+        const bool use_cuda_graph,
+        const bool cuda_graph_update_required,
+        const void * graph_key,
+        const ggml_cuda_rdna3_qwen36_one_layer_mega_plan * one_layer_plan) {
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu
@@ -5614,6 +5710,24 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+                const bool qwen36_identity_layer_hit =
+                    one_layer_plan != nullptr &&
+                    ggml_cuda_rdna3_qwen36_one_layer_mega_identity_enabled(cuda_ctx->device) &&
+                    i == one_layer_plan->start;
+
+                if (qwen36_identity_layer_hit) {
+                    std::string identity_blocker;
+                    const bool identity_ok = ggml_cuda_rdna3_qwen36_one_layer_mega_identity_launch(
+                            cuda_ctx, cgraph, *one_layer_plan, &identity_blocker);
+                    if (!identity_ok) {
+                        GGML_ABORT("%s: Qwen3.6 RDNA3 one-layer identity mega failed: %s",
+                                __func__, identity_blocker.c_str());
+                    }
+                    prev_i = one_layer_plan->end;
+                    i = one_layer_plan->end;
+                    continue;
+                }
+
                 if (is_concurrent_event_active) {
                     GGML_ASSERT(concurrent_event);
 
@@ -6421,6 +6535,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     const bool qwen36_one_layer_mega = ggml_cuda_rdna3_qwen36_one_layer_mega_enabled(cuda_ctx->device);
     const bool qwen36_one_layer_mega_required =
         ggml_cuda_rdna3_qwen36_one_layer_mega_required(cuda_ctx->device);
+    const bool qwen36_one_layer_mega_identity =
+        ggml_cuda_rdna3_qwen36_one_layer_mega_identity_enabled(cuda_ctx->device);
     ggml_cuda_rdna3_qwen36_one_layer_mega_plan qwen36_one_layer_plan;
     bool qwen36_one_layer_mega_ready = false;
     bool qwen36_mega_contract_this_eval = false;
@@ -6600,10 +6716,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_rdna3_qwen36_mega_decode_contract_current =
         qwen36_mega_required && qwen36_mega_contract_this_eval;
-    if (qwen36_one_layer_mega_ready && (!use_cuda_graph || cuda_graph_update_required)) {
+    if (qwen36_one_layer_mega_ready && !qwen36_one_layer_mega_identity &&
+            (!use_cuda_graph || cuda_graph_update_required)) {
         ggml_cuda_rdna3_qwen36_one_layer_mega_stage0_launch(cuda_ctx, qwen36_one_layer_plan);
     }
-    ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    ggml_cuda_graph_evaluate_and_capture(
+            cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key,
+            qwen36_one_layer_mega_ready ? &qwen36_one_layer_plan : nullptr);
     ggml_cuda_rdna3_qwen36_mega_decode_contract_current = false;
 
     if (ggml_cuda_rdna3_mmvq_q8_cache_log_enabled() &&
