@@ -121,6 +121,7 @@ static std::atomic<int64_t> ggml_cuda_rdna3_op_profile_eval_count{0};
 static thread_local ggml_cuda_rdna3_op_profile_state * ggml_cuda_rdna3_op_profile_current = nullptr;
 class ggml_cuda_rdna3_op_timer;
 static thread_local ggml_cuda_rdna3_op_timer * ggml_cuda_rdna3_op_timer_current = nullptr;
+static thread_local bool ggml_cuda_rdna3_qwen36_mega_decode_contract_current = false;
 
 static bool ggml_cuda_rdna3_op_profile_enabled(const int device) {
     return ggml_cuda_env_enabled("GGML_CUDA_RDNA3_OP_PROFILE") &&
@@ -135,6 +136,22 @@ static bool ggml_cuda_rdna3_graph_log_enabled(const int device) {
 static bool ggml_cuda_rdna3_qwen36_fastpath_enabled(const int device) {
     return ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_FASTPATH") &&
         GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[device].cc);
+}
+
+static bool ggml_cuda_rdna3_qwen36_mega_decode_enabled(const int device) {
+    return ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_DECODE") &&
+        GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[device].cc);
+}
+
+static bool ggml_cuda_rdna3_qwen36_mega_decode_required(const int device) {
+    return ggml_cuda_rdna3_qwen36_mega_decode_enabled(device) &&
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_REQUIRED");
+}
+
+static bool ggml_cuda_rdna3_qwen36_mega_no_host_output(const int device) {
+    return ggml_cuda_rdna3_qwen36_mega_decode_enabled(device) &&
+        (ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_NO_HOST_OUTPUT") ||
+         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_NO_HOST_IO"));
 }
 
 static bool ggml_cuda_rdna3_mmvq_q8_cache_log_enabled() {
@@ -2924,13 +2941,17 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     static const bool fail_mmid_host_sync =
         getenv("GGML_CUDA_RDNA3_FAIL_ON_HOST_SYNC") != nullptr ||
         getenv("GGML_CUDA_MUL_MAT_ID_FAIL_ON_HOST_SYNC") != nullptr;
+    const bool fail_mmid_for_mega_decode =
+        ggml_cuda_rdna3_qwen36_mega_decode_contract_current &&
+        ggml_cuda_rdna3_qwen36_mega_decode_required(ctx.device);
 
-    if (log_mmid_host_sync || fail_mmid_host_sync) {
+    if (log_mmid_host_sync || fail_mmid_host_sync || fail_mmid_for_mega_decode) {
         GGML_LOG_WARN("%s: MUL_MAT_ID host-sync fallback: dst=%s, src0_type=%s, experts=%" PRId64
                 ", expert_used=%" PRId64 ", tokens=%" PRId64 ", out=%" PRId64 "\n",
                 __func__, dst->name, ggml_type_name(src0->type), ne02, ids->ne[0], ne12, ne0);
-        if (fail_mmid_host_sync) {
-            GGML_ABORT("%s: blocked MUL_MAT_ID host-sync fallback; unset GGML_CUDA_RDNA3_FAIL_ON_HOST_SYNC to continue",
+        if (fail_mmid_host_sync || fail_mmid_for_mega_decode) {
+            GGML_ABORT("%s: blocked MUL_MAT_ID host-sync fallback; unset GGML_CUDA_RDNA3_FAIL_ON_HOST_SYNC"
+                    " or GGML_CUDA_RDNA3_QWEN36_MEGA_REQUIRED to continue",
                     __func__);
         }
     }
@@ -3047,6 +3068,160 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         ne0, ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted,
         ne_get_rows, 1, 1, sizeof(int32_t), ne_get_rows*sizeof(int32_t), ne_get_rows*sizeof(int32_t),
         nb1, nb2, nb3, stream);
+}
+
+struct ggml_cuda_rdna3_qwen36_mega_plan {
+    int n_nodes          = 0;
+    int n_fattn          = 0;
+    int n_gdn            = 0;
+    int n_ssm_conv       = 0;
+    int n_topk_moe       = 0;
+    int n_moe_gate_up    = 0;
+    int n_moe_down       = 0;
+    int n_mmid           = 0;
+    int n_mmid_host_sync = 0;
+    bool has_decode_out  = false;
+    bool is_decode_token = false;
+    std::string blocker;
+};
+
+static bool ggml_cuda_rdna3_qwen36_mmid_needs_host_sync(const ggml_tensor * dst, const int cc) {
+    if (dst == nullptr || dst->op != GGML_OP_MUL_MAT_ID || dst->src[0] == nullptr ||
+            dst->src[1] == nullptr || dst->src[2] == nullptr) {
+        return false;
+    }
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * ids  = dst->src[2];
+
+    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) {
+        return true;
+    }
+
+    const int64_t ne2  = dst->ne[2];
+    const int64_t ne12 = src1->ne[2];
+    const int64_t ne02 = src0->ne[2];
+
+    static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
+    if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
+        if (ggml_is_quantized(src0->type)) {
+            const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
+            if (ne2 <= mmvq_mmid_max) {
+                return false;
+            }
+        } else if (GGML_CUDA_CC_IS_AMD(cc)) {
+            return false;
+        }
+    }
+
+    if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+        return false;
+    }
+
+    if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+        return false;
+    }
+
+    return true;
+}
+
+static ggml_cuda_rdna3_qwen36_mega_plan ggml_cuda_rdna3_qwen36_mega_decode_plan(
+        const ggml_cgraph * cgraph, const int device) {
+    ggml_cuda_rdna3_qwen36_mega_plan plan;
+    plan.n_nodes = cgraph ? cgraph->n_nodes : 0;
+
+    if (cgraph == nullptr || cgraph->n_nodes <= 0) {
+        plan.blocker = "empty graph";
+        return plan;
+    }
+
+    const int cc = ggml_cuda_info().devices[device].cc;
+
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node == nullptr) {
+            continue;
+        }
+
+        switch (node->op) {
+            case GGML_OP_FLASH_ATTN_EXT:
+                plan.n_fattn++;
+                break;
+            case GGML_OP_GATED_DELTA_NET:
+                plan.n_gdn++;
+                break;
+            case GGML_OP_SSM_CONV:
+                plan.n_ssm_conv++;
+                break;
+            case GGML_OP_MUL_MAT_ID:
+                plan.n_mmid++;
+                if (ggml_cuda_rdna3_qwen36_mmid_needs_host_sync(node, cc)) {
+                    plan.n_mmid_host_sync++;
+                }
+                if (ggml_cuda_rdna3_tensor_name_starts_with(node, "ffn_moe_down")) {
+                    plan.n_moe_down++;
+                } else if (ggml_cuda_rdna3_tensor_name_starts_with(node, "ffn_moe_gate")) {
+                    plan.n_moe_gate_up++;
+                }
+                break;
+            case GGML_OP_SOFT_MAX:
+                if (ggml_cuda_rdna3_tensor_name_starts_with(node, "ffn_moe_probs")) {
+                    plan.n_topk_moe++;
+                }
+                break;
+            case GGML_OP_MUL_MAT:
+                if (ggml_cuda_rdna3_tensor_name_starts_with(node, "result_output") && node->ne[1] == 1) {
+                    plan.has_decode_out = true;
+                    plan.is_decode_token = true;
+                }
+                break;
+            default:
+                break;
+        }
+
+        if (ggml_cuda_rdna3_tensor_name_starts_with(node, "result_output") && node->ne[1] == 1) {
+            plan.has_decode_out = true;
+            plan.is_decode_token = true;
+        }
+    }
+
+    if (!GGML_CUDA_CC_IS_RDNA3(cc)) {
+        plan.blocker = "device is not RDNA3";
+    } else if (!plan.has_decode_out || !plan.is_decode_token) {
+        plan.blocker = "not a one-token decoder graph ending in result_output";
+    } else if (plan.n_fattn != 10) {
+        plan.blocker = "Qwen3.6-35B-A3B signature mismatch: expected 10 full-attention layers";
+    } else if (plan.n_gdn != 30) {
+        plan.blocker = "Qwen3.6-35B-A3B signature mismatch: expected 30 recurrent/GDN layers";
+    } else if (plan.n_topk_moe != 40) {
+        plan.blocker = "Qwen3.6-35B-A3B signature mismatch: expected 40 MoE router nodes";
+    } else if (plan.n_moe_down != 40) {
+        plan.blocker = "Qwen3.6-35B-A3B signature mismatch: expected 40 MoE down projections";
+    } else if (plan.n_moe_gate_up < 40) {
+        plan.blocker = "Qwen3.6-35B-A3B signature mismatch: expected fused gate/up projections in all layers";
+    } else if (plan.n_mmid_host_sync > 0) {
+        plan.blocker = "MUL_MAT_ID would use host-sync fallback";
+    }
+
+    return plan;
+}
+
+static bool ggml_cuda_rdna3_qwen36_mega_decode_plan_ok(
+        const ggml_cuda_rdna3_qwen36_mega_plan & plan) {
+    return plan.blocker.empty();
+}
+
+static void ggml_cuda_rdna3_qwen36_mega_decode_report(
+        const ggml_cuda_rdna3_qwen36_mega_plan & plan, const uint64_t uid, const bool ok) {
+    GGML_LOG_INFO(
+            "rdna3_qwen36_mega_decode: uid=%" PRIu64 " status=%s nodes=%d fattn=%d gdn=%d ssm_conv=%d"
+            " topk=%d moe_gate_up=%d moe_down=%d mmid=%d mmid_host_sync=%d blocker=%s\n",
+            uid, ok ? "ready-contract" : "blocked",
+            plan.n_nodes, plan.n_fattn, plan.n_gdn, plan.n_ssm_conv,
+            plan.n_topk_moe, plan.n_moe_gate_up, plan.n_moe_down,
+            plan.n_mmid, plan.n_mmid_host_sync,
+            plan.blocker.empty() ? "none" : plan.blocker.c_str());
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
@@ -3423,6 +3598,11 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    if (ggml_cuda_rdna3_qwen36_mega_no_host_output(cuda_ctx->device)) {
+        GGML_ABORT("%s: blocked device-to-host tensor read in Qwen3.6 RDNA3 mega decode mode: tensor=%s size=%zu",
+                __func__, tensor->name, size);
+    }
+
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
@@ -3443,6 +3623,11 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+
+    if (ggml_cuda_rdna3_qwen36_mega_no_host_output(cuda_ctx->device)) {
+        GGML_ABORT("%s: blocked device-to-host tensor read in Qwen3.6 RDNA3 mega decode mode: tensor=%s size=%zu copies=%zu",
+                __func__, tensor->name, size, n_copies);
+    }
 
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
@@ -6008,6 +6193,28 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     int64_t rdna3_profile_tokens = -1;
     const bool rdna3_op_profile_this_eval =
         rdna3_op_profile && ggml_cuda_rdna3_op_profile_should_run(cgraph, &rdna3_profile_tokens);
+    const bool qwen36_mega_decode = ggml_cuda_rdna3_qwen36_mega_decode_enabled(cuda_ctx->device);
+    const bool qwen36_mega_required = ggml_cuda_rdna3_qwen36_mega_decode_required(cuda_ctx->device);
+    bool qwen36_mega_contract_this_eval = false;
+
+    if (qwen36_mega_decode) {
+        const auto mega_plan = ggml_cuda_rdna3_qwen36_mega_decode_plan(cgraph, cuda_ctx->device);
+        const bool mega_ok = ggml_cuda_rdna3_qwen36_mega_decode_plan_ok(mega_plan);
+        qwen36_mega_contract_this_eval = mega_plan.has_decode_out && mega_plan.is_decode_token;
+        static std::atomic<int64_t> mega_decode_report_count{0};
+        const int64_t report_id = mega_decode_report_count.fetch_add(1, std::memory_order_relaxed);
+        if (qwen36_mega_required || rdna3_graph_log || report_id < 4) {
+            ggml_cuda_rdna3_qwen36_mega_decode_report(mega_plan, cgraph->uid, mega_ok);
+        }
+        if (qwen36_mega_required && qwen36_mega_contract_this_eval && !mega_ok) {
+            GGML_ABORT("%s: Qwen3.6 RDNA3 mega decode is required but this graph cannot enter the"
+                    " device-resident contract: %s", __func__, mega_plan.blocker.c_str());
+        }
+        if (qwen36_mega_required && qwen36_mega_contract_this_eval && rdna3_op_profile_this_eval) {
+            GGML_ABORT("%s: Qwen3.6 RDNA3 mega decode cannot run with per-op profiling because profiling"
+                    " injects events and disables graph-level execution", __func__);
+        }
+    }
 
 #ifdef USE_CUDA_GRAPH
     graph_key = ggml_cuda_graph_get_key(cgraph);
@@ -6084,7 +6291,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     const uint64_t mmvq_q8_cache_eval_before = cuda_ctx->mmvq_q8_cache_eval_id;
 
+    ggml_cuda_rdna3_qwen36_mega_decode_contract_current =
+        qwen36_mega_required && qwen36_mega_contract_this_eval;
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    ggml_cuda_rdna3_qwen36_mega_decode_contract_current = false;
 
     if (ggml_cuda_rdna3_mmvq_q8_cache_log_enabled() &&
             cuda_ctx->mmvq_q8_cache_eval_id != mmvq_q8_cache_eval_before) {

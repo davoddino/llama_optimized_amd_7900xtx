@@ -38,6 +38,10 @@ RDNA3_OP_PROFILE_MAX_ROWS="${RDNA3_OP_PROFILE_MAX_ROWS:-}"
 RDNA3_OP_PROFILE_SUMMARY_ROWS="${RDNA3_OP_PROFILE_SUMMARY_ROWS:-}"
 RDNA3_GRAPH_LOG="${RDNA3_GRAPH_LOG:-0}"
 RDNA3_FAIL_ON_HOST_SYNC="${RDNA3_FAIL_ON_HOST_SYNC:-0}"
+RDNA3_QWEN36_MEGA_DECODE="${RDNA3_QWEN36_MEGA_DECODE:-0}"
+RDNA3_QWEN36_MEGA_REQUIRED="${RDNA3_QWEN36_MEGA_REQUIRED:-$RDNA3_QWEN36_MEGA_DECODE}"
+RDNA3_QWEN36_MEGA_NO_HOST_OUTPUT="${RDNA3_QWEN36_MEGA_NO_HOST_OUTPUT:-0}"
+RDNA3_QWEN36_MEGA_NO_HOST_IO="${RDNA3_QWEN36_MEGA_NO_HOST_IO:-0}"
 RDNA3_KERNEL_PRESET="${RDNA3_KERNEL_PRESET:-decode-max}"
 RDNA3_DISABLE_QWEN_TOPK="${RDNA3_DISABLE_QWEN_TOPK:-${RDNA3_DISABLE_QWEN35_TOPK:-0}}"
 RDNA3_DISABLE_QWEN35_TOPK="${RDNA3_DISABLE_QWEN35_TOPK:-$RDNA3_DISABLE_QWEN_TOPK}"
@@ -90,9 +94,19 @@ case "$RDNA3_KERNEL_PRESET" in
         RDNA3_MOE_GATE_UP_RPB="${RDNA3_MOE_GATE_UP_RPB:-16}"
         RDNA3_QWEN36_TOPK_RPB="${RDNA3_QWEN36_TOPK_RPB:-4}"
         ;;
+    mega-contract)
+        RDNA3_TQKV_FATTN_KQ_LANES="${RDNA3_TQKV_FATTN_KQ_LANES:-4}"
+        RDNA3_GDN_AR_COLS="${RDNA3_GDN_AR_COLS:-16}"
+        RDNA3_MOE_MMVQ_RPB="${RDNA3_MOE_MMVQ_RPB:-16}"
+        RDNA3_MOE_DOWN_RPB="${RDNA3_MOE_DOWN_RPB:-16}"
+        RDNA3_MOE_GATE_UP_RPB="${RDNA3_MOE_GATE_UP_RPB:-16}"
+        RDNA3_QWEN36_TOPK_RPB="${RDNA3_QWEN36_TOPK_RPB:-4}"
+        RDNA3_QWEN36_MEGA_DECODE=1
+        RDNA3_QWEN36_MEGA_REQUIRED=1
+        ;;
     *)
         echo "Unsupported RDNA3_KERNEL_PRESET=$RDNA3_KERNEL_PRESET" >&2
-        echo "Allowed values: auto, attn-kq4, attn-kq8, decode-wide, decode-max" >&2
+        echo "Allowed values: auto, attn-kq4, attn-kq8, decode-wide, decode-max, mega-contract" >&2
         exit 1
         ;;
 esac
@@ -218,6 +232,22 @@ if [[ "$RDNA3_FAIL_ON_HOST_SYNC" == "1" ]]; then
     export GGML_CUDA_RDNA3_FAIL_ON_HOST_SYNC=1
 fi
 
+if [[ "$RDNA3_QWEN36_MEGA_DECODE" == "1" ]]; then
+    export GGML_CUDA_RDNA3_QWEN36_MEGA_DECODE=1
+fi
+
+if [[ "$RDNA3_QWEN36_MEGA_REQUIRED" == "1" ]]; then
+    export GGML_CUDA_RDNA3_QWEN36_MEGA_REQUIRED=1
+fi
+
+if [[ "$RDNA3_QWEN36_MEGA_NO_HOST_OUTPUT" == "1" ]]; then
+    export GGML_CUDA_RDNA3_QWEN36_MEGA_NO_HOST_OUTPUT=1
+fi
+
+if [[ "$RDNA3_QWEN36_MEGA_NO_HOST_IO" == "1" ]]; then
+    export GGML_CUDA_RDNA3_QWEN36_MEGA_NO_HOST_IO=1
+fi
+
 if [[ "$RDNA3_DISABLE_QWEN_TOPK" == "1" || "$RDNA3_DISABLE_QWEN35_TOPK" == "1" ]]; then
     export GGML_CUDA_RDNA3_DISABLE_QWEN_TOPK=1
     export GGML_CUDA_RDNA3_DISABLE_QWEN35_TOPK=1
@@ -335,6 +365,10 @@ echo "  rdna3 op profile max rows: ${RDNA3_OP_PROFILE_MAX_ROWS:-64}"
 echo "  rdna3 op profile summary rows: ${RDNA3_OP_PROFILE_SUMMARY_ROWS:-16}"
 echo "  rdna3 graph log: $RDNA3_GRAPH_LOG"
 echo "  rdna3 fail on host sync: $RDNA3_FAIL_ON_HOST_SYNC"
+echo "  rdna3 qwen36 mega decode: $RDNA3_QWEN36_MEGA_DECODE"
+echo "  rdna3 qwen36 mega required: $RDNA3_QWEN36_MEGA_REQUIRED"
+echo "  rdna3 qwen36 mega no host output: $RDNA3_QWEN36_MEGA_NO_HOST_OUTPUT"
+echo "  rdna3 qwen36 mega no host io: $RDNA3_QWEN36_MEGA_NO_HOST_IO"
 echo "  rdna3 kernel preset: $RDNA3_KERNEL_PRESET"
 echo "  rdna3 disable qwen topk: $RDNA3_DISABLE_QWEN_TOPK"
 echo "  rdna3 disable moe gate_up fused: $RDNA3_DISABLE_MOE_GATE_UP_FUSED"

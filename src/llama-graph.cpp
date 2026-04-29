@@ -13,10 +13,16 @@
 
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <sstream>
 #include <unordered_set>
+
+static bool qwen36_mega_no_host_io_enabled() {
+    const char * value = std::getenv("GGML_CUDA_RDNA3_QWEN36_MEGA_NO_HOST_IO");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
 
 // dedup helpers
 
@@ -76,6 +82,10 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
 
+        if (qwen36_mega_no_host_io_enabled() && n_tokens == 1) {
+            GGML_ABORT("%s: blocked host token input in Qwen3.6 RDNA3 mega decode no-host-io mode", __func__);
+        }
+
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
     }
 
@@ -100,6 +110,10 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
 void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
     if (ubatch->pos && pos) {
         const int64_t n_tokens = ubatch->n_tokens;
+
+        if (qwen36_mega_no_host_io_enabled() && n_tokens == 1) {
+            GGML_ABORT("%s: blocked host position input in Qwen3.6 RDNA3 mega decode no-host-io mode", __func__);
+        }
 
         if (ubatch->token && n_pos_per_embd == 4) {
             // in case we're using M-RoPE with text tokens, convert the 1D positions to 4D
