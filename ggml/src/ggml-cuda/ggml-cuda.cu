@@ -6662,8 +6662,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 #endif
 
     static bool enable_graph_optimization = [] {
-        const char * env     = getenv("GGML_CUDA_GRAPH_OPT");
-        return env != nullptr && atoi(env) == 1;
+        const char * env = getenv("GGML_CUDA_GRAPH_OPT");
+        return (env != nullptr && atoi(env) == 1) ||
+            ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_MEGA");
     }();
 
     if (!enable_graph_optimization) {
@@ -6727,14 +6728,20 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     // 5. save the original cgraph and restore it in graph_compute, to enable fusion within streams
     // See discussion: https://github.com/ggml-org/llama.cpp/pull/16991#issuecomment-3522620030
 
+    const bool qwen36_one_layer_streams =
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_MEGA");
     const int min_fan_out = 3;
-    const int max_fan_out = 3;
+    const int max_fan_out = qwen36_one_layer_streams ? 4 : 3;
 
     // store {fork_idx, join_idx}
     std::vector<std::pair<int, int>> concurrent_node_ranges;
 
     for (const auto & [root_node, count] : fan_out) {
         if (count >= min_fan_out && count <= max_fan_out) {
+            if (root_node == nullptr) {
+                continue;
+            }
+
             const int root_node_idx = node_indices[root_node];
 
             // only optimize for attn_norm
@@ -6853,6 +6860,13 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 std::unordered_map<const ggml_tensor *, ggml_cuda_concurrent_event> & concurrent_events = cuda_ctx->stream_context().concurrent_events;
                 GGML_ASSERT(concurrent_events.find(root_node) == concurrent_events.end());
                 concurrent_events.emplace(root_node, std::move(concurrent_event));
+                static std::atomic<int64_t> qwen36_one_layer_stream_report_count{0};
+                const int64_t qwen36_stream_report_id =
+                    qwen36_one_layer_stream_report_count.fetch_add(1, std::memory_order_relaxed);
+                if (qwen36_one_layer_streams && qwen36_stream_report_id < 8) {
+                    GGML_LOG_INFO("%s: RDNA3 Qwen3.6 one-layer streams: fork=%s branches=%d join=%s\n",
+                            __func__, root_node->name, n_branches, join_node->name);
+                }
                 GGML_LOG_DEBUG("Adding stream at node %s %p\n", root_node->name, root_node);
                 concurrent_node_ranges.emplace_back(fork_node_idx, join_node_idx);
 

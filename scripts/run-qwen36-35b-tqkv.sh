@@ -51,6 +51,7 @@ RDNA3_OP_PROFILE_MAX_EVALS="${RDNA3_OP_PROFILE_MAX_EVALS:-}"
 RDNA3_OP_PROFILE_MAX_ROWS="${RDNA3_OP_PROFILE_MAX_ROWS:-}"
 RDNA3_OP_PROFILE_SUMMARY_ROWS="${RDNA3_OP_PROFILE_SUMMARY_ROWS:-}"
 RDNA3_GRAPH_LOG="${RDNA3_GRAPH_LOG:-0}"
+RDNA3_CUDA_GRAPH_OPT="${RDNA3_CUDA_GRAPH_OPT:-}"
 RDNA3_FAIL_ON_HOST_SYNC="${RDNA3_FAIL_ON_HOST_SYNC:-0}"
 RDNA3_QWEN36_MEGA_DECODE="${RDNA3_QWEN36_MEGA_DECODE:-0}"
 RDNA3_QWEN36_MEGA_REQUIRED="${RDNA3_QWEN36_MEGA_REQUIRED:-$RDNA3_QWEN36_MEGA_DECODE}"
@@ -327,6 +328,10 @@ if [[ "$RDNA3_GRAPH_LOG" == "1" ]]; then
     export GGML_CUDA_RDNA3_GRAPH_LOG=1
 fi
 
+if [[ -n "$RDNA3_CUDA_GRAPH_OPT" ]]; then
+    export GGML_CUDA_GRAPH_OPT="$RDNA3_CUDA_GRAPH_OPT"
+fi
+
 if [[ "$RDNA3_FAIL_ON_HOST_SYNC" == "1" ]]; then
     export GGML_CUDA_RDNA3_FAIL_ON_HOST_SYNC=1
 fi
@@ -469,6 +474,15 @@ if [[ "$RDNA3_SSM_CONV_STATE_INPLACE" == "1" ]]; then
     export GGML_CUDA_RDNA3_SSM_CONV_STATE_INPLACE=1
 fi
 
+RDNA3_CUDA_GRAPH_OPT_LABEL="$RDNA3_CUDA_GRAPH_OPT"
+if [[ -z "$RDNA3_CUDA_GRAPH_OPT_LABEL" ]]; then
+    if [[ "$RDNA3_QWEN36_ONE_LAYER_MEGA" == "1" ]]; then
+        RDNA3_CUDA_GRAPH_OPT_LABEL="auto-one-layer"
+    else
+        RDNA3_CUDA_GRAPH_OPT_LABEL="0"
+    fi
+fi
+
 echo "Starting TQKV server"
 echo "  model: $MODEL"
 echo "  profile: $TQKV_PROFILE ($PROFILE_NOTE)"
@@ -490,6 +504,7 @@ echo "  rdna3 op profile max evals: ${RDNA3_OP_PROFILE_MAX_EVALS:-all}"
 echo "  rdna3 op profile max rows: ${RDNA3_OP_PROFILE_MAX_ROWS:-64}"
 echo "  rdna3 op profile summary rows: ${RDNA3_OP_PROFILE_SUMMARY_ROWS:-16}"
 echo "  rdna3 graph log: $RDNA3_GRAPH_LOG"
+echo "  rdna3 cuda graph opt: $RDNA3_CUDA_GRAPH_OPT_LABEL"
 echo "  rdna3 fail on host sync: $RDNA3_FAIL_ON_HOST_SYNC"
 echo "  rdna3 qwen36 mega decode: $RDNA3_QWEN36_MEGA_DECODE"
 echo "  rdna3 qwen36 mega required: $RDNA3_QWEN36_MEGA_REQUIRED"
