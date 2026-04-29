@@ -9,6 +9,7 @@
 
 #include "server-common.h"
 
+#include <cctype>
 #include <random>
 #include <sstream>
 #include <fstream>
@@ -82,6 +83,63 @@ std::string gen_chatcmplid() {
 
 std::string gen_tool_call_id() {
     return random_string();
+}
+
+static bool strip_leading_chat_directive(std::string & text, const std::string & directive) {
+    if (text.compare(0, directive.size(), directive) != 0) {
+        return false;
+    }
+    if (text.size() > directive.size()) {
+        const unsigned char c = text[directive.size()];
+        if (!std::isspace(c)) {
+            return false;
+        }
+    }
+
+    size_t pos = directive.size();
+    if (text.compare(pos, 2, "\r\n") == 0) {
+        pos += 2;
+    } else if (pos < text.size() && text[pos] == '\n') {
+        pos++;
+    } else {
+        while (pos < text.size() && std::isspace((unsigned char) text[pos])) {
+            pos++;
+        }
+    }
+    text.erase(0, pos);
+    return true;
+}
+
+static bool apply_chat_reasoning_directive(std::vector<common_chat_msg> & messages, bool & enable_thinking) {
+    for (auto it = messages.rbegin(); it != messages.rend(); ++it) {
+        if (it->role != "user") {
+            continue;
+        }
+
+        auto apply_to_text = [&](std::string & text) {
+            if (strip_leading_chat_directive(text, "/nothink") ||
+                    strip_leading_chat_directive(text, "/no_think")) {
+                enable_thinking = false;
+                return true;
+            }
+            if (strip_leading_chat_directive(text, "/think")) {
+                enable_thinking = true;
+                return true;
+            }
+            return false;
+        };
+
+        if (!it->content.empty()) {
+            return apply_to_text(it->content);
+        }
+        for (auto & part : it->content_parts) {
+            if (part.type == "text" && apply_to_text(part.text)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    return false;
 }
 
 const char * get_media_marker() {
@@ -1067,6 +1125,9 @@ json oaicompat_chat_params_parse(
         inputs.enable_thinking = false;
     } else if (!enable_thinking_kwarg.empty() && enable_thinking_kwarg[0] == '"') {
         throw std::invalid_argument("invalid type for \"enable_thinking\" (expected boolean, got string)");
+    }
+    if (apply_chat_reasoning_directive(inputs.messages, inputs.enable_thinking)) {
+        SRV_DBG("applied chat reasoning directive, enable_thinking = %d\n", inputs.enable_thinking);
     }
 
     // if the assistant message appears at the end of list, we do not add end-of-turn token
