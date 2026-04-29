@@ -163,6 +163,20 @@ static bool ggml_cuda_rdna3_qwen36_mega_no_host_output(const int device) {
          ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_NO_HOST_IO"));
 }
 
+static bool ggml_cuda_rdna3_qwen36_one_layer_mega_enabled(const int device) {
+    return ggml_cuda_rdna3_qwen36_mega_decode_enabled(device) &&
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_MEGA");
+}
+
+static bool ggml_cuda_rdna3_qwen36_one_layer_mega_required(const int device) {
+    return ggml_cuda_rdna3_qwen36_one_layer_mega_enabled(device) &&
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_MEGA_REQUIRED");
+}
+
+static int ggml_cuda_rdna3_qwen36_one_layer_mega_layer() {
+    return (int) std::max<int64_t>(0, ggml_cuda_env_i64("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_MEGA_LAYER", 0));
+}
+
 static bool ggml_cuda_rdna3_mmvq_q8_cache_log_enabled() {
     return ggml_cuda_env_enabled("GGML_CUDA_RDNA3_MMVQ_Q8_CACHE_LOG");
 }
@@ -184,6 +198,17 @@ static bool ggml_cuda_rdna3_qwen36_moe_decode_shape(const ggml_tensor * src0, co
 
 static bool ggml_cuda_rdna3_tensor_name_starts_with(const ggml_tensor * tensor, const char * prefix) {
     return tensor != nullptr && std::strncmp(tensor->name, prefix, std::strlen(prefix)) == 0;
+}
+
+static bool ggml_cuda_rdna3_tensor_name_equals(const ggml_tensor * tensor, const char * name) {
+    return tensor != nullptr && std::strcmp(tensor->name, name) == 0;
+}
+
+static bool ggml_cuda_rdna3_tensor_name_matches_layer(
+        const ggml_tensor * tensor, const char * prefix, const int layer) {
+    char name[64];
+    std::snprintf(name, sizeof(name), "%s-%d", prefix, layer);
+    return ggml_cuda_rdna3_tensor_name_equals(tensor, name);
 }
 
 static bool ggml_cuda_rdna3_qwen36_output_decode_shape(
@@ -3094,6 +3119,23 @@ struct ggml_cuda_rdna3_qwen36_mega_plan {
     std::string blocker;
 };
 
+struct ggml_cuda_rdna3_qwen36_one_layer_mega_plan {
+    int layer            = 0;
+    int start            = -1;
+    int end              = -1;
+    int n_nodes          = 0;
+    int n_fattn          = 0;
+    int n_gdn            = 0;
+    int n_ssm_conv       = 0;
+    int n_topk_moe       = 0;
+    int n_moe_gate_up    = 0;
+    int n_moe_down       = 0;
+    int n_mmid           = 0;
+    int n_mmid_host_sync = 0;
+    bool is_recurrent    = false;
+    std::string blocker;
+};
+
 static bool ggml_cuda_rdna3_qwen36_mmid_needs_host_sync(const ggml_tensor * dst, const int cc) {
     if (dst == nullptr || dst->op != GGML_OP_MUL_MAT_ID || dst->src[0] == nullptr ||
             dst->src[1] == nullptr || dst->src[2] == nullptr) {
@@ -3133,6 +3175,145 @@ static bool ggml_cuda_rdna3_qwen36_mmid_needs_host_sync(const ggml_tensor * dst,
     }
 
     return true;
+}
+
+static ggml_cuda_rdna3_qwen36_one_layer_mega_plan ggml_cuda_rdna3_qwen36_one_layer_mega_make_plan(
+        const ggml_cgraph * cgraph, const int device, const int layer) {
+    ggml_cuda_rdna3_qwen36_one_layer_mega_plan plan;
+    plan.layer = layer;
+
+    if (cgraph == nullptr || cgraph->n_nodes <= 0) {
+        plan.blocker = "empty graph";
+        return plan;
+    }
+
+    const int cc = ggml_cuda_info().devices[device].cc;
+
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        if (ggml_cuda_rdna3_tensor_name_matches_layer(cgraph->nodes[i], "attn_norm", layer)) {
+            plan.start = i;
+            break;
+        }
+    }
+
+    if (plan.start >= 0) {
+        for (int i = plan.start + 1; i < cgraph->n_nodes; ++i) {
+            if (ggml_cuda_rdna3_tensor_name_matches_layer(cgraph->nodes[i], "attn_norm", layer + 1)) {
+                plan.end = i - 1;
+                break;
+            }
+        }
+
+        if (plan.end < plan.start) {
+            for (int i = plan.start + 1; i < cgraph->n_nodes; ++i) {
+                if (ggml_cuda_rdna3_tensor_name_matches_layer(cgraph->nodes[i], "l_out", layer) ||
+                        ggml_cuda_rdna3_tensor_name_matches_layer(cgraph->nodes[i], "post_moe", layer)) {
+                    plan.end = i;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!GGML_CUDA_CC_IS_RDNA3(cc)) {
+        plan.blocker = "device is not RDNA3";
+        return plan;
+    }
+    if (plan.start < 0) {
+        plan.blocker = "layer start attn_norm not found";
+        return plan;
+    }
+    if (plan.end < plan.start) {
+        plan.blocker = "layer end not found";
+        return plan;
+    }
+
+    for (int i = plan.start; i <= plan.end; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node == nullptr) {
+            continue;
+        }
+
+        plan.n_nodes++;
+        switch (node->op) {
+            case GGML_OP_FLASH_ATTN_EXT:
+                plan.n_fattn++;
+                break;
+            case GGML_OP_GATED_DELTA_NET:
+                plan.n_gdn++;
+                break;
+            case GGML_OP_SSM_CONV:
+                plan.n_ssm_conv++;
+                break;
+            case GGML_OP_MUL_MAT_ID:
+                plan.n_mmid++;
+                if (ggml_cuda_rdna3_qwen36_mmid_needs_host_sync(node, cc)) {
+                    plan.n_mmid_host_sync++;
+                }
+                if (ggml_cuda_rdna3_tensor_name_starts_with(node, "ffn_moe_down")) {
+                    plan.n_moe_down++;
+                } else if (ggml_cuda_rdna3_tensor_name_starts_with(node, "ffn_moe_gate")) {
+                    plan.n_moe_gate_up++;
+                }
+                break;
+            case GGML_OP_SOFT_MAX:
+                if (ggml_cuda_rdna3_tensor_name_starts_with(node, "ffn_moe_probs")) {
+                    plan.n_topk_moe++;
+                }
+                break;
+            default:
+                break;
+        }
+    }
+
+    plan.is_recurrent = plan.n_gdn > 0;
+
+    if (plan.n_nodes <= 0) {
+        plan.blocker = "empty layer span";
+    } else if (plan.n_fattn == 0 && plan.n_gdn == 0) {
+        plan.blocker = "layer span has no attention core";
+    } else if (plan.n_gdn > 0 && plan.n_ssm_conv == 0) {
+        plan.blocker = "recurrent layer span has no SSM conv";
+    } else if (plan.n_topk_moe != 1) {
+        plan.blocker = "layer span does not have exactly one MoE router";
+    } else if (plan.n_moe_gate_up < 1) {
+        plan.blocker = "layer span does not have fused MoE gate/up";
+    } else if (plan.n_moe_down != 1) {
+        plan.blocker = "layer span does not have exactly one MoE down";
+    } else if (plan.n_mmid_host_sync > 0) {
+        plan.blocker = "layer MUL_MAT_ID would use host-sync fallback";
+    }
+
+    return plan;
+}
+
+static bool ggml_cuda_rdna3_qwen36_one_layer_mega_plan_ok(
+        const ggml_cuda_rdna3_qwen36_one_layer_mega_plan & plan) {
+    return plan.blocker.empty();
+}
+
+static void ggml_cuda_rdna3_qwen36_one_layer_mega_report(
+        const ggml_cuda_rdna3_qwen36_one_layer_mega_plan & plan, const uint64_t uid, const bool ok) {
+    GGML_LOG_INFO(
+            "rdna3_qwen36_one_layer_mega: uid=%" PRIu64 " layer=%d status=%s span=[%d,%d]"
+            " nodes=%d kind=%s fattn=%d gdn=%d ssm_conv=%d topk=%d moe_gate_up=%d"
+            " moe_down=%d mmid=%d mmid_host_sync=%d blocker=%s\n",
+            uid, plan.layer, ok ? "stage0-ready" : "blocked", plan.start, plan.end,
+            plan.n_nodes, plan.is_recurrent ? "recurrent" : "attention",
+            plan.n_fattn, plan.n_gdn, plan.n_ssm_conv, plan.n_topk_moe,
+            plan.n_moe_gate_up, plan.n_moe_down, plan.n_mmid, plan.n_mmid_host_sync,
+            plan.blocker.empty() ? "none" : plan.blocker.c_str());
+}
+
+static __global__ void ggml_cuda_rdna3_qwen36_one_layer_mega_stage0_kernel() {
+}
+
+static void ggml_cuda_rdna3_qwen36_one_layer_mega_stage0_launch(
+        ggml_backend_cuda_context * cuda_ctx,
+        const ggml_cuda_rdna3_qwen36_one_layer_mega_plan & plan) {
+    GGML_UNUSED(plan);
+    ggml_cuda_rdna3_qwen36_one_layer_mega_stage0_kernel<<<1, 32, 0, cuda_ctx->stream()>>>();
+    CUDA_CHECK(cudaGetLastError());
 }
 
 static ggml_cuda_rdna3_qwen36_mega_plan ggml_cuda_rdna3_qwen36_mega_decode_plan(
@@ -6237,6 +6418,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     const bool qwen36_mega_decode = ggml_cuda_rdna3_qwen36_mega_decode_enabled(cuda_ctx->device);
     const bool qwen36_mega_required = ggml_cuda_rdna3_qwen36_mega_decode_required(cuda_ctx->device);
     const bool qwen36_mega_require_graph = ggml_cuda_rdna3_qwen36_mega_graph_required(cuda_ctx->device);
+    const bool qwen36_one_layer_mega = ggml_cuda_rdna3_qwen36_one_layer_mega_enabled(cuda_ctx->device);
+    const bool qwen36_one_layer_mega_required =
+        ggml_cuda_rdna3_qwen36_one_layer_mega_required(cuda_ctx->device);
+    ggml_cuda_rdna3_qwen36_one_layer_mega_plan qwen36_one_layer_plan;
+    bool qwen36_one_layer_mega_ready = false;
     bool qwen36_mega_contract_this_eval = false;
 
     if (qwen36_mega_decode) {
@@ -6258,6 +6444,34 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         if (qwen36_mega_required && qwen36_mega_contract_this_eval && rdna3_op_profile_this_eval) {
             GGML_ABORT("%s: Qwen3.6 RDNA3 mega decode cannot run with per-op profiling because profiling"
                     " injects events and disables graph-level execution", __func__);
+        }
+
+        if (qwen36_one_layer_mega && qwen36_mega_contract_this_eval) {
+            const int one_layer = ggml_cuda_rdna3_qwen36_one_layer_mega_layer();
+            qwen36_one_layer_plan =
+                ggml_cuda_rdna3_qwen36_one_layer_mega_make_plan(cgraph, cuda_ctx->device, one_layer);
+            const bool one_layer_ok =
+                ggml_cuda_rdna3_qwen36_one_layer_mega_plan_ok(qwen36_one_layer_plan);
+            qwen36_one_layer_mega_ready = one_layer_ok;
+
+            static std::atomic<int64_t> one_layer_report_count{0};
+            static std::atomic<uint64_t> one_layer_report_uid{0};
+            const int64_t one_layer_report_id =
+                one_layer_report_count.fetch_add(1, std::memory_order_relaxed);
+            const uint64_t one_layer_prev_uid =
+                one_layer_report_uid.exchange(cgraph->uid, std::memory_order_relaxed);
+            const bool one_layer_uid_change = one_layer_prev_uid != cgraph->uid;
+
+            if (rdna3_graph_log || !one_layer_ok || one_layer_report_id < 4 || one_layer_uid_change) {
+                ggml_cuda_rdna3_qwen36_one_layer_mega_report(
+                        qwen36_one_layer_plan, cgraph->uid, one_layer_ok);
+            }
+
+            if (qwen36_one_layer_mega_required && !one_layer_ok) {
+                GGML_ABORT("%s: Qwen3.6 RDNA3 one-layer mega is required but layer %d cannot enter"
+                        " the one-layer contract: %s",
+                        __func__, one_layer, qwen36_one_layer_plan.blocker.c_str());
+            }
         }
     }
 
@@ -6386,6 +6600,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_rdna3_qwen36_mega_decode_contract_current =
         qwen36_mega_required && qwen36_mega_contract_this_eval;
+    if (qwen36_one_layer_mega_ready && (!use_cuda_graph || cuda_graph_update_required)) {
+        ggml_cuda_rdna3_qwen36_one_layer_mega_stage0_launch(cuda_ctx, qwen36_one_layer_plan);
+    }
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
     ggml_cuda_rdna3_qwen36_mega_decode_contract_current = false;
 
