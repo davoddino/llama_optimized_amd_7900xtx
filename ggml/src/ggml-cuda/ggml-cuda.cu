@@ -3734,11 +3734,18 @@ static bool ggml_cuda_rdna3_qwen36_one_layer_mega_launch(
     static std::atomic<int64_t> qkv_report_count{0};
     const int64_t report_id = qkv_report_count.fetch_add(1, std::memory_order_relaxed);
     if (report_id < 16 || ggml_cuda_rdna3_graph_log_enabled(cuda_ctx->device)) {
+        const int skipped_nodes =
+            1 + (plan.attn_norm != plan.rms ? 1 : 0) +
+            (plan.qkv_math != plan.rms && plan.qkv_math != plan.attn_norm ? 1 : 0) +
+            (plan.qkv_out != plan.rms && plan.qkv_out != plan.attn_norm && plan.qkv_out != plan.qkv_math ? 1 : 0) +
+            (plan.qkv != plan.rms && plan.qkv != plan.attn_norm &&
+             plan.qkv != plan.qkv_math && plan.qkv != plan.qkv_out ? 1 : 0);
         GGML_LOG_INFO(
                 "rdna3_qwen36_one_layer_mega: executed-qkv layer=%d skipped_nodes=%d"
-                " span=[%d,%d] rms=%s attn_norm=%s wqkv=%s qkv=%s qkv_scale=%s"
+                " skip_indices=[%d,%d,%d,%d,%d] rms=%s attn_norm=%s wqkv=%s qkv=%s qkv_scale=%s"
                 " tokens=%" PRId64 " n_embd=%d n_out=%d type=%s\n",
-                plan.layer, plan.qkv_skip_end - plan.rms + 1, plan.rms, plan.qkv_skip_end,
+                plan.layer, skipped_nodes,
+                plan.rms, plan.attn_norm, plan.qkv_math, plan.qkv_out, plan.qkv,
                 rms->name, attn_norm->name, wqkv->name, qkv_out->name,
                 qkv_scale == nullptr ? "none" : qkv_scale->name,
                 n_tokens, n_embd, n_out, ggml_type_name(wqkv->type));
@@ -6049,11 +6056,19 @@ static void ggml_cuda_graph_evaluate_and_capture(
                 stream_ctx.concurrent_events.clear();
             }
 
+            bool qwen36_one_layer_qkv_launched = false;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 const bool qwen36_one_layer_qkv_hit =
                     one_layer_plan != nullptr &&
                     i == one_layer_plan->rms;
+                const bool qwen36_one_layer_qkv_skip =
+                    qwen36_one_layer_qkv_launched &&
+                    one_layer_plan != nullptr &&
+                    (i == one_layer_plan->attn_norm ||
+                     i == one_layer_plan->qkv_math ||
+                     i == one_layer_plan->qkv_out ||
+                     i == one_layer_plan->qkv);
 
                 if (qwen36_one_layer_qkv_hit) {
                     std::string qkv_blocker;
@@ -6063,8 +6078,13 @@ static void ggml_cuda_graph_evaluate_and_capture(
                         GGML_ABORT("%s: Qwen3.6 RDNA3 one-layer QKV mega failed: %s",
                                 __func__, qkv_blocker.c_str());
                     }
-                    prev_i = one_layer_plan->qkv_skip_end;
-                    i = one_layer_plan->qkv_skip_end;
+                    qwen36_one_layer_qkv_launched = true;
+                    prev_i = i;
+                    continue;
+                }
+
+                if (qwen36_one_layer_qkv_skip) {
+                    prev_i = i;
                     continue;
                 }
 
