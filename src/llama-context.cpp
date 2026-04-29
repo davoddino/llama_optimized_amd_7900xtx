@@ -13,6 +13,7 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -20,6 +21,16 @@
 //
 // llama_context
 //
+
+static bool qwen36_mega_no_raw_logits_enabled() {
+    const char * value = std::getenv("GGML_CUDA_RDNA3_QWEN36_MEGA_NO_RAW_LOGITS");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+static bool qwen36_mega_sample_token_only_enabled() {
+    const char * value = std::getenv("GGML_CUDA_RDNA3_QWEN36_MEGA_SAMPLE_TOKEN_ONLY");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
 
 llama_context::llama_context(
         const llama_model & model,
@@ -1735,14 +1746,21 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         // extract logits
-        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
-            ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
-            GGML_ASSERT(backend_res != nullptr);
-            GGML_ASSERT(logits.data != nullptr);
+        const bool raw_logits_needed = t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers);
+        if (raw_logits_needed) {
+            if (qwen36_mega_no_raw_logits_enabled()) {
+                LLAMA_LOG_ERROR("%s: blocked raw logits device-to-host readback in Qwen3.6 RDNA3 mega decode mode;"
+                        " enable backend sampling or unset GGML_CUDA_RDNA3_QWEN36_MEGA_NO_RAW_LOGITS\n", __func__);
+                return -1;
+            }
 
-            float * logits_out = logits.data + n_outputs_prev*n_vocab;
+            if (logits.data) {
+                ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
+                GGML_ASSERT(backend_res != nullptr);
+                GGML_ASSERT(logits.data != nullptr);
 
-            if (n_outputs) {
+                float * logits_out = logits.data + n_outputs_prev*n_vocab;
+
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
@@ -1813,13 +1831,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
         if (has_samplers && (!res->t_sampled.empty() || !res->t_sampled_probs.empty() || !res->t_sampled_logits.empty())) {
             const auto seq_to_output_row = build_seq_to_output_row(ubatch, n_outputs_prev);
             const auto stride = n_vocab;
+            const bool sample_token_only = qwen36_mega_sample_token_only_enabled();
 
             // async copy the sampling data from the backend to the host
             copy_tensor_async_ints(res->t_sampled, sampling.sampled, seq_to_output_row, sched.get());
 
-            copy_tensor_async_floats    (res->t_sampled_logits, sampling.logits,     stride, sampling.logits_count,     seq_to_output_row, sched.get());
-            copy_tensor_async_floats    (res->t_sampled_probs,  sampling.probs,      stride, sampling.probs_count,      seq_to_output_row, sched.get());
-            copy_tensor_async_candidates(res->t_candidates,     sampling.candidates, stride, sampling.candidates_count, seq_to_output_row, sched.get());
+            if (!sample_token_only) {
+                copy_tensor_async_floats    (res->t_sampled_logits, sampling.logits,     stride, sampling.logits_count,     seq_to_output_row, sched.get());
+                copy_tensor_async_floats    (res->t_sampled_probs,  sampling.probs,      stride, sampling.probs_count,      seq_to_output_row, sched.get());
+                copy_tensor_async_candidates(res->t_candidates,     sampling.candidates, stride, sampling.candidates_count, seq_to_output_row, sched.get());
+            }
         }
 
         n_outputs_prev += n_outputs;
@@ -1904,6 +1925,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         has_embd   = true;
     }
 
+    if (qwen36_mega_no_raw_logits_enabled()) {
+        has_logits = false;
+    }
 
     size_t backend_float_count = 0;
     size_t backend_token_count = 0;
@@ -1913,9 +1937,10 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     // Allocate backend sampling output buffers if there are backend samplers configured.
     const bool has_sampling = !sampling.samplers.empty();
+    const bool sample_token_only = has_sampling && qwen36_mega_sample_token_only_enabled();
     if (has_sampling) {
-        backend_float_count = 2 * n_vocab * n_outputs_max;      // logits + probs
-        backend_token_count = (1 + n_vocab) * n_outputs_max;    // sampled + candidates
+        backend_float_count = sample_token_only ? 0 : 2 * n_vocab * n_outputs_max;      // logits + probs
+        backend_token_count = (sample_token_only ? 1 : 1 + n_vocab) * n_outputs_max;    // sampled + candidates
     }
 
     if (output_ids.empty()) {
@@ -1971,30 +1996,44 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     offset += embd.size * sizeof(float);
 
     if (has_sampling) {
-        sampling.logits = {(float *) (base + offset), (size_t)(n_vocab*n_outputs_max)};
-        offset += sampling.logits.size * sizeof(float);
+        if (sample_token_only) {
+            sampling.logits     = {nullptr, 0};
+            sampling.probs      = {nullptr, 0};
+            sampling.candidates = {nullptr, 0};
 
-        sampling.probs = {(float *) (base + offset), (size_t)(n_vocab*n_outputs_max)};
-        offset += sampling.probs.size * sizeof(float);
+            sampling.sampled = {(llama_token *) (base + offset), (size_t)n_outputs_max};
+            offset += sampling.sampled.size * sizeof(llama_token);
 
-        sampling.sampled = {(llama_token *) (base + offset), (size_t)n_outputs_max};
-        offset += sampling.sampled.size * sizeof(llama_token);
+            sampling.logits_count.clear();
+            sampling.probs_count.clear();
+            sampling.candidates_count.clear();
 
-        sampling.candidates = {(llama_token *) (base + offset), (size_t)(n_vocab*n_outputs_max)};
-        offset += sampling.candidates.size * sizeof(llama_token);
+            std::fill_n(sampling.sampled.data, sampling.sampled.size, LLAMA_TOKEN_NULL);
+        } else {
+            sampling.logits = {(float *) (base + offset), (size_t)(n_vocab*n_outputs_max)};
+            offset += sampling.logits.size * sizeof(float);
 
-        // The count vectors keep track of the actual number of logits/probs/candidates
-        // copied from the backend for each output row.
+            sampling.probs = {(float *) (base + offset), (size_t)(n_vocab*n_outputs_max)};
+            offset += sampling.probs.size * sizeof(float);
 
-        sampling.logits_count.resize(n_outputs_max);
-        sampling.probs_count.resize(n_outputs_max);
-        sampling.candidates_count.resize(n_outputs_max);
+            sampling.sampled = {(llama_token *) (base + offset), (size_t)n_outputs_max};
+            offset += sampling.sampled.size * sizeof(llama_token);
 
-        std::fill(sampling.logits_count.begin(),     sampling.logits_count.end(),     0);
-        std::fill(sampling.probs_count.begin(),      sampling.probs_count.end(),      0);
-        std::fill(sampling.candidates_count.begin(), sampling.candidates_count.end(), 0);
+            sampling.candidates = {(llama_token *) (base + offset), (size_t)(n_vocab*n_outputs_max)};
+            offset += sampling.candidates.size * sizeof(llama_token);
 
-        std::fill_n(sampling.sampled.data, sampling.sampled.size, LLAMA_TOKEN_NULL);
+            // The count vectors keep track of the actual number of logits/probs/candidates
+            // copied from the backend for each output row.
+            sampling.logits_count.resize(n_outputs_max);
+            sampling.probs_count.resize(n_outputs_max);
+            sampling.candidates_count.resize(n_outputs_max);
+
+            std::fill(sampling.logits_count.begin(),     sampling.logits_count.end(),     0);
+            std::fill(sampling.probs_count.begin(),      sampling.probs_count.end(),      0);
+            std::fill(sampling.candidates_count.begin(), sampling.candidates_count.end(), 0);
+
+            std::fill_n(sampling.sampled.data, sampling.sampled.size, LLAMA_TOKEN_NULL);
+        }
     } else {
         sampling.logits     = {nullptr, 0};
         sampling.probs      = {nullptr, 0};
@@ -2035,30 +2074,33 @@ void llama_context::output_reorder() {
         }
 
         if (!sampling.samplers.empty()) {
-            assert(sampling.logits.size > 0);
-            assert(sampling.probs.size > 0);
-            assert(sampling.candidates.size > 0);
             assert(sampling.sampled.size > 0);
-            assert(sampling.logits_count.size() > 0);
-            assert(sampling.probs_count.size() > 0);
-            assert(sampling.candidates_count.size() > 0);
 
-            for (uint64_t k = 0; k < n_vocab; ++k) {
-                std::swap(sampling.logits.data[i0*n_vocab + k], sampling.logits.data[i1*n_vocab + k]);
+            if (sampling.logits.has_data()) {
+                assert(sampling.logits_count.size() > 0);
+                for (uint64_t k = 0; k < n_vocab; ++k) {
+                    std::swap(sampling.logits.data[i0*n_vocab + k], sampling.logits.data[i1*n_vocab + k]);
+                }
+                std::swap(sampling.logits_count[i0], sampling.logits_count[i1]);
             }
 
-            for (uint64_t k = 0; k < n_vocab; ++k) {
-                std::swap(sampling.probs.data[i0*n_vocab + k], sampling.probs.data[i1*n_vocab + k]);
+            if (sampling.probs.has_data()) {
+                assert(sampling.probs_count.size() > 0);
+                for (uint64_t k = 0; k < n_vocab; ++k) {
+                    std::swap(sampling.probs.data[i0*n_vocab + k], sampling.probs.data[i1*n_vocab + k]);
+                }
+                std::swap(sampling.probs_count[i0], sampling.probs_count[i1]);
             }
 
-            for (uint64_t k = 0; k < n_vocab; ++k) {
-                std::swap(sampling.candidates.data[i0*n_vocab + k], sampling.candidates.data[i1*n_vocab + k]);
+            if (sampling.candidates.has_data()) {
+                assert(sampling.candidates_count.size() > 0);
+                for (uint64_t k = 0; k < n_vocab; ++k) {
+                    std::swap(sampling.candidates.data[i0*n_vocab + k], sampling.candidates.data[i1*n_vocab + k]);
+                }
+                std::swap(sampling.candidates_count[i0], sampling.candidates_count[i1]);
             }
 
-            std::swap(sampling.sampled.data[i0],     sampling.sampled.data[i1]);
-            std::swap(sampling.logits_count[i0],     sampling.logits_count[i1]);
-            std::swap(sampling.probs_count[i0],      sampling.probs_count[i1]);
-            std::swap(sampling.candidates_count[i0], sampling.candidates_count[i1]);
+            std::swap(sampling.sampled.data[i0], sampling.sampled.data[i1]);
         }
     }
 

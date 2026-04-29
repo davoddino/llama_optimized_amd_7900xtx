@@ -148,6 +148,15 @@ static bool ggml_cuda_rdna3_qwen36_mega_decode_required(const int device) {
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_REQUIRED");
 }
 
+static bool ggml_cuda_rdna3_qwen36_mega_graph_required(const int device) {
+    return ggml_cuda_rdna3_qwen36_mega_decode_enabled(device) &&
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_REQUIRE_GRAPH");
+}
+
+static int64_t ggml_cuda_rdna3_qwen36_mega_graph_grace_evals() {
+    return ggml_cuda_env_i64("GGML_CUDA_RDNA3_QWEN36_MEGA_GRAPH_GRACE_EVALS", 8);
+}
+
 static bool ggml_cuda_rdna3_qwen36_mega_no_host_output(const int device) {
     return ggml_cuda_rdna3_qwen36_mega_decode_enabled(device) &&
         (ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_NO_HOST_OUTPUT") ||
@@ -3224,6 +3233,33 @@ static void ggml_cuda_rdna3_qwen36_mega_decode_report(
             plan.blocker.empty() ? "none" : plan.blocker.c_str());
 }
 
+static ggml_cuda_rdna3_qwen36_mega_plan ggml_cuda_rdna3_qwen36_mega_decode_plan_cached(
+        ggml_cgraph * cgraph, const int device) {
+    struct cache_entry {
+        uint64_t uid = 0;
+        int      device = -1;
+        int      n_nodes = -1;
+        ggml_cuda_rdna3_qwen36_mega_plan plan;
+    };
+
+    static thread_local cache_entry cache;
+
+    if (cgraph->uid != 0 && cache.uid == cgraph->uid && cache.device == device && cache.n_nodes == cgraph->n_nodes) {
+        return cache.plan;
+    }
+
+    ggml_cuda_rdna3_qwen36_mega_plan plan = ggml_cuda_rdna3_qwen36_mega_decode_plan(cgraph, device);
+
+    if (cgraph->uid != 0) {
+        cache.uid = cgraph->uid;
+        cache.device = device;
+        cache.n_nodes = cgraph->n_nodes;
+        cache.plan = plan;
+    }
+
+    return plan;
+}
+
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     switch (dst->op) {
         case GGML_OP_ARGMAX:
@@ -3753,10 +3789,15 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     return cgraph->nodes[0];
 }
 
-static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
+static const void * ggml_cuda_rdna3_qwen36_mega_decode_graph_key(const int device) {
+    static uint8_t keys[GGML_CUDA_MAX_DEVICES];
+    GGML_ASSERT(device >= 0 && device < GGML_CUDA_MAX_DEVICES);
+    return &keys[device];
+}
+
+static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const void * graph_key) {
     bool res = false;
 
-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     if (cgraph->uid != 0 &&
@@ -6195,15 +6236,19 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         rdna3_op_profile && ggml_cuda_rdna3_op_profile_should_run(cgraph, &rdna3_profile_tokens);
     const bool qwen36_mega_decode = ggml_cuda_rdna3_qwen36_mega_decode_enabled(cuda_ctx->device);
     const bool qwen36_mega_required = ggml_cuda_rdna3_qwen36_mega_decode_required(cuda_ctx->device);
+    const bool qwen36_mega_require_graph = ggml_cuda_rdna3_qwen36_mega_graph_required(cuda_ctx->device);
     bool qwen36_mega_contract_this_eval = false;
 
     if (qwen36_mega_decode) {
-        const auto mega_plan = ggml_cuda_rdna3_qwen36_mega_decode_plan(cgraph, cuda_ctx->device);
+        const auto mega_plan = ggml_cuda_rdna3_qwen36_mega_decode_plan_cached(cgraph, cuda_ctx->device);
         const bool mega_ok = ggml_cuda_rdna3_qwen36_mega_decode_plan_ok(mega_plan);
         qwen36_mega_contract_this_eval = mega_plan.has_decode_out && mega_plan.is_decode_token;
         static std::atomic<int64_t> mega_decode_report_count{0};
+        static std::atomic<uint64_t> mega_decode_report_uid{0};
         const int64_t report_id = mega_decode_report_count.fetch_add(1, std::memory_order_relaxed);
-        if (qwen36_mega_required || rdna3_graph_log || report_id < 4) {
+        const uint64_t prev_report_uid = mega_decode_report_uid.exchange(cgraph->uid, std::memory_order_relaxed);
+        const bool report_uid_change = prev_report_uid != cgraph->uid;
+        if (rdna3_graph_log || !mega_ok || report_id < 4 || report_uid_change) {
             ggml_cuda_rdna3_qwen36_mega_decode_report(mega_plan, cgraph->uid, mega_ok);
         }
         if (qwen36_mega_required && qwen36_mega_contract_this_eval && !mega_ok) {
@@ -6216,23 +6261,31 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
     }
 
+    const char * qwen36_mega_graph_skip = "not evaluated";
+
 #ifdef USE_CUDA_GRAPH
-    graph_key = ggml_cuda_graph_get_key(cgraph);
+    const bool qwen36_mega_graph_key =
+        qwen36_mega_decode && qwen36_mega_contract_this_eval;
+    graph_key = qwen36_mega_graph_key ?
+        ggml_cuda_rdna3_qwen36_mega_decode_graph_key(cuda_ctx->device) :
+        ggml_cuda_graph_get_key(cgraph);
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     if (rdna3_graph_log) {
-        GGML_LOG_INFO("%s: RDNA3 graph support compiled=1 env_disabled=%d arch_disabled=%d op_profile=%d qwen36_fast=%d nodes=%d uid=%" PRIu64 "\n",
+        GGML_LOG_INFO("%s: RDNA3 graph support compiled=1 env_disabled=%d arch_disabled=%d op_profile=%d qwen36_fast=%d"
+                " qwen36_mega_key=%d nodes=%d uid=%" PRIu64 "\n",
                 __func__, ggml_cuda_env_enabled("GGML_CUDA_DISABLE_GRAPHS") ? 1 : 0,
                 graph->disable_due_to_gpu_arch ? 1 : 0, rdna3_op_profile_this_eval ? 1 : 0,
-                ggml_cuda_rdna3_qwen36_fastpath_enabled(cuda_ctx->device) ? 1 : 0, cgraph->n_nodes, cgraph->uid);
+                ggml_cuda_rdna3_qwen36_fastpath_enabled(cuda_ctx->device) ? 1 : 0,
+                qwen36_mega_graph_key ? 1 : 0, cgraph->n_nodes, cgraph->uid);
     }
 
     if (graph->is_enabled() && !rdna3_op_profile_this_eval) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
-            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph, graph_key);
 
             if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
@@ -6241,38 +6294,78 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
                     use_cuda_graph = true;
                     cuda_graph_update_required = true;
+                    qwen36_mega_graph_skip = "launching";
+                } else {
+                    qwen36_mega_graph_skip = "warmup-properties-changed";
                 }
-                // else: properties changed or first call - execute directly (use_cuda_graph stays false)
             } else {
                 // Post-warmup: normal CUDA graph operation
                 if (properties_changed) {
                     // Properties changed - reset warmup, execute directly until stable again
                     graph->warmup_complete = false;
                     GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
+                    qwen36_mega_graph_skip = "post-warmup-properties-changed";
                 } else {
                     use_cuda_graph = true;
                     cuda_graph_update_required = graph->instance == nullptr;
+                    qwen36_mega_graph_skip = "launching";
                 }
             }
         } else if (rdna3_graph_log) {
+            qwen36_mega_graph_skip = "incompatible graph";
             GGML_LOG_INFO("%s: RDNA3 graph disabled for this evaluation: incompatible graph\n", __func__);
-        }
-    } else if (rdna3_graph_log && rdna3_op_profile_this_eval) {
-        GGML_LOG_INFO("%s: RDNA3 graph disabled for this evaluation: op profiling uses per-op events\n", __func__);
-    } else if (rdna3_graph_log && rdna3_op_profile) {
-        if (rdna3_profile_tokens >= 0) {
-            GGML_LOG_INFO("%s: RDNA3 op profile skipped for this evaluation: tokens=%" PRId64 "\n",
-                    __func__, rdna3_profile_tokens);
         } else {
-            GGML_LOG_INFO("%s: RDNA3 op profile skipped for this evaluation: tokens=unknown\n", __func__);
+            qwen36_mega_graph_skip = "incompatible graph";
+        }
+    } else {
+        if (!graph->is_enabled()) {
+            qwen36_mega_graph_skip = graph->disable_due_to_gpu_arch ? "graph disabled by gpu architecture" : "graph disabled";
+        } else if (rdna3_op_profile_this_eval) {
+            qwen36_mega_graph_skip = "op profiling active";
+        }
+
+        if (rdna3_graph_log && rdna3_op_profile_this_eval) {
+            GGML_LOG_INFO("%s: RDNA3 graph disabled for this evaluation: op profiling uses per-op events\n", __func__);
+        } else if (rdna3_graph_log && rdna3_op_profile) {
+            if (rdna3_profile_tokens >= 0) {
+                GGML_LOG_INFO("%s: RDNA3 op profile skipped for this evaluation: tokens=%" PRId64 "\n",
+                        __func__, rdna3_profile_tokens);
+            } else {
+                GGML_LOG_INFO("%s: RDNA3 op profile skipped for this evaluation: tokens=unknown\n", __func__);
+            }
         }
     }
 #else
+    qwen36_mega_graph_skip = "graph support not compiled";
     if (rdna3_graph_log) {
         GGML_LOG_INFO("%s: RDNA3 graph support compiled=0 nodes=%d uid=%" PRIu64 "\n",
                 __func__, cgraph->n_nodes, cgraph->uid);
     }
 #endif // USE_CUDA_GRAPH
+
+    if (qwen36_mega_require_graph && qwen36_mega_contract_this_eval) {
+        static std::atomic<int64_t> qwen36_mega_direct_graph_evals{0};
+
+        if (use_cuda_graph) {
+            qwen36_mega_direct_graph_evals.store(0, std::memory_order_relaxed);
+        } else {
+            const int64_t direct_evals =
+                qwen36_mega_direct_graph_evals.fetch_add(1, std::memory_order_relaxed) + 1;
+            const int64_t grace_evals = ggml_cuda_rdna3_qwen36_mega_graph_grace_evals();
+
+            if (rdna3_graph_log || direct_evals == grace_evals) {
+                GGML_LOG_INFO("%s: RDNA3 Qwen3.6 mega graph not launched yet: reason=%s direct_evals=%" PRId64
+                        " grace=%" PRId64 " uid=%" PRIu64 "\n",
+                        __func__, qwen36_mega_graph_skip, direct_evals, grace_evals, cgraph->uid);
+            }
+
+            if (direct_evals > grace_evals) {
+                GGML_ABORT("%s: Qwen3.6 RDNA3 mega decode requires CUDA/HIP graph launch but the graph"
+                        " stayed on direct execution after %" PRId64 " contract evals: %s",
+                        __func__, direct_evals, qwen36_mega_graph_skip);
+            }
+        }
+    }
 
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture

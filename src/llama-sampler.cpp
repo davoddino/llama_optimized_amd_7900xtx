@@ -805,15 +805,16 @@ struct llama_sampler * llama_sampler_chain_init(struct llama_sampler_chain_param
 
 llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_context * ctx, int32_t idx) {
     const llama_token   sampled_token  = llama_get_sampled_token_ith     (ctx, idx);
-    const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
-    const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
-    const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
 
     // If a backend sampler has already sampled a token, return it.
     if (sampled_token != LLAMA_TOKEN_NULL) {
         LLAMA_LOG_DEBUG("%s: Backend sampler selected token for idx %d. Skipping CPU samplers\n", __func__, idx);
         return sampled_token;
     }
+
+    const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
+    const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
+    const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
 
     const llama_model * model = llama_get_model(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);

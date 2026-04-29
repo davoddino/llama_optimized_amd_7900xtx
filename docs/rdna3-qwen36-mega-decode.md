@@ -23,7 +23,29 @@ The server helper exposes this as:
 RDNA3_KERNEL_PRESET=mega-contract scripts/run-qwen36-35b-tqkv.sh
 ```
 
+The `mega-contract` preset now forces backend sampling and blocks raw logits readback:
+
+```bash
+BACKEND_SAMPLING=1
+GGML_CUDA_RDNA3_QWEN36_MEGA_REQUIRE_GRAPH=1
+GGML_CUDA_RDNA3_QWEN36_MEGA_SAMPLE_TOKEN_ONLY=1
+GGML_CUDA_RDNA3_QWEN36_MEGA_NO_RAW_LOGITS=1
+GGML_CUDA_RDNA3_QWEN36_MEGA_ASYNC_INPUTS=1
+```
+
+This removes the legacy per-token `result_output` Device->Host copy from the normal benchmark path, requires the matching one-token decode graph to launch through CUDA/HIP graphs after a short warmup window, and only copies the sampled token from backend sampling. Raw logits are not reserved in the host output buffer while `NO_RAW_LOGITS` is active. Auxiliary sampler tensors (`logits`, `probs`, and candidate ids) are kept inside the graph unless the sampler chain fails to produce a backend sampled token, and the host output buffer does not reserve storage for them in token-only mode. Input tensor updates use backend async copies when the target input buffer is device-side. If backend sampling is disabled or made unavailable by an incompatible sampler, the run fails instead of silently measuring the old CPU-sampling path.
+
 When `GGML_CUDA_RDNA3_QWEN36_MEGA_REQUIRED=1`, failing this contract aborts immediately for one-token decode graphs instead of silently running the old decode path. Prompt processing and warmup graphs are reported but are not forced through this contract. The required mode also blocks the `MUL_MAT_ID` host-sync fallback inside matching one-token decode graphs and rejects per-op profiling there, because per-op profiling injects events and disables graph-level execution.
+
+For the matching one-token Qwen3.6 decode graph, the CUDA/HIP graph cache key is stable per device instead of using `cgraph->nodes[0]`. This is deliberate: a fixed decode topology should not lose graph reuse because the generic ggml graph object or first-node pointer changes between tokens.
+
+The graph launch guard allows a small number of direct executions for capture warmup. Tune it with:
+
+```bash
+GGML_CUDA_RDNA3_QWEN36_MEGA_GRAPH_GRACE_EVALS=8
+```
+
+If the graph never stabilizes, the run aborts with the direct-execution reason instead of producing a misleading tokens/sec result.
 
 Optional strict output mode:
 

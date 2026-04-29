@@ -24,6 +24,36 @@ static bool qwen36_mega_no_host_io_enabled() {
     return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
+static bool qwen36_mega_sample_token_only_enabled() {
+    const char * value = std::getenv("GGML_CUDA_RDNA3_QWEN36_MEGA_SAMPLE_TOKEN_ONLY");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+static bool qwen36_mega_async_inputs_enabled() {
+    const char * value = std::getenv("GGML_CUDA_RDNA3_QWEN36_MEGA_ASYNC_INPUTS");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+static thread_local ggml_backend_sched_t llm_graph_input_sched = nullptr;
+
+static ggml_backend_buffer_t llm_graph_tensor_buffer(const ggml_tensor * tensor) {
+    return tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+}
+
+static void llm_graph_set_input_tensor(ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    const ggml_backend_buffer_t buffer = llm_graph_tensor_buffer(tensor);
+
+    if (qwen36_mega_async_inputs_enabled() && llm_graph_input_sched != nullptr && buffer != nullptr && !ggml_backend_buffer_is_host(buffer)) {
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(llm_graph_input_sched, tensor);
+        if (backend != nullptr) {
+            ggml_backend_tensor_set_async(backend, tensor, data, offset, size);
+            return;
+        }
+    }
+
+    ggml_backend_tensor_set(tensor, data, offset, size);
+}
+
 // dedup helpers
 
 static ggml_tensor * build_attn_inp_kq_mask(
@@ -86,7 +116,7 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
             GGML_ABORT("%s: blocked host token input in Qwen3.6 RDNA3 mega decode no-host-io mode", __func__);
         }
 
-        ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
+        llm_graph_set_input_tensor(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
     }
 
     if (ubatch->embd) {
@@ -94,7 +124,7 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
 
         const int64_t n_tokens = ubatch->n_tokens;
 
-        ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(embd));
+        llm_graph_set_input_tensor(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(embd));
     }
 }
 
@@ -128,7 +158,7 @@ void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
             }
             ggml_backend_tensor_set(pos, pos_data.data(), 0, pos_data.size()*ggml_element_size(pos));
         } else {
-            ggml_backend_tensor_set(pos, ubatch->pos, 0, n_tokens*n_pos_per_embd*ggml_element_size(pos));
+            llm_graph_set_input_tensor(pos, ubatch->pos, 0, n_tokens*n_pos_per_embd*ggml_element_size(pos));
         }
     }
 }
@@ -353,7 +383,7 @@ void llm_graph_input_cross_embd::set_input(const llama_ubatch * ubatch) {
     if (cross_embd && !cross->v_embd.empty()) {
         assert(cross_embd->type == GGML_TYPE_F32);
 
-        ggml_backend_tensor_set(cross_embd, cross->v_embd.data(), 0, ggml_nbytes(cross_embd));
+        llm_graph_set_input_tensor(cross_embd, cross->v_embd.data(), 0, ggml_nbytes(cross_embd));
     }
 }
 
@@ -854,9 +884,14 @@ void llm_graph_result::reset() {
 }
 
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
+    ggml_backend_sched_t sched_prev = llm_graph_input_sched;
+    llm_graph_input_sched = params.sched;
+
     for (auto & input : inputs) {
         input->set_input(ubatch);
     }
+
+    llm_graph_input_sched = sched_prev;
 }
 
 void llm_graph_result::set_outputs() {
@@ -2922,6 +2957,8 @@ void llm_graph_context::build_sampling() const {
         return;
     }
 
+    const bool sample_token_only = qwen36_mega_sample_token_only_enabled();
+
     std::array<ggml_tensor *, 2> outs;
     outs[0] = res->t_logits;
 
@@ -2967,25 +3004,27 @@ void llm_graph_context::build_sampling() const {
         assert(sampler->iface->backend_apply);
         sampler->iface->backend_apply(sampler, ctx0, gf, &data);
 
+        const bool suppress_aux_outputs = sample_token_only && data.sampled != nullptr;
+
         if (data.sampled != nullptr) {
             res->t_sampled[seq_id] = data.sampled;
             outs[1] = data.sampled;
             ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
         }
 
-        if (data.probs != nullptr) {
+        if (!suppress_aux_outputs && data.probs != nullptr) {
             res->t_sampled_probs[seq_id] = data.probs;
             outs[1] = data.probs;
             ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
         }
 
-        if (data.logits != nullptr) {
+        if (!suppress_aux_outputs && data.logits != nullptr) {
             res->t_sampled_logits[seq_id] = data.logits;
             outs[1] = data.logits;
             ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
         }
 
-        if (data.candidates != nullptr) {
+        if (!suppress_aux_outputs && data.candidates != nullptr) {
             res->t_candidates[seq_id] = data.candidates;
             outs[1] = data.candidates;
             ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
