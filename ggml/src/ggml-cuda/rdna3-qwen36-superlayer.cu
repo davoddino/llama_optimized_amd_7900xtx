@@ -2736,6 +2736,9 @@ __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_projection_bundle(
     const float * alpha_scale = desc->has_alpha_scale != 0 ?
         (const float *) (weightpack + desc->alpha_scale_offset) : nullptr;
     (void) sums;
+    const bool write_z = (write_outputs & 0x4u) != 0;
+    const bool write_beta = (write_outputs & 0x8u) != 0;
+    const bool write_alpha = (write_outputs & 0x10u) != 0;
 
     const int lane = threadIdx.x & (WARP_SIZE - 1);
     const int warp = threadIdx.x / WARP_SIZE;
@@ -2746,17 +2749,26 @@ __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_projection_bundle(
         ggml_type wtype = GGML_TYPE_COUNT;
         uint32_t local_row = row;
         if (local_row < desc->z_out) {
+            if (!write_z) {
+                continue;
+            }
             w = (const char *) (weightpack + desc->wz_offset);
             w_nb1 = desc->wz_nb1;
             wtype = (ggml_type) desc->wz_type;
         } else {
             local_row -= desc->z_out;
             if (local_row < desc->beta_out) {
+                if (!write_beta) {
+                    continue;
+                }
                 w = (const char *) (weightpack + desc->wbeta_offset);
                 w_nb1 = desc->wbeta_nb1;
                 wtype = (ggml_type) desc->wbeta_type;
             } else {
                 local_row -= desc->beta_out;
+                if (!write_alpha) {
+                    continue;
+                }
                 w = (const char *) (weightpack + desc->walpha_offset);
                 w_nb1 = desc->walpha_nb1;
                 wtype = (ggml_type) desc->walpha_type;
@@ -2778,10 +2790,10 @@ __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_projection_bundle(
                     z_scale[desc->z_scale_n == 1 ? 0 : local_row];
                 const float v = sum*scale;
                 z[local_row] = v;
-                if (write_outputs != 0 && desc->z_math_dst != nullptr) {
+                if (desc->z_math_dst != nullptr) {
                     desc->z_math_dst[local_row] = sum;
                 }
-                if (write_outputs != 0 && desc->z_dst != nullptr) {
+                if (desc->z_dst != nullptr) {
                     desc->z_dst[local_row] = v;
                 }
             } else {
@@ -2792,13 +2804,13 @@ __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_projection_bundle(
                     const float raw = sum*scale;
                     const float v = 1.0f / (1.0f + expf(-raw));
                     beta[local_row] = v;
-                    if (write_outputs != 0 && desc->beta_math_dst != nullptr) {
+                    if (desc->beta_math_dst != nullptr) {
                         desc->beta_math_dst[local_row] = sum;
                     }
-                    if (write_outputs != 0 && desc->beta_raw_dst != nullptr) {
+                    if (desc->beta_raw_dst != nullptr) {
                         desc->beta_raw_dst[local_row] = raw;
                     }
-                    if (write_outputs != 0 && desc->beta_dst != nullptr) {
+                    if (desc->beta_dst != nullptr) {
                         desc->beta_dst[local_row] = v;
                     }
                 } else {
@@ -2810,19 +2822,19 @@ __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_projection_bundle(
                     const float softplus = biased > 20.0f ? biased : log1pf(expf(biased));
                     const float v = softplus * alpha_a[local_row];
                     alpha[local_row] = v;
-                    if (write_outputs != 0 && desc->alpha_math_dst != nullptr) {
+                    if (desc->alpha_math_dst != nullptr) {
                         desc->alpha_math_dst[local_row] = sum;
                     }
-                    if (write_outputs != 0 && desc->alpha_raw_dst != nullptr) {
+                    if (desc->alpha_raw_dst != nullptr) {
                         desc->alpha_raw_dst[local_row] = raw;
                     }
-                    if (write_outputs != 0 && desc->alpha_biased_dst != nullptr) {
+                    if (desc->alpha_biased_dst != nullptr) {
                         desc->alpha_biased_dst[local_row] = biased;
                     }
-                    if (write_outputs != 0 && desc->alpha_softplus_dst != nullptr) {
+                    if (desc->alpha_softplus_dst != nullptr) {
                         desc->alpha_softplus_dst[local_row] = softplus;
                     }
-                    if (write_outputs != 0 && desc->alpha_dst != nullptr) {
+                    if (desc->alpha_dst != nullptr) {
                         desc->alpha_dst[local_row] = v;
                     }
                 }
@@ -2931,8 +2943,9 @@ __global__ void qwen36_rdna3_superlayer_contract_kernel(
         l0_proj != nullptr ? l0_proj->beta_scratch_offset + (uint64_t) l0_proj->beta_out*sizeof(float) : 0;
     const uint64_t l0_proj_alpha_end =
         l0_proj != nullptr ? l0_proj->alpha_scratch_offset + (uint64_t) l0_proj->alpha_out*sizeof(float) : 0;
+    const uint32_t l0_proj_stage_mask = l0_stage_mask & 0x1cu;
     const bool l0_proj_ready =
-        (l0_stage_mask & 0x4u) != 0 &&
+        l0_proj_stage_mask != 0 &&
         l0_proj != nullptr && l0_proj->ready != 0 && scratch != nullptr && weightpack != nullptr &&
         l0_proj->z_out != 0 && l0_proj->beta_out != 0 && l0_proj->alpha_out != 0 &&
         l0_proj_z_end <= scratch_bytes && l0_proj_beta_end <= scratch_bytes &&
@@ -2949,7 +2962,7 @@ __global__ void qwen36_rdna3_superlayer_contract_kernel(
     }
     if (l0_norm_ready && l0_proj_ready) {
         qwen36_rdna3_superlayer_l0_projection_bundle(
-                l0_proj, weightpack, scratch, scratch_bytes, l0_rms_sums, l0_stage_mask & 0x4u);
+                l0_proj, weightpack, scratch, scratch_bytes, l0_rms_sums, l0_proj_stage_mask);
     }
 
     if (lane == 0) {
@@ -2986,7 +2999,30 @@ static bool qwen36_superlayer_replace_l0_qkv_requested() {
 
 static bool qwen36_superlayer_replace_l0_proj_requested() {
     return qwen36_superlayer_replace_l0_all_requested() ||
+        qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ", 0) != 0 ||
+        qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_Z", 0) != 0 ||
+        qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_BETA", 0) != 0 ||
+        qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_ALPHA", 0) != 0;
+}
+
+static bool qwen36_superlayer_replace_l0_proj_all_requested() {
+    return qwen36_superlayer_replace_l0_all_requested() ||
         qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ", 0) != 0;
+}
+
+static bool qwen36_superlayer_replace_l0_proj_z_requested() {
+    return qwen36_superlayer_replace_l0_proj_all_requested() ||
+        qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_Z", 0) != 0;
+}
+
+static bool qwen36_superlayer_replace_l0_proj_beta_requested() {
+    return qwen36_superlayer_replace_l0_proj_all_requested() ||
+        qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_BETA", 0) != 0;
+}
+
+static bool qwen36_superlayer_replace_l0_proj_alpha_requested() {
+    return qwen36_superlayer_replace_l0_proj_all_requested() ||
+        qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_ALPHA", 0) != 0;
 }
 
 static bool qwen36_superlayer_replace_l0_any_requested() {
@@ -2997,7 +3033,7 @@ static bool qwen36_superlayer_replace_l0_any_requested() {
 
 static uint32_t qwen36_superlayer_l0_stage_mask() {
     if (qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_RUN_L0")) {
-        return 0x7u;
+        return 0x1fu;
     }
 
     uint32_t mask = 0;
@@ -3007,8 +3043,14 @@ static uint32_t qwen36_superlayer_l0_stage_mask() {
     if (qwen36_superlayer_replace_l0_qkv_requested()) {
         mask |= 0x2u;
     }
-    if (qwen36_superlayer_replace_l0_proj_requested()) {
+    if (qwen36_superlayer_replace_l0_proj_z_requested()) {
         mask |= 0x4u;
+    }
+    if (qwen36_superlayer_replace_l0_proj_beta_requested()) {
+        mask |= 0x8u;
+    }
+    if (qwen36_superlayer_replace_l0_proj_alpha_requested()) {
+        mask |= 0x10u;
     }
     return mask;
 }
@@ -3093,6 +3135,24 @@ bool ggml_cuda_rdna3_qwen36_superlayer_replace_l0_proj_enabled(const int device)
     return ggml_cuda_rdna3_qwen36_superlayer_enabled(device) &&
         qwen36_superlayer_contract_dispatch_enabled() &&
         qwen36_superlayer_replace_l0_proj_requested();
+}
+
+bool ggml_cuda_rdna3_qwen36_superlayer_replace_l0_proj_z_enabled(const int device) {
+    return ggml_cuda_rdna3_qwen36_superlayer_enabled(device) &&
+        qwen36_superlayer_contract_dispatch_enabled() &&
+        qwen36_superlayer_replace_l0_proj_z_requested();
+}
+
+bool ggml_cuda_rdna3_qwen36_superlayer_replace_l0_proj_beta_enabled(const int device) {
+    return ggml_cuda_rdna3_qwen36_superlayer_enabled(device) &&
+        qwen36_superlayer_contract_dispatch_enabled() &&
+        qwen36_superlayer_replace_l0_proj_beta_requested();
+}
+
+bool ggml_cuda_rdna3_qwen36_superlayer_replace_l0_proj_alpha_enabled(const int device) {
+    return ggml_cuda_rdna3_qwen36_superlayer_enabled(device) &&
+        qwen36_superlayer_contract_dispatch_enabled() &&
+        qwen36_superlayer_replace_l0_proj_alpha_requested();
 }
 
 bool ggml_cuda_rdna3_qwen36_superlayer_prepare(
@@ -3297,14 +3357,18 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
                 "rdna3_qwen36_superlayer: contract-kernel-launched fingerprint=%s blocks=%d threads=%d"
                 " weightpack_tensors=%zu runtime_bindings=%zu weightpack_bytes=%zu scratch_bytes=%zu"
                 " l0_stage_mask=0x%x l0_rms_norm=%s l0_qkv=%s l0_projection=%s replace_l0=%d"
+                " l0_proj_z=%s l0_proj_beta=%s l0_proj_alpha=%s"
                 " note=single physical cooperative 40-layer dispatch scaffold\n",
                 hex_u64(plan.fingerprint).c_str(), blocks, threads,
                 device_pack.tensors, device_pack.io_count, device_pack.bytes, device_pack.runtime.scratch_bytes,
                 l0_stage_mask_arg,
                 (l0_stage_mask_arg & 0x1u) != 0 ? "on" : "off",
                 (l0_stage_mask_arg & 0x2u) != 0 ? "on" : "off",
+                (l0_stage_mask_arg & 0x1cu) != 0 ? "on" : "off",
+                ggml_cuda_rdna3_qwen36_superlayer_replace_l0_enabled(cuda_ctx->device) ? 1 : 0,
                 (l0_stage_mask_arg & 0x4u) != 0 ? "on" : "off",
-                ggml_cuda_rdna3_qwen36_superlayer_replace_l0_enabled(cuda_ctx->device) ? 1 : 0);
+                (l0_stage_mask_arg & 0x8u) != 0 ? "on" : "off",
+                (l0_stage_mask_arg & 0x10u) != 0 ? "on" : "off");
         fflush(stderr);
     }
 

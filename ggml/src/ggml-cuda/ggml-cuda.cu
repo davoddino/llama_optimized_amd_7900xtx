@@ -126,7 +126,10 @@ static bool ggml_cuda_rdna3_qwen36_superlayer_env_present() {
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0") ||
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_RMS") ||
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_QKV") ||
-        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ");
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_Z") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_BETA") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_ALPHA");
 }
 
 static bool ggml_cuda_rdna3_qwen36_superlayer_trace_enabled() {
@@ -699,7 +702,8 @@ static ggml_cuda_device_info ggml_cuda_init() {
     if (ggml_cuda_rdna3_qwen36_superlayer_env_present()) {
         GGML_LOG_INFO(
                 "rdna3_qwen36_superlayer: init-env graph_log=%d trace=%d superlayer=%d required=%d"
-                " dispatch=%d contract=%d run_l0=%d replace_l0=%d rms=%d qkv=%d proj=%d\n",
+                " dispatch=%d contract=%d run_l0=%d replace_l0=%d rms=%d qkv=%d proj=%d"
+                " proj_z=%d proj_beta=%d proj_alpha=%d\n",
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_GRAPH_LOG") ? 1 : 0,
                 ggml_cuda_rdna3_qwen36_superlayer_trace_enabled() ? 1 : 0,
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER") ? 1 : 0,
@@ -710,7 +714,10 @@ static ggml_cuda_device_info ggml_cuda_init() {
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0") ? 1 : 0,
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_RMS") ? 1 : 0,
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_QKV") ? 1 : 0,
-                ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ") ? 1 : 0);
+                ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ") ? 1 : 0,
+                ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_Z") ? 1 : 0,
+                ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_BETA") ? 1 : 0,
+                ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_ALPHA") ? 1 : 0);
     }
 
     std::vector<std::pair<int, std::string>> turing_devices_without_mma;
@@ -6742,9 +6749,15 @@ static void ggml_cuda_graph_evaluate_and_capture(
             const bool qwen36_superlayer_l0_replace_qkv =
                 superlayer_l0_plan != nullptr &&
                 ggml_cuda_rdna3_qwen36_superlayer_replace_l0_qkv_enabled(cuda_ctx->device);
-            const bool qwen36_superlayer_l0_replace_proj =
+            const bool qwen36_superlayer_l0_replace_proj_z =
                 superlayer_l0_plan != nullptr &&
-                ggml_cuda_rdna3_qwen36_superlayer_replace_l0_proj_enabled(cuda_ctx->device);
+                ggml_cuda_rdna3_qwen36_superlayer_replace_l0_proj_z_enabled(cuda_ctx->device);
+            const bool qwen36_superlayer_l0_replace_proj_beta =
+                superlayer_l0_plan != nullptr &&
+                ggml_cuda_rdna3_qwen36_superlayer_replace_l0_proj_beta_enabled(cuda_ctx->device);
+            const bool qwen36_superlayer_l0_replace_proj_alpha =
+                superlayer_l0_plan != nullptr &&
+                ggml_cuda_rdna3_qwen36_superlayer_replace_l0_proj_alpha_enabled(cuda_ctx->device);
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (superlayer_l0_plan != nullptr &&
@@ -6771,16 +6784,18 @@ static void ggml_cuda_graph_evaluate_and_capture(
                       (i == superlayer_l0_plan->rms ||
                        i == superlayer_l0_plan->attn_norm)) ||
                      (qwen36_superlayer_l0_replace_qkv &&
-                      (i == superlayer_l0_plan->qkv_math ||
+                     (i == superlayer_l0_plan->qkv_math ||
                        i == superlayer_l0_plan->qkv_out ||
                        i == superlayer_l0_plan->qkv)) ||
-                     (qwen36_superlayer_l0_replace_proj &&
+                     (qwen36_superlayer_l0_replace_proj_z &&
                       (i == superlayer_l0_plan->z ||
-                       i == superlayer_l0_plan->z_math ||
-                       i == superlayer_l0_plan->beta ||
+                       i == superlayer_l0_plan->z_math)) ||
+                     (qwen36_superlayer_l0_replace_proj_beta &&
+                      (i == superlayer_l0_plan->beta ||
                        i == superlayer_l0_plan->beta_math ||
-                       i == superlayer_l0_plan->beta_sigmoid ||
-                       i == superlayer_l0_plan->alpha ||
+                       i == superlayer_l0_plan->beta_sigmoid)) ||
+                     (qwen36_superlayer_l0_replace_proj_alpha &&
+                      (i == superlayer_l0_plan->alpha ||
                        i == superlayer_l0_plan->alpha_math ||
                        i == superlayer_l0_plan->alpha_biased ||
                        i == superlayer_l0_plan->alpha_softplus ||

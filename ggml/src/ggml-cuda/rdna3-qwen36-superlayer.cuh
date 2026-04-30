@@ -13,6 +13,9 @@ bool ggml_cuda_rdna3_qwen36_superlayer_replace_l0_enabled(int device);
 bool ggml_cuda_rdna3_qwen36_superlayer_replace_l0_rms_enabled(int device);
 bool ggml_cuda_rdna3_qwen36_superlayer_replace_l0_qkv_enabled(int device);
 bool ggml_cuda_rdna3_qwen36_superlayer_replace_l0_proj_enabled(int device);
+bool ggml_cuda_rdna3_qwen36_superlayer_replace_l0_proj_z_enabled(int device);
+bool ggml_cuda_rdna3_qwen36_superlayer_replace_l0_proj_beta_enabled(int device);
+bool ggml_cuda_rdna3_qwen36_superlayer_replace_l0_proj_alpha_enabled(int device);
 
 bool ggml_cuda_rdna3_qwen36_superlayer_prepare(
         ggml_backend_cuda_context * cuda_ctx,
