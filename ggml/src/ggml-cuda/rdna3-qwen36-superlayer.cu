@@ -2662,7 +2662,8 @@ __global__ void qwen36_rdna3_superlayer_contract_kernel(
         const qwen36_superlayer_l0_proj_desc * l0_proj,
         uint8_t * scratch,
         const uint64_t scratch_bytes,
-        const uint64_t weightpack_bytes) {
+        const uint64_t weightpack_bytes,
+        const uint32_t run_l0_math) {
     namespace cg = cooperative_groups;
     cg::grid_group grid = cg::this_grid();
     __shared__ float l0_rms_sums[256];
@@ -2733,14 +2734,16 @@ __global__ void qwen36_rdna3_superlayer_contract_kernel(
     const uint64_t l0_norm_requested =
         l0_norm != nullptr && l0_norm->ready != 0 ? (uint64_t) l0_norm->n_embd*sizeof(float) : 0;
     const bool l0_norm_ready =
-        l0_norm_requested != 0 && scratch != nullptr && scratch_bytes >= l0_norm_requested &&
+        run_l0_math != 0 && l0_norm_requested != 0 &&
+        scratch != nullptr && scratch_bytes >= l0_norm_requested &&
         l0_grid_scratch != nullptr && (l0_norm->has_norm_w == 0 || weightpack != nullptr);
     const uint64_t l0_qkv_requested =
         l0_qkv != nullptr && l0_qkv->ready != 0 ? (uint64_t) l0_qkv->n_out*sizeof(float) : 0;
     const uint64_t l0_qkv_begin = l0_qkv != nullptr ? l0_qkv->qkv_scratch_offset : 0;
     const uint64_t l0_qkv_end = l0_qkv_begin + l0_qkv_requested;
     const bool l0_qkv_ready =
-        l0_qkv_requested != 0 && scratch != nullptr && weightpack != nullptr &&
+        run_l0_math != 0 && l0_qkv_requested != 0 &&
+        scratch != nullptr && weightpack != nullptr &&
         l0_qkv_end <= scratch_bytes;
     const uint64_t l0_proj_z_end =
         l0_proj != nullptr ? l0_proj->z_scratch_offset + (uint64_t) l0_proj->z_out*sizeof(float) : 0;
@@ -2749,6 +2752,7 @@ __global__ void qwen36_rdna3_superlayer_contract_kernel(
     const uint64_t l0_proj_alpha_end =
         l0_proj != nullptr ? l0_proj->alpha_scratch_offset + (uint64_t) l0_proj->alpha_out*sizeof(float) : 0;
     const bool l0_proj_ready =
+        run_l0_math != 0 &&
         l0_proj != nullptr && l0_proj->ready != 0 && scratch != nullptr && weightpack != nullptr &&
         l0_proj->z_out != 0 && l0_proj->beta_out != 0 && l0_proj->alpha_out != 0 &&
         l0_proj_z_end <= scratch_bytes && l0_proj_beta_end <= scratch_bytes &&
@@ -2781,6 +2785,11 @@ __global__ void qwen36_rdna3_superlayer_contract_kernel(
 static bool qwen36_superlayer_contract_dispatch_enabled() {
     return qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DISPATCH") ||
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_SMOKE");
+}
+
+static bool qwen36_superlayer_run_l0_math_enabled() {
+    return qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_RUN_L0") ||
+        qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0", 0) != 0;
 }
 
 } // namespace
@@ -2968,6 +2977,7 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
     uint8_t * scratch_arg = (uint8_t *) device_pack.scratch;
     const uint64_t scratch_bytes_arg = (uint64_t) device_pack.runtime.scratch_bytes;
     const uint64_t weightpack_bytes_arg = (uint64_t) device_pack.bytes;
+    const uint32_t run_l0_math_arg = qwen36_superlayer_run_l0_math_enabled() ? 1u : 0u;
     void * kernel_args[] = {
         (void *) &state_arg,
         (void *) &weightpack_arg,
@@ -2980,6 +2990,7 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
         (void *) &scratch_arg,
         (void *) &scratch_bytes_arg,
         (void *) &weightpack_bytes_arg,
+        (void *) &run_l0_math_arg,
     };
     CUDA_CHECK(cudaLaunchCooperativeKernel(
             (void *) qwen36_rdna3_superlayer_contract_kernel,
@@ -2993,10 +3004,15 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
         GGML_LOG_INFO(
                 "rdna3_qwen36_superlayer: contract-kernel-launched fingerprint=%s blocks=%d threads=%d"
                 " weightpack_tensors=%zu runtime_bindings=%zu weightpack_bytes=%zu scratch_bytes=%zu"
-                " l0_rms_norm=on l0_qkv=on l0_projection=on l0_real_outputs=on replace_l0=%d"
+                " l0_math=%d l0_rms_norm=%s l0_qkv=%s l0_projection=%s l0_real_outputs=%s replace_l0=%d"
                 " note=single physical cooperative 40-layer dispatch scaffold\n",
                 hex_u64(plan.fingerprint).c_str(), blocks, threads,
                 device_pack.tensors, device_pack.io_count, device_pack.bytes, device_pack.runtime.scratch_bytes,
+                run_l0_math_arg,
+                run_l0_math_arg ? "on" : "off",
+                run_l0_math_arg ? "on" : "off",
+                run_l0_math_arg ? "on" : "off",
+                run_l0_math_arg ? "on" : "off",
                 ggml_cuda_rdna3_qwen36_superlayer_replace_l0_enabled(cuda_ctx->device) ? 1 : 0);
     }
 
