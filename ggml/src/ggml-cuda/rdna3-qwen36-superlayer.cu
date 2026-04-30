@@ -1889,7 +1889,7 @@ static bool qwen36_superlayer_materialize_device_pack(
         *view = local_view;
     }
 
-    if (should_report) {
+    if (should_report && qwen36_superlayer_trace_enabled()) {
         fprintf(stderr,
                 "rdna3_qwen36_superlayer: device-pack-ready fingerprint=%s source=%s runtime=%s"
                 " ptr=%p layer_descs=%p io_descs=%p l0_norm=%p l0_qkv=%p l0_proj=%p scratch=%p tensors=%zu io=%zu bytes=%zu"
@@ -3162,7 +3162,7 @@ bool ggml_cuda_rdna3_qwen36_superlayer_prepare(
         should_report = reported_fingerprints.insert(plan.fingerprint).second;
     }
 
-    if (should_report) {
+    if (should_report && qwen36_superlayer_trace_enabled()) {
         fprintf(stderr,
                 "rdna3_qwen36_superlayer: artifact-ready fingerprint=%s dir=%s nodes=%d"
                 " layers=40 fattn=%d gdn=%d topk=%d moe_gate_up=%d moe_down=%d mmid=%d"
@@ -3292,7 +3292,7 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
     static std::atomic<int64_t> contract_reports{0};
     const int64_t report_id = contract_reports.fetch_add(1, std::memory_order_relaxed);
     (void) report_id;
-    if (ggml_cuda_rdna3_qwen36_superlayer_trace_enabled()) {
+    if (qwen36_superlayer_trace_enabled()) {
         fprintf(stderr,
                 "rdna3_qwen36_superlayer: contract-kernel-launched fingerprint=%s blocks=%d threads=%d"
                 " weightpack_tensors=%zu runtime_bindings=%zu weightpack_bytes=%zu scratch_bytes=%zu"
