@@ -2957,10 +2957,17 @@ static bool qwen36_superlayer_contract_kernel_enabled() {
         qwen36_superlayer_run_l0_math_enabled();
 }
 
+static bool qwen36_superlayer_requested() {
+    return qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER") ||
+        qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REQUIRED") ||
+        qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_CONTRACT") ||
+        qwen36_superlayer_run_l0_math_enabled();
+}
+
 } // namespace
 
 bool ggml_cuda_rdna3_qwen36_superlayer_enabled(const int device) {
-    return qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER") &&
+    return qwen36_superlayer_requested() &&
         GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[device].cc);
 }
 
