@@ -250,7 +250,6 @@ static bool ggml_cuda_rdna3_qwen36_mega_no_host_output(const int device) {
 static bool ggml_cuda_rdna3_qwen36_one_layer_mega_enabled(const int device) {
     return ggml_cuda_rdna3_qwen36_mega_decode_enabled(device) &&
         (ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_MEGA") ||
-         ggml_cuda_rdna3_qwen36_superlayer_final_requested() ||
          ggml_cuda_rdna3_qwen36_superlayer_final_physical_l0_requested());
 }
 
@@ -775,7 +774,6 @@ static ggml_cuda_device_info ggml_cuda_init() {
             qwen36_mega_decode_effective;
         const bool qwen36_one_layer_mega_effective =
             ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_MEGA") ||
-            qwen36_final_env ||
             ggml_cuda_rdna3_qwen36_superlayer_final_physical_l0_requested();
         GGML_LOG_INFO(
                 "rdna3_qwen36_superlayer: init-env graph_log=%d trace=%d final=%d superlayer=%d required=%d"
