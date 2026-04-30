@@ -248,7 +248,11 @@ static bool ggml_cuda_rdna3_qwen36_mega_no_host_output(const int device) {
 }
 
 static bool ggml_cuda_rdna3_qwen36_one_layer_mega_enabled(const int device) {
+    const bool unsafe_opt_in =
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_MEGA_UNSAFE") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_FINAL_PHYSICAL_L0_UNSAFE");
     return ggml_cuda_rdna3_qwen36_mega_decode_enabled(device) &&
+        unsafe_opt_in &&
         (ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_MEGA") ||
          ggml_cuda_rdna3_qwen36_superlayer_final_physical_l0_requested());
 }
@@ -772,16 +776,20 @@ static ggml_cuda_device_info ggml_cuda_init() {
         const bool qwen36_linear_mmvq_effective =
             ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_LINEAR_MMVQ_FAST") ||
             qwen36_mega_decode_effective;
+        const bool qwen36_one_layer_mega_unsafe =
+            ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_MEGA_UNSAFE") ||
+            ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_FINAL_PHYSICAL_L0_UNSAFE");
         const bool qwen36_one_layer_mega_effective =
-            ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_MEGA") ||
-            ggml_cuda_rdna3_qwen36_superlayer_final_physical_l0_requested();
+            qwen36_one_layer_mega_unsafe &&
+            (ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_MEGA") ||
+             ggml_cuda_rdna3_qwen36_superlayer_final_physical_l0_requested());
         GGML_LOG_INFO(
                 "rdna3_qwen36_superlayer: init-env graph_log=%d trace=%d final=%d superlayer=%d required=%d"
                 " dispatch=%d requested_effective=%d dispatch_effective=%d"
                 " mega_decode_env=%d mega_required_env=%d mega_graph_required_env=%d fastpath_env=%d"
                 " mega_decode_effective=%d mega_required_effective=%d mega_graph_required_effective=%d"
                 " fastpath_effective=%d linear_mmvq_effective=%d topk_fastpath_effective=%d"
-                " one_layer_mega_effective=%d final_physical_l0=%d"
+                " one_layer_mega_effective=%d one_layer_mega_unsafe=%d final_physical_l0=%d"
                 " contract=%d run_l0=%d replace_l0=%d rms=%d qkv=%d proj=%d"
                 " proj_z=%d proj_z_math_only=%d proj_beta=%d proj_alpha=%d single_l0=%d"
                 " direct_l0_proj_weights=%d\n",
@@ -804,6 +812,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
                 qwen36_linear_mmvq_effective ? 1 : 0,
                 qwen36_fastpath_effective ? 1 : 0,
                 qwen36_one_layer_mega_effective ? 1 : 0,
+                qwen36_one_layer_mega_unsafe ? 1 : 0,
                 ggml_cuda_rdna3_qwen36_superlayer_final_physical_l0_requested() ? 1 : 0,
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_CONTRACT") ? 1 : 0,
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_RUN_L0") ? 1 : 0,
