@@ -2,6 +2,12 @@
 
 #include "ggml-cuda/common.cuh"
 
+#ifdef GGML_USE_HIP
+#include <hip/hip_cooperative_groups.h>
+#else
+#include <cooperative_groups.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -2414,14 +2420,17 @@ __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_rms_norm(
         const uint8_t * weightpack,
         uint8_t * scratch,
         const uint64_t scratch_bytes,
+        cooperative_groups::grid_group grid,
+        float * partial_sums,
         float * sums) {
-    if (blockIdx.x != 0 || desc == nullptr || desc->ready == 0 ||
-            desc->x == nullptr || scratch == nullptr || sums == nullptr) {
+    if (desc == nullptr || desc->ready == 0 || desc->x == nullptr ||
+            scratch == nullptr || partial_sums == nullptr || sums == nullptr) {
         return;
     }
 
     const uint32_t n_embd = desc->n_embd;
-    if (n_embd == 0 || scratch_bytes < (uint64_t) n_embd*sizeof(float)) {
+    if (n_embd == 0 || scratch_bytes < (uint64_t) n_embd*sizeof(float) ||
+            scratch_bytes < (uint64_t) (gridDim.x + 1)*sizeof(float)) {
         return;
     }
     if (desc->has_norm_w != 0 && weightpack == nullptr) {
@@ -2431,7 +2440,7 @@ __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_rms_norm(
     const int tid = threadIdx.x;
     float sum = 0.0f;
 
-    for (uint32_t i = tid; i < n_embd; i += blockDim.x) {
+    for (uint32_t i = blockIdx.x*blockDim.x + tid; i < n_embd; i += gridDim.x*blockDim.x) {
         const float x = desc->x[i];
         sum += x*x;
     }
@@ -2446,12 +2455,36 @@ __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_rms_norm(
         __syncthreads();
     }
 
-    const float inv_rms = rsqrtf(sums[0]/(float) n_embd + desc->eps);
+    if (tid == 0) {
+        partial_sums[blockIdx.x] = sums[0];
+    }
+    grid.sync();
+
+    if (blockIdx.x == 0) {
+        float total = 0.0f;
+        for (uint32_t i = tid; i < gridDim.x; i += blockDim.x) {
+            total += partial_sums[i];
+        }
+        sums[tid] = total;
+        __syncthreads();
+        for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                sums[tid] += sums[tid + stride];
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            partial_sums[gridDim.x] = rsqrtf(sums[0]/(float) n_embd + desc->eps);
+        }
+    }
+    grid.sync();
+
+    const float inv_rms = partial_sums[gridDim.x];
     const float * norm_w = desc->has_norm_w != 0 ?
         (const float *) (weightpack + desc->norm_w_offset) : nullptr;
     float * dst = (float *) scratch;
 
-    for (uint32_t i = tid; i < n_embd; i += blockDim.x) {
+    for (uint32_t i = blockIdx.x*blockDim.x + tid; i < n_embd; i += gridDim.x*blockDim.x) {
         const float w = norm_w != nullptr ? norm_w[i] : 1.0f;
         const float v = desc->x[i]*inv_rms*w;
         dst[i] = v;
@@ -2459,6 +2492,7 @@ __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_rms_norm(
             desc->norm_out[i] = v;
         }
     }
+    grid.sync();
 }
 
 __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_qkv(
@@ -2467,7 +2501,7 @@ __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_qkv(
         uint8_t * scratch,
         const uint64_t scratch_bytes,
         float * sums) {
-    if (blockIdx.x != 0 || desc == nullptr || desc->ready == 0 ||
+    if (desc == nullptr || desc->ready == 0 ||
             weightpack == nullptr || scratch == nullptr || sums == nullptr) {
         return;
     }
@@ -2488,7 +2522,7 @@ __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_qkv(
     const ggml_type wqkv_type = (ggml_type) desc->wqkv_type;
 
     const int tid = threadIdx.x;
-    for (uint32_t row = 0; row < n_out; ++row) {
+    for (uint32_t row = blockIdx.x; row < n_out; row += gridDim.x) {
         float acc = 0.0f;
         for (uint32_t col = tid; col < n_embd; col += blockDim.x) {
             const float w = qwen36_rdna3_superlayer_dequant_weight(
@@ -2524,7 +2558,7 @@ __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_projection_bundle(
         uint8_t * scratch,
         const uint64_t scratch_bytes,
         float * sums) {
-    if (blockIdx.x != 0 || desc == nullptr || desc->ready == 0 ||
+    if (desc == nullptr || desc->ready == 0 ||
             weightpack == nullptr || scratch == nullptr || sums == nullptr) {
         return;
     }
@@ -2546,7 +2580,7 @@ __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_projection_bundle(
     const float * alpha_a = (const float *) (weightpack + desc->alpha_a_offset);
     const int tid = threadIdx.x;
 
-    for (uint32_t row = 0; row < total_out; ++row) {
+    for (uint32_t row = blockIdx.x; row < total_out; row += gridDim.x) {
         const char * w = nullptr;
         uint64_t w_nb1 = 0;
         ggml_type wtype = GGML_TYPE_COUNT;
@@ -2629,6 +2663,8 @@ __global__ void qwen36_rdna3_superlayer_contract_kernel(
         uint8_t * scratch,
         const uint64_t scratch_bytes,
         const uint64_t weightpack_bytes) {
+    namespace cg = cooperative_groups;
+    cg::grid_group grid = cg::this_grid();
     __shared__ float l0_rms_sums[256];
 
     const uint64_t lane = (uint64_t) blockIdx.x*blockDim.x + threadIdx.x;
@@ -2689,12 +2725,16 @@ __global__ void qwen36_rdna3_superlayer_contract_kernel(
         }
     }
 
+    float * l0_grid_scratch = nullptr;
+    if (scratch != nullptr && scratch_bytes >= (uint64_t) (gridDim.x + 1)*sizeof(float)) {
+        l0_grid_scratch = (float *) (scratch + scratch_bytes) - ((uint64_t) gridDim.x + 1);
+    }
+
     const uint64_t l0_norm_requested =
         l0_norm != nullptr && l0_norm->ready != 0 ? (uint64_t) l0_norm->n_embd*sizeof(float) : 0;
     const bool l0_norm_ready =
         l0_norm_requested != 0 && scratch != nullptr && scratch_bytes >= l0_norm_requested &&
-        (l0_norm->has_norm_w == 0 || weightpack != nullptr);
-    const uint64_t l0_norm_bytes = l0_norm_ready ? l0_norm_requested : 0;
+        l0_grid_scratch != nullptr && (l0_norm->has_norm_w == 0 || weightpack != nullptr);
     const uint64_t l0_qkv_requested =
         l0_qkv != nullptr && l0_qkv->ready != 0 ? (uint64_t) l0_qkv->n_out*sizeof(float) : 0;
     const uint64_t l0_qkv_begin = l0_qkv != nullptr ? l0_qkv->qkv_scratch_offset : 0;
@@ -2712,20 +2752,18 @@ __global__ void qwen36_rdna3_superlayer_contract_kernel(
         l0_proj != nullptr && l0_proj->ready != 0 && scratch != nullptr && weightpack != nullptr &&
         l0_proj->z_out != 0 && l0_proj->beta_out != 0 && l0_proj->alpha_out != 0 &&
         l0_proj_z_end <= scratch_bytes && l0_proj_beta_end <= scratch_bytes &&
-        l0_proj_alpha_end <= scratch_bytes;
-    const bool reserved_scratch =
-        lane < l0_norm_bytes ||
-        (l0_qkv_ready && lane >= l0_qkv_begin && lane < l0_qkv_end) ||
-        (l0_proj_ready && lane >= l0_proj->z_scratch_offset && lane < l0_proj_z_end) ||
-        (l0_proj_ready && lane >= l0_proj->beta_scratch_offset && lane < l0_proj_beta_end) ||
-        (l0_proj_ready && lane >= l0_proj->alpha_scratch_offset && lane < l0_proj_alpha_end);
-    if (scratch != nullptr && lane < scratch_bytes && !reserved_scratch) {
-        scratch[lane] = (uint8_t) checksum;
-    }
+        l0_proj_alpha_end <= scratch_bytes && l0_grid_scratch != nullptr;
 
-    qwen36_rdna3_superlayer_l0_rms_norm(l0_norm, weightpack, scratch, scratch_bytes, l0_rms_sums);
-    qwen36_rdna3_superlayer_l0_qkv(l0_qkv, weightpack, scratch, scratch_bytes, l0_rms_sums);
-    qwen36_rdna3_superlayer_l0_projection_bundle(l0_proj, weightpack, scratch, scratch_bytes, l0_rms_sums);
+    if (l0_norm_ready) {
+        qwen36_rdna3_superlayer_l0_rms_norm(
+                l0_norm, weightpack, scratch, scratch_bytes, grid, l0_grid_scratch, l0_rms_sums);
+    }
+    if (l0_norm_ready && l0_qkv_ready) {
+        qwen36_rdna3_superlayer_l0_qkv(l0_qkv, weightpack, scratch, scratch_bytes, l0_rms_sums);
+    }
+    if (l0_norm_ready && l0_proj_ready) {
+        qwen36_rdna3_superlayer_l0_projection_bundle(l0_proj, weightpack, scratch, scratch_bytes, l0_rms_sums);
+    }
 
     if (lane == 0) {
         state->fingerprint ^= 0x7900'0110'0036'0001ull;
@@ -2760,7 +2798,7 @@ bool ggml_cuda_rdna3_qwen36_superlayer_required(const int device) {
 bool ggml_cuda_rdna3_qwen36_superlayer_replace_l0_enabled(const int device) {
     return ggml_cuda_rdna3_qwen36_superlayer_enabled(device) &&
         qwen36_superlayer_contract_dispatch_enabled() &&
-        qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0", 1) != 0;
+        qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0", 0) != 0;
 }
 
 bool ggml_cuda_rdna3_qwen36_superlayer_prepare(
@@ -2861,6 +2899,12 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
     if (!qwen36_superlayer_contract_dispatch_enabled()) {
         return true;
     }
+    if (!ggml_cuda_info().devices[cuda_ctx->device].supports_cooperative_launch) {
+        if (blocker != nullptr) {
+            *blocker = "superlayer dispatch requires cooperative launch support";
+        }
+        return false;
+    }
 
     qwen36_superlayer_plan plan = qwen36_superlayer_make_plan(cgraph, cuda_ctx->device);
     if (!plan.blocker.empty()) {
@@ -2913,18 +2957,34 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
         requested_threads >= 128 ? 128 :
         requested_threads >=  64 ?  64 : 32;
 
-    qwen36_rdna3_superlayer_contract_kernel<<<blocks, threads, 0, cuda_ctx->stream()>>>(
-            contract_state.ptr,
-            (const uint8_t *) device_pack.data,
-            device_pack.layers,
-            device_pack.io_descs,
-            (uint32_t) device_pack.io_count,
-            device_pack.l0_norm,
-            device_pack.l0_qkv,
-            device_pack.l0_proj,
-            (uint8_t *) device_pack.scratch,
-            (uint64_t) device_pack.runtime.scratch_bytes,
-            (uint64_t) device_pack.bytes);
+    qwen36_superlayer_contract_state * state_arg = contract_state.ptr;
+    const uint8_t * weightpack_arg = (const uint8_t *) device_pack.data;
+    qwen36_superlayer_layer_pack_desc * layers_arg = device_pack.layers;
+    qwen36_superlayer_runtime_tensor_desc * io_descs_arg = device_pack.io_descs;
+    const uint32_t io_count_arg = (uint32_t) device_pack.io_count;
+    qwen36_superlayer_l0_norm_desc * l0_norm_arg = device_pack.l0_norm;
+    qwen36_superlayer_l0_qkv_desc * l0_qkv_arg = device_pack.l0_qkv;
+    qwen36_superlayer_l0_proj_desc * l0_proj_arg = device_pack.l0_proj;
+    uint8_t * scratch_arg = (uint8_t *) device_pack.scratch;
+    const uint64_t scratch_bytes_arg = (uint64_t) device_pack.runtime.scratch_bytes;
+    const uint64_t weightpack_bytes_arg = (uint64_t) device_pack.bytes;
+    void * kernel_args[] = {
+        (void *) &state_arg,
+        (void *) &weightpack_arg,
+        (void *) &layers_arg,
+        (void *) &io_descs_arg,
+        (void *) &io_count_arg,
+        (void *) &l0_norm_arg,
+        (void *) &l0_qkv_arg,
+        (void *) &l0_proj_arg,
+        (void *) &scratch_arg,
+        (void *) &scratch_bytes_arg,
+        (void *) &weightpack_bytes_arg,
+    };
+    CUDA_CHECK(cudaLaunchCooperativeKernel(
+            (void *) qwen36_rdna3_superlayer_contract_kernel,
+            dim3((unsigned int) blocks, 1, 1), dim3((unsigned int) threads, 1, 1),
+            kernel_args, 0, cuda_ctx->stream()));
     CUDA_CHECK(cudaGetLastError());
 
     static std::atomic<int64_t> contract_reports{0};
@@ -2934,7 +2994,7 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
                 "rdna3_qwen36_superlayer: contract-kernel-launched fingerprint=%s blocks=%d threads=%d"
                 " weightpack_tensors=%zu runtime_bindings=%zu weightpack_bytes=%zu scratch_bytes=%zu"
                 " l0_rms_norm=on l0_qkv=on l0_projection=on l0_real_outputs=on replace_l0=%d"
-                " note=single physical 40-layer dispatch scaffold\n",
+                " note=single physical cooperative 40-layer dispatch scaffold\n",
                 hex_u64(plan.fingerprint).c_str(), blocks, threads,
                 device_pack.tensors, device_pack.io_count, device_pack.bytes, device_pack.runtime.scratch_bytes,
                 ggml_cuda_rdna3_qwen36_superlayer_replace_l0_enabled(cuda_ctx->device) ? 1 : 0);
