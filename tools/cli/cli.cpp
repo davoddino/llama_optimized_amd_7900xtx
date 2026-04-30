@@ -92,7 +92,7 @@ struct cli_context {
 
             // chat template settings
             task.params.chat_parser_params = common_chat_parser_params(chat_params);
-            task.params.chat_parser_params.reasoning_format = chat_params.reasoning_format;
+            task.params.chat_parser_params.reasoning_format = ctx_server.get_meta().chat_params.reasoning_format;
             if (!chat_params.parser.empty()) {
                 task.params.chat_parser_params.parser.load(chat_params.parser);
             }
