@@ -6746,7 +6746,11 @@ static void ggml_cuda_graph_evaluate_and_capture(
 
             bool qwen36_one_layer_qkv_launched = false;
             bool qwen36_one_layer_projection_bundle_launched = false;
-            bool qwen36_superlayer_l0_launched = false;
+            bool qwen36_superlayer_l0_rms_qkv_launched = false;
+            bool qwen36_superlayer_l0_qkv_late_launched = false;
+            bool qwen36_superlayer_l0_proj_z_launched = false;
+            bool qwen36_superlayer_l0_proj_beta_launched = false;
+            bool qwen36_superlayer_l0_proj_alpha_launched = false;
             const bool qwen36_superlayer_l0_replace_rms =
                 superlayer_l0_plan != nullptr &&
                 ggml_cuda_rdna3_qwen36_superlayer_replace_l0_rms_enabled(cuda_ctx->device);
@@ -6765,25 +6769,76 @@ static void ggml_cuda_graph_evaluate_and_capture(
             const bool qwen36_superlayer_l0_replace_proj_alpha =
                 superlayer_l0_plan != nullptr &&
                 ggml_cuda_rdna3_qwen36_superlayer_replace_l0_proj_alpha_enabled(cuda_ctx->device);
+            const uint32_t qwen36_superlayer_l0_rms_qkv_mask =
+                (qwen36_superlayer_l0_replace_rms ? 0x1u : 0u) |
+                (qwen36_superlayer_l0_replace_rms && qwen36_superlayer_l0_replace_qkv ? 0x2u : 0u);
+            const uint32_t qwen36_superlayer_l0_qkv_late_mask =
+                !qwen36_superlayer_l0_replace_rms && qwen36_superlayer_l0_replace_qkv ? 0x2u : 0u;
+            const uint32_t qwen36_superlayer_l0_proj_z_mask =
+                qwen36_superlayer_l0_replace_proj_z ?
+                    (0x4u | (qwen36_superlayer_l0_replace_proj_z_math_only ? 0x20u : 0u)) : 0u;
+            const uint32_t qwen36_superlayer_l0_proj_beta_mask =
+                qwen36_superlayer_l0_replace_proj_beta ? 0x8u : 0u;
+            const uint32_t qwen36_superlayer_l0_proj_alpha_mask =
+                qwen36_superlayer_l0_replace_proj_alpha ? 0x10u : 0u;
+            auto qwen36_superlayer_l0_launch_mask = [&](const int node_idx, const char * stage, const uint32_t mask) {
+                if (mask == 0) {
+                    return;
+                }
+
+                std::string superlayer_l0_blocker;
+                const bool superlayer_l0_ok =
+                    ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
+                            cuda_ctx, cgraph, &superlayer_l0_blocker, mask);
+                if (!superlayer_l0_ok) {
+                    GGML_ABORT("%s: Qwen3.6 RDNA3 physical superlayer L0 %s dispatch failed at"
+                            " graph node %d: %s", __func__, stage, node_idx, superlayer_l0_blocker.c_str());
+                }
+                if (ggml_cuda_rdna3_qwen36_superlayer_trace_enabled()) {
+                    fprintf(stderr, "%s: RDNA3 Qwen3.6 physical superlayer L0 %s dispatched"
+                            " at node %d (%s) mask=0x%x\n",
+                            __func__, stage, node_idx,
+                            cgraph->nodes[node_idx] != nullptr ? cgraph->nodes[node_idx]->name : "<null>",
+                            mask);
+                    fflush(stderr);
+                }
+            };
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (superlayer_l0_plan != nullptr &&
-                        !qwen36_superlayer_l0_launched &&
-                        i == superlayer_l0_plan->rms) {
-                    std::string superlayer_l0_blocker;
-                    const bool superlayer_l0_ok =
-                        ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
-                                cuda_ctx, cgraph, &superlayer_l0_blocker);
-                    if (!superlayer_l0_ok) {
-                        GGML_ABORT("%s: Qwen3.6 RDNA3 physical superlayer L0 dispatch failed at"
-                                " graph node %d: %s", __func__, i, superlayer_l0_blocker.c_str());
-                    }
-                    qwen36_superlayer_l0_launched = true;
-                    if (ggml_cuda_rdna3_qwen36_superlayer_trace_enabled()) {
-                        fprintf(stderr, "%s: RDNA3 Qwen3.6 physical superlayer L0 dispatched at node %d (%s)\n",
-                                __func__, i, node->name);
-                        fflush(stderr);
-                    }
+                        !qwen36_superlayer_l0_rms_qkv_launched &&
+                        i == superlayer_l0_plan->rms &&
+                        qwen36_superlayer_l0_rms_qkv_mask != 0) {
+                    qwen36_superlayer_l0_launch_mask(i, "rms-qkv", qwen36_superlayer_l0_rms_qkv_mask);
+                    qwen36_superlayer_l0_rms_qkv_launched = true;
+                }
+                if (superlayer_l0_plan != nullptr &&
+                        !qwen36_superlayer_l0_qkv_late_launched &&
+                        i == superlayer_l0_plan->qkv_math &&
+                        qwen36_superlayer_l0_qkv_late_mask != 0) {
+                    qwen36_superlayer_l0_launch_mask(i, "qkv", qwen36_superlayer_l0_qkv_late_mask);
+                    qwen36_superlayer_l0_qkv_late_launched = true;
+                }
+                if (superlayer_l0_plan != nullptr &&
+                        !qwen36_superlayer_l0_proj_z_launched &&
+                        i == superlayer_l0_plan->z_math &&
+                        qwen36_superlayer_l0_proj_z_mask != 0) {
+                    qwen36_superlayer_l0_launch_mask(i, "proj-z", qwen36_superlayer_l0_proj_z_mask);
+                    qwen36_superlayer_l0_proj_z_launched = true;
+                }
+                if (superlayer_l0_plan != nullptr &&
+                        !qwen36_superlayer_l0_proj_beta_launched &&
+                        i == superlayer_l0_plan->beta_math &&
+                        qwen36_superlayer_l0_proj_beta_mask != 0) {
+                    qwen36_superlayer_l0_launch_mask(i, "proj-beta", qwen36_superlayer_l0_proj_beta_mask);
+                    qwen36_superlayer_l0_proj_beta_launched = true;
+                }
+                if (superlayer_l0_plan != nullptr &&
+                        !qwen36_superlayer_l0_proj_alpha_launched &&
+                        i == superlayer_l0_plan->alpha_math &&
+                        qwen36_superlayer_l0_proj_alpha_mask != 0) {
+                    qwen36_superlayer_l0_launch_mask(i, "proj-alpha", qwen36_superlayer_l0_proj_alpha_mask);
+                    qwen36_superlayer_l0_proj_alpha_launched = true;
                 }
                 const bool qwen36_superlayer_l0_skip =
                     superlayer_l0_plan != nullptr &&
@@ -7814,7 +7869,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 } else {
                     std::string contract_blocker;
                     const bool contract_ok =
-                        ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(cuda_ctx, cgraph, &contract_blocker);
+                        ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
+                                cuda_ctx, cgraph, &contract_blocker, UINT32_MAX);
                     if (!contract_ok && ggml_cuda_rdna3_qwen36_superlayer_required(cuda_ctx->device)) {
                         GGML_ABORT("%s: Qwen3.6 RDNA3 physical superlayer contract dispatch failed: %s",
                                 __func__, contract_blocker.c_str());

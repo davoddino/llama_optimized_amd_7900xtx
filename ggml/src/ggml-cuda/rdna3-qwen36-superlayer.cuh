@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 
+#include <cstdint>
 #include <string>
 
 struct ggml_backend_cuda_context;
@@ -25,7 +26,8 @@ bool ggml_cuda_rdna3_qwen36_superlayer_prepare(
 bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
         ggml_backend_cuda_context * cuda_ctx,
         const ggml_cgraph * cgraph,
-        std::string * blocker);
+        std::string * blocker,
+        uint32_t forced_l0_stage_mask);
 
 bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_smoke(
         ggml_backend_cuda_context * cuda_ctx,

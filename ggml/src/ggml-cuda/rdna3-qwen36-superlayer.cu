@@ -3278,7 +3278,8 @@ bool ggml_cuda_rdna3_qwen36_superlayer_prepare(
 bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
         ggml_backend_cuda_context * cuda_ctx,
         const ggml_cgraph * cgraph,
-        std::string * blocker) {
+        std::string * blocker,
+        const uint32_t forced_l0_stage_mask) {
     if (!qwen36_superlayer_contract_dispatch_enabled()) {
         return true;
     }
@@ -3362,7 +3363,8 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
     uint8_t * scratch_arg = (uint8_t *) device_pack.scratch;
     const uint64_t scratch_bytes_arg = (uint64_t) device_pack.runtime.scratch_bytes;
     const uint64_t weightpack_bytes_arg = (uint64_t) device_pack.bytes;
-    const uint32_t l0_stage_mask_arg = qwen36_superlayer_l0_stage_mask();
+    const uint32_t l0_stage_mask_arg =
+        forced_l0_stage_mask == UINT32_MAX ? qwen36_superlayer_l0_stage_mask() : forced_l0_stage_mask;
     void * kernel_args[] = {
         (void *) &state_arg,
         (void *) &weightpack_arg,
@@ -3415,5 +3417,5 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_smoke(
         ggml_backend_cuda_context * cuda_ctx,
         const ggml_cgraph * cgraph,
         std::string * blocker) {
-    return ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(cuda_ctx, cgraph, blocker);
+    return ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(cuda_ctx, cgraph, blocker, UINT32_MAX);
 }
