@@ -208,18 +208,21 @@ static bool ggml_cuda_rdna3_qwen36_fastpath_enabled(const int device) {
 }
 
 static bool ggml_cuda_rdna3_qwen36_mega_decode_enabled(const int device) {
-    return ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_DECODE") &&
+    return (ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_DECODE") ||
+            ggml_cuda_rdna3_qwen36_superlayer_final_requested()) &&
         GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[device].cc);
 }
 
 static bool ggml_cuda_rdna3_qwen36_mega_decode_required(const int device) {
     return ggml_cuda_rdna3_qwen36_mega_decode_enabled(device) &&
-        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_REQUIRED");
+        (ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_REQUIRED") ||
+         ggml_cuda_rdna3_qwen36_superlayer_final_requested());
 }
 
 static bool ggml_cuda_rdna3_qwen36_mega_graph_required(const int device) {
     return ggml_cuda_rdna3_qwen36_mega_decode_enabled(device) &&
-        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_REQUIRE_GRAPH");
+        (ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_REQUIRE_GRAPH") ||
+         ggml_cuda_rdna3_qwen36_superlayer_final_requested());
 }
 
 static int64_t ggml_cuda_rdna3_qwen36_mega_graph_grace_evals() {
@@ -7796,10 +7799,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     const bool qwen36_mega_require_graph = ggml_cuda_rdna3_qwen36_mega_graph_required(cuda_ctx->device);
     const bool qwen36_superlayer_enabled =
         ggml_cuda_rdna3_qwen36_superlayer_enabled(cuda_ctx->device);
-    const bool qwen36_superlayer_runtime =
-        ggml_cuda_rdna3_qwen36_superlayer_runtime_enabled(cuda_ctx->device);
     const bool qwen36_superlayer_final =
-        ggml_cuda_rdna3_qwen36_superlayer_final_enabled(cuda_ctx->device);
+        ggml_cuda_rdna3_qwen36_superlayer_final_requested() &&
+        GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[cuda_ctx->device].cc);
+    const bool qwen36_superlayer_runtime =
+        !qwen36_superlayer_final &&
+        ggml_cuda_rdna3_qwen36_superlayer_runtime_enabled(cuda_ctx->device);
     const bool qwen36_one_layer_mega = ggml_cuda_rdna3_qwen36_one_layer_mega_enabled(cuda_ctx->device);
     const bool qwen36_one_layer_mega_required =
         ggml_cuda_rdna3_qwen36_one_layer_mega_required(cuda_ctx->device);
@@ -7902,7 +7907,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
     }
 
-    if (qwen36_superlayer_runtime) {
+    if (qwen36_superlayer_runtime && !qwen36_superlayer_final) {
         if (superlayer_decode_candidate) {
             std::string superlayer_blocker;
             const bool superlayer_ok =
@@ -7913,7 +7918,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             }
 
             if (superlayer_ok) {
-                if (ggml_cuda_rdna3_qwen36_superlayer_replace_l0_enabled(cuda_ctx->device)) {
+                if (!qwen36_superlayer_final &&
+                        ggml_cuda_rdna3_qwen36_superlayer_replace_l0_enabled(cuda_ctx->device)) {
                     qwen36_superlayer_l0_plan =
                         ggml_cuda_rdna3_qwen36_one_layer_mega_make_plan(cgraph, cuda_ctx->device, 0);
                     qwen36_superlayer_l0_replace_ready =
