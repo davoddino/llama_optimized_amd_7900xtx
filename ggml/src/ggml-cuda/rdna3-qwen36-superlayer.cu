@@ -159,6 +159,19 @@ struct qwen36_superlayer_l0_norm_desc {
     uint32_t ready = 0;
 };
 
+struct qwen36_superlayer_l0_qkv_desc {
+    uint64_t wqkv_offset = 0;
+    uint64_t qkv_scale_offset = 0;
+    uint64_t qkv_scratch_offset = 0;
+    uint64_t wqkv_nb1 = 0;
+    uint32_t n_embd = 0;
+    uint32_t n_out = 0;
+    int32_t wqkv_type = GGML_TYPE_COUNT;
+    uint32_t qkv_scale_n = 0;
+    uint32_t has_qkv_scale = 0;
+    uint32_t ready = 0;
+};
+
 struct qwen36_superlayer_device_pack_entry {
     int device = -1;
     uint64_t fingerprint = 0;
@@ -168,6 +181,7 @@ struct qwen36_superlayer_device_pack_entry {
     qwen36_superlayer_layer_pack_desc * layers = nullptr;
     qwen36_superlayer_runtime_tensor_desc * io_descs = nullptr;
     qwen36_superlayer_l0_norm_desc * l0_norm = nullptr;
+    qwen36_superlayer_l0_qkv_desc * l0_qkv = nullptr;
     void * scratch = nullptr;
     size_t bytes = 0;
     size_t tensors = 0;
@@ -182,6 +196,7 @@ struct qwen36_superlayer_device_pack_view {
     qwen36_superlayer_layer_pack_desc * layers = nullptr;
     qwen36_superlayer_runtime_tensor_desc * io_descs = nullptr;
     qwen36_superlayer_l0_norm_desc * l0_norm = nullptr;
+    qwen36_superlayer_l0_qkv_desc * l0_qkv = nullptr;
     void * scratch = nullptr;
     size_t bytes = 0;
     size_t tensors = 0;
@@ -778,6 +793,190 @@ static bool qwen36_superlayer_make_l0_norm_desc(
     return true;
 }
 
+static const ggml_tensor * qwen36_superlayer_strip_view_ops(const ggml_tensor * t) {
+    for (int depth = 0; t != nullptr && depth < 8; ++depth) {
+        switch (t->op) {
+            case GGML_OP_RESHAPE:
+            case GGML_OP_VIEW:
+            case GGML_OP_PERMUTE:
+            case GGML_OP_TRANSPOSE:
+            case GGML_OP_CONT:
+                t = t->src[0];
+                break;
+            default:
+                return t;
+        }
+    }
+    return t;
+}
+
+static bool qwen36_superlayer_projection_weight_supported(const ggml_tensor * w) {
+    if (w == nullptr) {
+        return false;
+    }
+    switch (w->type) {
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_F16:
+        case GGML_TYPE_F32:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool qwen36_superlayer_make_l0_qkv_desc(
+        const ggml_cgraph * cgraph,
+        const qwen36_superlayer_plan & plan,
+        const qwen36_superlayer_pack_plan & pack,
+        const qwen36_superlayer_runtime_layout & runtime,
+        qwen36_superlayer_l0_qkv_desc * desc,
+        std::string * blocker) {
+    if (desc == nullptr) {
+        if (blocker != nullptr) {
+            *blocker = "missing L0 QKV descriptor output";
+        }
+        return false;
+    }
+    *desc = qwen36_superlayer_l0_qkv_desc{};
+
+    const int begin = plan.layer_start[0] >= 0 ? plan.layer_start[0] : 0;
+    const int end   = plan.layer_end[0]   >= begin ? plan.layer_end[0]   : cgraph->n_nodes - 1;
+    const ggml_tensor * attn_norm = nullptr;
+    const ggml_tensor * qkv_named = nullptr;
+    for (int i = begin; i <= end; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (attn_norm == nullptr && tensor_name_matches_layer(node, "attn_norm", 0)) {
+            attn_norm = node;
+        }
+        if (qkv_named == nullptr && tensor_name_matches_layer(node, "linear_attn_qkv_mixed", 0)) {
+            qkv_named = node;
+        }
+    }
+    if (attn_norm == nullptr || qkv_named == nullptr) {
+        if (blocker != nullptr) {
+            *blocker = "L0 QKV fusion requires attn_norm-0 and linear_attn_qkv_mixed-0";
+        }
+        return false;
+    }
+
+    const ggml_tensor * qkv_out = qwen36_superlayer_strip_view_ops(qkv_named);
+    const ggml_tensor * qkv_math = qkv_out;
+    const ggml_tensor * qkv_scale = nullptr;
+    if (qkv_out != nullptr && qkv_out->op == GGML_OP_MUL) {
+        if (qkv_out->src[0] != nullptr && qkv_out->src[0]->op == GGML_OP_MUL_MAT) {
+            qkv_math = qkv_out->src[0];
+            qkv_scale = qkv_out->src[1];
+        } else if (qkv_out->src[1] != nullptr && qkv_out->src[1]->op == GGML_OP_MUL_MAT) {
+            qkv_math = qkv_out->src[1];
+            qkv_scale = qkv_out->src[0];
+        }
+    }
+
+    if (qkv_math == nullptr || qkv_math->op != GGML_OP_MUL_MAT ||
+            qkv_math->src[0] == nullptr || qkv_math->src[1] == nullptr) {
+        if (blocker != nullptr) {
+            *blocker = "L0 QKV fusion could not resolve linear_attn_qkv_mixed-0 to MUL_MAT";
+        }
+        return false;
+    }
+    if (qkv_math->src[1] != attn_norm) {
+        if (blocker != nullptr) {
+            *blocker = "L0 QKV MUL_MAT input is not attn_norm-0";
+        }
+        return false;
+    }
+    if (qkv_out == nullptr || qkv_out->type != GGML_TYPE_F32 || qkv_math->type != GGML_TYPE_F32) {
+        if (blocker != nullptr) {
+            *blocker = "L0 QKV fusion currently requires F32 QKV output tensors";
+        }
+        return false;
+    }
+
+    const ggml_tensor * wqkv = qkv_math->src[0];
+    if (!qwen36_superlayer_projection_weight_supported(wqkv)) {
+        if (blocker != nullptr) {
+            *blocker = "L0 QKV weight type is not implemented in the superlayer";
+        }
+        return false;
+    }
+    if (wqkv->ne[0] <= 0 || wqkv->ne[1] <= 0 || qkv_math->ne[0] != wqkv->ne[1]) {
+        if (blocker != nullptr) {
+            *blocker = "L0 QKV tensor dimensions do not match";
+        }
+        return false;
+    }
+    if (qkv_math->src[1]->ne[0] != wqkv->ne[0]) {
+        if (blocker != nullptr) {
+            *blocker = "L0 QKV input hidden dimension does not match weight columns";
+        }
+        return false;
+    }
+    if (ggml_nelements(qkv_out) / qkv_out->ne[0] != 1) {
+        if (blocker != nullptr) {
+            *blocker = "L0 QKV fusion is limited to one-token decode";
+        }
+        return false;
+    }
+
+    uint64_t wqkv_offset = 0;
+    if (!qwen36_superlayer_find_pack_offset(pack, wqkv, &wqkv_offset)) {
+        if (blocker != nullptr) {
+            *blocker = "L0 QKV weight is not present in the fused weightpack: ";
+            *blocker += wqkv->name;
+        }
+        return false;
+    }
+
+    uint64_t qkv_scale_offset = 0;
+    uint32_t qkv_scale_n = 0;
+    if (qkv_scale != nullptr) {
+        if (qkv_scale->type != GGML_TYPE_F32 || qkv_scale->nb[0] != (int64_t) sizeof(float)) {
+            if (blocker != nullptr) {
+                *blocker = "L0 QKV scale must be dense F32";
+            }
+            return false;
+        }
+        const int64_t scale_ne = ggml_nelements(qkv_scale);
+        if (scale_ne != 1 && scale_ne != qkv_math->ne[0]) {
+            if (blocker != nullptr) {
+                *blocker = "L0 QKV scale has unexpected size";
+            }
+            return false;
+        }
+        if (!qwen36_superlayer_find_pack_offset(pack, qkv_scale, &qkv_scale_offset)) {
+            if (blocker != nullptr) {
+                *blocker = "L0 QKV scale is not present in the fused weightpack: ";
+                *blocker += qkv_scale->name;
+            }
+            return false;
+        }
+        qkv_scale_n = (uint32_t) scale_ne;
+    }
+
+    const uint64_t qkv_scratch_offset = runtime.activation_slot_bytes;
+    const uint64_t qkv_bytes = (uint64_t) qkv_math->ne[0]*sizeof(float);
+    if (qkv_scratch_offset + qkv_bytes > runtime.scratch_bytes) {
+        if (blocker != nullptr) {
+            *blocker = "L0 QKV scratch range does not fit in the superlayer runtime scratch";
+        }
+        return false;
+    }
+
+    desc->wqkv_offset = wqkv_offset;
+    desc->qkv_scale_offset = qkv_scale_offset;
+    desc->qkv_scratch_offset = qkv_scratch_offset;
+    desc->wqkv_nb1 = (uint64_t) wqkv->nb[1];
+    desc->n_embd = (uint32_t) wqkv->ne[0];
+    desc->n_out = (uint32_t) qkv_math->ne[0];
+    desc->wqkv_type = (int32_t) wqkv->type;
+    desc->qkv_scale_n = qkv_scale_n;
+    desc->has_qkv_scale = qkv_scale != nullptr ? 1u : 0u;
+    desc->ready = 1u;
+    return true;
+}
+
 static bool qwen36_superlayer_materialize_device_pack(
         ggml_backend_cuda_context * cuda_ctx,
         const ggml_cgraph * cgraph,
@@ -786,6 +985,8 @@ static bool qwen36_superlayer_materialize_device_pack(
         qwen36_superlayer_device_pack_view * view,
         std::string * blocker) {
     const uint64_t source_signature = qwen36_superlayer_source_signature(pack);
+    const qwen36_superlayer_runtime_layout runtime =
+        qwen36_superlayer_make_runtime_layout(cgraph, plan);
     const qwen36_superlayer_runtime_binding_plan bindings =
         qwen36_superlayer_make_runtime_binding_plan(cgraph, plan, cuda_ctx->device);
     if (bindings.refs.empty()) {
@@ -802,6 +1003,10 @@ static bool qwen36_superlayer_materialize_device_pack(
     qwen36_superlayer_l0_norm_desc l0_norm_host;
     if (!qwen36_superlayer_make_l0_norm_desc(
                 cgraph, plan, pack, cuda_ctx->device, &l0_norm_host, blocker)) {
+        return false;
+    }
+    qwen36_superlayer_l0_qkv_desc l0_qkv_host;
+    if (!qwen36_superlayer_make_l0_qkv_desc(cgraph, plan, pack, runtime, &l0_qkv_host, blocker)) {
         return false;
     }
 
@@ -823,8 +1028,6 @@ static bool qwen36_superlayer_materialize_device_pack(
             }
 
             ggml_cuda_set_device(cuda_ctx->device);
-            const qwen36_superlayer_runtime_layout runtime =
-                qwen36_superlayer_make_runtime_layout(cgraph, plan);
 
             void * data = nullptr;
             cudaError_t err = cudaMalloc(&data, pack.total_bytes);
@@ -947,9 +1150,36 @@ static bool qwen36_superlayer_materialize_device_pack(
                 return false;
             }
 
+            qwen36_superlayer_l0_qkv_desc * l0_qkv = nullptr;
+            err = cudaMalloc((void **) &l0_qkv, sizeof(qwen36_superlayer_l0_qkv_desc));
+            if (err != cudaSuccess) {
+                (void) cudaFree(l0_norm);
+                (void) cudaFree(io_descs);
+                (void) cudaFree(scratch);
+                (void) cudaFree(layer_descs);
+                (void) cudaFree(data);
+                (void) cudaGetLastError();
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to allocate L0 QKV descriptor", err);
+                return false;
+            }
+            err = cudaMemcpy(
+                    l0_qkv, &l0_qkv_host, sizeof(qwen36_superlayer_l0_qkv_desc),
+                    cudaMemcpyHostToDevice);
+            if (err != cudaSuccess) {
+                (void) cudaFree(l0_qkv);
+                (void) cudaFree(l0_norm);
+                (void) cudaFree(io_descs);
+                (void) cudaFree(scratch);
+                (void) cudaFree(layer_descs);
+                (void) cudaFree(data);
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to upload L0 QKV descriptor", err);
+                return false;
+            }
+
             cudaEvent_t ready_event = nullptr;
             err = cudaEventCreateWithFlags(&ready_event, cudaEventDisableTiming);
             if (err != cudaSuccess) {
+                (void) cudaFree(l0_qkv);
                 (void) cudaFree(l0_norm);
                 (void) cudaFree(io_descs);
                 (void) cudaFree(scratch);
@@ -962,6 +1192,7 @@ static bool qwen36_superlayer_materialize_device_pack(
             err = cudaEventRecord(ready_event, cuda_ctx->stream());
             if (err != cudaSuccess) {
                 (void) cudaEventDestroy(ready_event);
+                (void) cudaFree(l0_qkv);
                 (void) cudaFree(l0_norm);
                 (void) cudaFree(io_descs);
                 (void) cudaFree(scratch);
@@ -980,6 +1211,7 @@ static bool qwen36_superlayer_materialize_device_pack(
             entry.layers = layer_descs;
             entry.io_descs = io_descs;
             entry.l0_norm = l0_norm;
+            entry.l0_qkv = l0_qkv;
             entry.scratch = scratch;
             entry.bytes = pack.total_bytes;
             entry.tensors = pack.refs.size();
@@ -992,8 +1224,6 @@ static bool qwen36_superlayer_materialize_device_pack(
             should_report = reported_device_packs.insert(key).second;
         } else {
             ggml_cuda_set_device(cuda_ctx->device);
-            const qwen36_superlayer_runtime_layout runtime =
-                qwen36_superlayer_make_runtime_layout(cgraph, plan);
             if (io_descs_host.size() > it->second.io_capacity) {
                 qwen36_superlayer_runtime_tensor_desc * io_descs = nullptr;
                 cudaError_t err = cudaMalloc(
@@ -1056,6 +1286,24 @@ static bool qwen36_superlayer_materialize_device_pack(
                 return false;
             }
 
+            if (it->second.l0_qkv == nullptr) {
+                qwen36_superlayer_l0_qkv_desc * l0_qkv = nullptr;
+                cudaError_t err = cudaMalloc((void **) &l0_qkv, sizeof(qwen36_superlayer_l0_qkv_desc));
+                if (err != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    qwen36_superlayer_set_cuda_blocker(blocker, "failed to allocate L0 QKV descriptor", err);
+                    return false;
+                }
+                it->second.l0_qkv = l0_qkv;
+            }
+            err = cudaMemcpy(
+                    it->second.l0_qkv, &l0_qkv_host, sizeof(qwen36_superlayer_l0_qkv_desc),
+                    cudaMemcpyHostToDevice);
+            if (err != cudaSuccess) {
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to refresh L0 QKV descriptor", err);
+                return false;
+            }
+
             it->second.runtime_signature = runtime_signature;
             it->second.io_count = io_descs_host.size();
             it->second.runtime = runtime;
@@ -1065,6 +1313,7 @@ static bool qwen36_superlayer_materialize_device_pack(
         local_view.layers = it->second.layers;
         local_view.io_descs = it->second.io_descs;
         local_view.l0_norm = it->second.l0_norm;
+        local_view.l0_qkv = it->second.l0_qkv;
         local_view.scratch = it->second.scratch;
         local_view.bytes = it->second.bytes;
         local_view.tensors = it->second.tensors;
@@ -1087,12 +1336,13 @@ static bool qwen36_superlayer_materialize_device_pack(
     if (should_report) {
         GGML_LOG_INFO(
                 "rdna3_qwen36_superlayer: device-pack-ready fingerprint=%s source=%s runtime=%s"
-                " ptr=%p layer_descs=%p io_descs=%p l0_norm=%p scratch=%p tensors=%zu io=%zu bytes=%zu"
+                " ptr=%p layer_descs=%p io_descs=%p l0_norm=%p l0_qkv=%p scratch=%p tensors=%zu io=%zu bytes=%zu"
                 " scratch_bytes=%zu activation_slot=%zu logits_bytes=%zu router_slot=%zu"
                 " n_embd=%" PRId64 " n_vocab=%" PRId64 "\n",
                 hex_u64(plan.fingerprint).c_str(), hex_u64(source_signature).c_str(),
                 hex_u64(runtime_signature).c_str(),
-                local_view.data, local_view.layers, local_view.io_descs, local_view.l0_norm, local_view.scratch,
+                local_view.data, local_view.layers, local_view.io_descs, local_view.l0_norm, local_view.l0_qkv,
+                local_view.scratch,
                 local_view.tensors, local_view.io_count, local_view.bytes,
                 local_view.runtime.scratch_bytes, local_view.runtime.activation_slot_bytes,
                 local_view.runtime.logits_bytes, local_view.runtime.router_slot_bytes,
@@ -1649,6 +1899,99 @@ __device__ __forceinline__ uint64_t qwen36_rdna3_superlayer_contract_layer(
         ((uint64_t) L << 48);
 }
 
+static __device__ __forceinline__ void qwen36_rdna3_superlayer_get_scale_min_k4(
+        const int j,
+        const uint8_t * __restrict__ q,
+        uint8_t & d,
+        uint8_t & m) {
+    if (j < 4) {
+        d = q[j] & 63;
+        m = q[j + 4] & 63;
+    } else {
+        d = (q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4);
+        m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+    }
+}
+
+static __device__ __forceinline__ float qwen36_rdna3_superlayer_dequant_q4_k(
+        const char * __restrict__ row,
+        const int64_t col) {
+    const block_q4_K * blocks = (const block_q4_K *) row;
+    const block_q4_K & b = blocks[col / QK_K];
+    const int k = (int) (col % QK_K);
+    const int g64 = k >> 6;
+    const int in64 = k & 63;
+    const int half = in64 >> 5;
+    const int q_index = 32*g64 + (in64 & 31);
+
+    uint8_t sc;
+    uint8_t m;
+    qwen36_rdna3_superlayer_get_scale_min_k4(2*g64 + half, b.scales, sc, m);
+
+    const uint8_t q_byte = b.qs[q_index];
+    const int q = half == 0 ? (q_byte & 0x0F) : (q_byte >> 4);
+    const float d_all = __low2half(b.dm);
+    const float m_all = __high2half(b.dm);
+    return d_all * sc * q - m_all * m;
+}
+
+static __device__ __forceinline__ float qwen36_rdna3_superlayer_dequant_q6_k(
+        const char * __restrict__ row,
+        const int64_t col) {
+    const block_q6_K * blocks = (const block_q6_K *) row;
+    const block_q6_K & b = blocks[col / QK_K];
+    const int k = (int) (col % QK_K);
+    const int ip = k >> 7;
+    const int in128 = k & 127;
+    const int il = in128 & 31;
+    const uint8_t qh = b.qh[32*ip + il];
+    const int scale_base = 8*ip + il/16;
+    int q;
+    int scale_index;
+
+    if (in128 < 32) {
+        q = (b.ql[64*ip + il] & 0x0F) | (((qh >> 0) & 3) << 4);
+        scale_index = scale_base + 0;
+    } else if (in128 < 64) {
+        q = (b.ql[64*ip + il + 32] & 0x0F) | (((qh >> 2) & 3) << 4);
+        scale_index = scale_base + 2;
+    } else if (in128 < 96) {
+        q = (b.ql[64*ip + il] >> 4) | (((qh >> 4) & 3) << 4);
+        scale_index = scale_base + 4;
+    } else {
+        q = (b.ql[64*ip + il + 32] >> 4) | (((qh >> 6) & 3) << 4);
+        scale_index = scale_base + 6;
+    }
+
+    return (float) b.d * b.scales[scale_index] * ((int8_t) q - 32);
+}
+
+static __device__ __forceinline__ float qwen36_rdna3_superlayer_dequant_weight(
+        const char * __restrict__ w,
+        const ggml_type wtype,
+        const int64_t w_nb1,
+        const int64_t row,
+        const int64_t col) {
+    const char * wrow = w + row*w_nb1;
+    switch (wtype) {
+        case GGML_TYPE_Q4_K:
+            return qwen36_rdna3_superlayer_dequant_q4_k(wrow, col);
+        case GGML_TYPE_Q6_K:
+            return qwen36_rdna3_superlayer_dequant_q6_k(wrow, col);
+        case GGML_TYPE_Q8_0: {
+            const block_q8_0 * blocks = (const block_q8_0 *) wrow;
+            const block_q8_0 & b = blocks[col / QK8_0];
+            return (float) b.d * b.qs[col % QK8_0];
+        }
+        case GGML_TYPE_F16:
+            return (float) ((const ggml_half *) wrow)[col];
+        case GGML_TYPE_F32:
+            return ((const float *) wrow)[col];
+        default:
+            return 0.0f;
+    }
+}
+
 __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_rms_norm(
         const qwen36_superlayer_l0_norm_desc * desc,
         const uint8_t * weightpack,
@@ -1697,6 +2040,59 @@ __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_rms_norm(
     }
 }
 
+__device__ __forceinline__ void qwen36_rdna3_superlayer_l0_qkv(
+        const qwen36_superlayer_l0_qkv_desc * desc,
+        const uint8_t * weightpack,
+        uint8_t * scratch,
+        const uint64_t scratch_bytes,
+        float * sums) {
+    if (blockIdx.x != 0 || desc == nullptr || desc->ready == 0 ||
+            weightpack == nullptr || scratch == nullptr || sums == nullptr) {
+        return;
+    }
+
+    const uint32_t n_embd = desc->n_embd;
+    const uint32_t n_out = desc->n_out;
+    const uint64_t qkv_bytes = (uint64_t) n_out*sizeof(float);
+    if (n_embd == 0 || n_out == 0 ||
+            desc->qkv_scratch_offset + qkv_bytes > scratch_bytes) {
+        return;
+    }
+
+    const float * norm = (const float *) scratch;
+    float * qkv = (float *) (scratch + desc->qkv_scratch_offset);
+    const char * wqkv = (const char *) (weightpack + desc->wqkv_offset);
+    const float * qkv_scale = desc->has_qkv_scale != 0 ?
+        (const float *) (weightpack + desc->qkv_scale_offset) : nullptr;
+    const ggml_type wqkv_type = (ggml_type) desc->wqkv_type;
+
+    const int tid = threadIdx.x;
+    for (uint32_t row = 0; row < n_out; ++row) {
+        float acc = 0.0f;
+        for (uint32_t col = tid; col < n_embd; col += blockDim.x) {
+            const float w = qwen36_rdna3_superlayer_dequant_weight(
+                    wqkv, wqkv_type, (int64_t) desc->wqkv_nb1, row, col);
+            acc += norm[col]*w;
+        }
+
+        sums[tid] = acc;
+        __syncthreads();
+        for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                sums[tid] += sums[tid + stride];
+            }
+            __syncthreads();
+        }
+
+        if (tid == 0) {
+            const float scale = qkv_scale == nullptr ? 1.0f :
+                qkv_scale[desc->qkv_scale_n == 1 ? 0 : row];
+            qkv[row] = sums[0]*scale;
+        }
+        __syncthreads();
+    }
+}
+
 __global__ void qwen36_rdna3_superlayer_contract_kernel(
         qwen36_superlayer_contract_state * state,
         const uint8_t * weightpack,
@@ -1704,6 +2100,7 @@ __global__ void qwen36_rdna3_superlayer_contract_kernel(
         const qwen36_superlayer_runtime_tensor_desc * io_descs,
         const uint32_t io_count,
         const qwen36_superlayer_l0_norm_desc * l0_norm,
+        const qwen36_superlayer_l0_qkv_desc * l0_qkv,
         uint8_t * scratch,
         const uint64_t scratch_bytes,
         const uint64_t weightpack_bytes) {
@@ -1773,16 +2170,29 @@ __global__ void qwen36_rdna3_superlayer_contract_kernel(
         l0_norm_requested != 0 && scratch != nullptr && scratch_bytes >= l0_norm_requested &&
         (l0_norm->has_norm_w == 0 || weightpack != nullptr);
     const uint64_t l0_norm_bytes = l0_norm_ready ? l0_norm_requested : 0;
-    if (scratch != nullptr && lane < scratch_bytes && lane >= l0_norm_bytes) {
+    const uint64_t l0_qkv_requested =
+        l0_qkv != nullptr && l0_qkv->ready != 0 ? (uint64_t) l0_qkv->n_out*sizeof(float) : 0;
+    const uint64_t l0_qkv_begin = l0_qkv != nullptr ? l0_qkv->qkv_scratch_offset : 0;
+    const uint64_t l0_qkv_end = l0_qkv_begin + l0_qkv_requested;
+    const bool l0_qkv_ready =
+        l0_qkv_requested != 0 && scratch != nullptr && weightpack != nullptr &&
+        l0_qkv_end <= scratch_bytes;
+    const bool reserved_scratch =
+        lane < l0_norm_bytes ||
+        (l0_qkv_ready && lane >= l0_qkv_begin && lane < l0_qkv_end);
+    if (scratch != nullptr && lane < scratch_bytes && !reserved_scratch) {
         scratch[lane] = (uint8_t) checksum;
     }
 
     qwen36_rdna3_superlayer_l0_rms_norm(l0_norm, weightpack, scratch, scratch_bytes, l0_rms_sums);
+    qwen36_rdna3_superlayer_l0_qkv(l0_qkv, weightpack, scratch, scratch_bytes, l0_rms_sums);
 
     if (lane == 0) {
         state->fingerprint ^= 0x7900'0110'0036'0001ull;
         state->fingerprint ^= checksum;
-        state->checksum = checksum ^ (l0_norm_ready ? 0x10'0000'0000ull : 0ull);
+        state->checksum = checksum ^
+            (l0_norm_ready ? 0x10'0000'0000ull : 0ull) ^
+            (l0_qkv_ready ? 0x20'0000'0000ull : 0ull);
         state->n_blocks = gridDim.x;
         state->touched_layers = 40;
         state->active_lanes = gridDim.x*blockDim.x;
@@ -1945,6 +2355,7 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
             device_pack.io_descs,
             (uint32_t) device_pack.io_count,
             device_pack.l0_norm,
+            device_pack.l0_qkv,
             (uint8_t *) device_pack.scratch,
             (uint64_t) device_pack.runtime.scratch_bytes,
             (uint64_t) device_pack.bytes);
@@ -1956,7 +2367,7 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
         GGML_LOG_INFO(
                 "rdna3_qwen36_superlayer: contract-kernel-launched fingerprint=%s blocks=%d threads=%d"
                 " weightpack_tensors=%zu runtime_bindings=%zu weightpack_bytes=%zu scratch_bytes=%zu"
-                " l0_rms_norm=on note=single physical 40-layer dispatch scaffold\n",
+                " l0_rms_norm=on l0_qkv=on note=single physical 40-layer dispatch scaffold\n",
                 hex_u64(plan.fingerprint).c_str(), blocks, threads,
                 device_pack.tensors, device_pack.io_count, device_pack.bytes, device_pack.runtime.scratch_bytes);
     }
