@@ -311,79 +311,91 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
             prefill_tokens);
     }
 
-    if (params.has_logit_bias()) {
-        samplers.push_back(llama_sampler_init_logit_bias(llama_vocab_n_tokens(vocab), params.logit_bias.size(), params.logit_bias.data()));
-    }
+    const bool qwen36_final = sampling_qwen36_superlayer_final_enabled();
 
-    if (params.mirostat == 0) {
-
-        bool use_adaptive_p = false; // see below
-
-        for (const auto & cnstr : params.samplers) {
-            switch (cnstr) {
-                case COMMON_SAMPLER_TYPE_DRY:
-                    {
-                        std::vector<const char *> c_breakers;
-                        c_breakers.reserve(params.dry_sequence_breakers.size());
-                        for (const auto & str : params.dry_sequence_breakers) {
-                            c_breakers.push_back(str.c_str());
-                        }
-                        samplers.push_back(llama_sampler_init_dry(vocab, llama_model_n_ctx_train(model), params.dry_multiplier, params.dry_base, params.dry_allowed_length, params.dry_penalty_last_n, c_breakers.data(), c_breakers.size()));
-                    }
-                    break;
-                case COMMON_SAMPLER_TYPE_TOP_K:
-                    samplers.push_back(llama_sampler_init_top_k(params.top_k));
-                    break;
-                case COMMON_SAMPLER_TYPE_TOP_P:
-                    samplers.push_back(llama_sampler_init_top_p(params.top_p, params.min_keep));
-                    break;
-                case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
-                    samplers.push_back(llama_sampler_init_top_n_sigma(params.top_n_sigma));
-                    break;
-                case COMMON_SAMPLER_TYPE_MIN_P:
-                    samplers.push_back(llama_sampler_init_min_p(params.min_p, params.min_keep));
-                    break;
-                case COMMON_SAMPLER_TYPE_XTC:
-                    samplers.push_back(llama_sampler_init_xtc(params.xtc_probability, params.xtc_threshold, params.min_keep, params.seed));
-                    break;
-                case COMMON_SAMPLER_TYPE_TYPICAL_P:
-                    samplers.push_back(llama_sampler_init_typical(params.typ_p, params.min_keep));
-                    break;
-                case COMMON_SAMPLER_TYPE_TEMPERATURE:
-                    samplers.push_back(llama_sampler_init_temp_ext(params.temp, params.dynatemp_range, params.dynatemp_exponent));
-                    break;
-                case COMMON_SAMPLER_TYPE_INFILL:
-                    samplers.push_back(llama_sampler_init_infill(vocab));
-                    break;
-                case COMMON_SAMPLER_TYPE_PENALTIES:
-                    samplers.push_back(llama_sampler_init_penalties(params.penalty_last_n, params.penalty_repeat, params.penalty_freq, params.penalty_present));
-                    break;
-                case COMMON_SAMPLER_TYPE_ADAPTIVE_P:
-                    // the `adaptive-p` sampler is like `dist` and `mirostat` in that it selects
-                    // a single token, so we will add `dist` at the end of the chain by default,
-                    // unless the user specifically included `adaptive-p`. we set this flag here
-                    // so we know to add the sampler at the very end.
-                    use_adaptive_p = true;
-                    break;
-                default:
-                    GGML_ASSERT(false && "unknown sampler type");
-            }
+    if (qwen36_final) {
+        if (params.has_logit_bias()) {
+            throw std::runtime_error("Qwen3.6 RDNA3 final mode currently requires the backend greedy sampler and does not support logit bias");
         }
-        if (use_adaptive_p) {
-            // only if user explicitly included adaptive-p sampler
-            samplers.push_back(llama_sampler_init_adaptive_p(params.adaptive_target, params.adaptive_decay, params.seed));
-        } else {
-            // default: sample from distribution
-            samplers.push_back(llama_sampler_init_dist(params.seed));
+        if (params.mirostat != 0) {
+            throw std::runtime_error("Qwen3.6 RDNA3 final mode currently requires the backend greedy sampler and does not support mirostat");
         }
-    } else if (params.mirostat == 1) {
-        samplers.push_back(llama_sampler_init_temp(params.temp));
-        samplers.push_back(llama_sampler_init_mirostat(llama_vocab_n_tokens(vocab), params.seed, params.mirostat_tau, params.mirostat_eta, 100));
-    } else if (params.mirostat == 2) {
-        samplers.push_back(llama_sampler_init_temp(params.temp));
-        samplers.push_back(llama_sampler_init_mirostat_v2(params.seed, params.mirostat_tau, params.mirostat_eta));
+        samplers.push_back(llama_sampler_init_greedy());
     } else {
-        GGML_ASSERT(false && "unknown mirostat version");
+        if (params.has_logit_bias()) {
+            samplers.push_back(llama_sampler_init_logit_bias(llama_vocab_n_tokens(vocab), params.logit_bias.size(), params.logit_bias.data()));
+        }
+
+        if (params.mirostat == 0) {
+
+            bool use_adaptive_p = false; // see below
+
+            for (const auto & cnstr : params.samplers) {
+                switch (cnstr) {
+                    case COMMON_SAMPLER_TYPE_DRY:
+                        {
+                            std::vector<const char *> c_breakers;
+                            c_breakers.reserve(params.dry_sequence_breakers.size());
+                            for (const auto & str : params.dry_sequence_breakers) {
+                                c_breakers.push_back(str.c_str());
+                            }
+                            samplers.push_back(llama_sampler_init_dry(vocab, llama_model_n_ctx_train(model), params.dry_multiplier, params.dry_base, params.dry_allowed_length, params.dry_penalty_last_n, c_breakers.data(), c_breakers.size()));
+                        }
+                        break;
+                    case COMMON_SAMPLER_TYPE_TOP_K:
+                        samplers.push_back(llama_sampler_init_top_k(params.top_k));
+                        break;
+                    case COMMON_SAMPLER_TYPE_TOP_P:
+                        samplers.push_back(llama_sampler_init_top_p(params.top_p, params.min_keep));
+                        break;
+                    case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+                        samplers.push_back(llama_sampler_init_top_n_sigma(params.top_n_sigma));
+                        break;
+                    case COMMON_SAMPLER_TYPE_MIN_P:
+                        samplers.push_back(llama_sampler_init_min_p(params.min_p, params.min_keep));
+                        break;
+                    case COMMON_SAMPLER_TYPE_XTC:
+                        samplers.push_back(llama_sampler_init_xtc(params.xtc_probability, params.xtc_threshold, params.min_keep, params.seed));
+                        break;
+                    case COMMON_SAMPLER_TYPE_TYPICAL_P:
+                        samplers.push_back(llama_sampler_init_typical(params.typ_p, params.min_keep));
+                        break;
+                    case COMMON_SAMPLER_TYPE_TEMPERATURE:
+                        samplers.push_back(llama_sampler_init_temp_ext(params.temp, params.dynatemp_range, params.dynatemp_exponent));
+                        break;
+                    case COMMON_SAMPLER_TYPE_INFILL:
+                        samplers.push_back(llama_sampler_init_infill(vocab));
+                        break;
+                    case COMMON_SAMPLER_TYPE_PENALTIES:
+                        samplers.push_back(llama_sampler_init_penalties(params.penalty_last_n, params.penalty_repeat, params.penalty_freq, params.penalty_present));
+                        break;
+                    case COMMON_SAMPLER_TYPE_ADAPTIVE_P:
+                        // the `adaptive-p` sampler is like `dist` and `mirostat` in that it selects
+                        // a single token, so we will add `dist` at the end of the chain by default,
+                        // unless the user specifically included `adaptive-p`. we set this flag here
+                        // so we know to add the sampler at the very end.
+                        use_adaptive_p = true;
+                        break;
+                    default:
+                        GGML_ASSERT(false && "unknown sampler type");
+                }
+            }
+            if (use_adaptive_p) {
+                // only if user explicitly included adaptive-p sampler
+                samplers.push_back(llama_sampler_init_adaptive_p(params.adaptive_target, params.adaptive_decay, params.seed));
+            } else {
+                // default: sample from distribution
+                samplers.push_back(llama_sampler_init_dist(params.seed));
+            }
+        } else if (params.mirostat == 1) {
+            samplers.push_back(llama_sampler_init_temp(params.temp));
+            samplers.push_back(llama_sampler_init_mirostat(llama_vocab_n_tokens(vocab), params.seed, params.mirostat_tau, params.mirostat_eta, 100));
+        } else if (params.mirostat == 2) {
+            samplers.push_back(llama_sampler_init_temp(params.temp));
+            samplers.push_back(llama_sampler_init_mirostat_v2(params.seed, params.mirostat_tau, params.mirostat_eta));
+        } else {
+            GGML_ASSERT(false && "unknown mirostat version");
+        }
     }
 
     for (auto * smpl : samplers) {
