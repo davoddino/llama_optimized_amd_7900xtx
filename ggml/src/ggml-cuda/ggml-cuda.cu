@@ -7557,7 +7557,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     const bool qwen36_mega_decode = ggml_cuda_rdna3_qwen36_mega_decode_enabled(cuda_ctx->device);
     const bool qwen36_mega_required = ggml_cuda_rdna3_qwen36_mega_decode_required(cuda_ctx->device);
     const bool qwen36_mega_require_graph = ggml_cuda_rdna3_qwen36_mega_graph_required(cuda_ctx->device);
-    const bool qwen36_superlayer = ggml_cuda_rdna3_qwen36_superlayer_enabled(cuda_ctx->device);
+    const bool qwen36_superlayer_runtime =
+        ggml_cuda_rdna3_qwen36_superlayer_runtime_enabled(cuda_ctx->device);
     const bool qwen36_one_layer_mega = ggml_cuda_rdna3_qwen36_one_layer_mega_enabled(cuda_ctx->device);
     const bool qwen36_one_layer_mega_required =
         ggml_cuda_rdna3_qwen36_one_layer_mega_required(cuda_ctx->device);
@@ -7617,7 +7618,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
     }
 
-    if (qwen36_superlayer) {
+    if (qwen36_superlayer_runtime) {
         bool superlayer_has_decode_out = false;
         bool superlayer_decode_candidate = false;
         int64_t superlayer_l0_tokens = -1;

@@ -169,6 +169,7 @@ struct qwen36_superlayer_l0_norm_desc {
 
 struct qwen36_superlayer_l0_qkv_desc {
     float * qkv_out = nullptr;
+    float * qkv_named_out = nullptr;
     uint64_t wqkv_offset = 0;
     uint64_t qkv_scale_offset = 0;
     uint64_t qkv_scratch_offset = 0;
@@ -977,7 +978,8 @@ static bool qwen36_superlayer_make_l0_qkv_desc(
         }
         return false;
     }
-    if (qkv_out == nullptr || qkv_out->type != GGML_TYPE_F32 || qkv_math->type != GGML_TYPE_F32) {
+    if (qkv_out == nullptr || qkv_out->type != GGML_TYPE_F32 ||
+            qkv_named->type != GGML_TYPE_F32 || qkv_math->type != GGML_TYPE_F32) {
         if (blocker != nullptr) {
             *blocker = "L0 QKV fusion currently requires F32 QKV output tensors";
         }
@@ -1009,13 +1011,22 @@ static bool qwen36_superlayer_make_l0_qkv_desc(
         }
         return false;
     }
-    if (qkv_out->nb[0] != (int64_t) sizeof(float) || ggml_nelements(qkv_out) != qkv_math->ne[0]) {
+    if (qkv_out->nb[0] != (int64_t) sizeof(float) ||
+            qkv_named->nb[0] != (int64_t) sizeof(float) ||
+            !ggml_is_contiguous_1(qkv_out) ||
+            !ggml_is_contiguous_1(qkv_named) ||
+            ggml_nelements(qkv_out) != qkv_math->ne[0] ||
+            ggml_nelements(qkv_named) != qkv_math->ne[0]) {
         if (blocker != nullptr) {
             *blocker = "L0 QKV fusion requires dense one-token QKV output";
         }
         return false;
     }
     if (!qwen36_superlayer_tensor_data_on_device(qkv_out, device, "L0 QKV output", blocker)) {
+        return false;
+    }
+    if (qkv_named != qkv_out &&
+            !qwen36_superlayer_tensor_data_on_device(qkv_named, device, "L0 QKV named output", blocker)) {
         return false;
     }
 
@@ -1064,6 +1075,8 @@ static bool qwen36_superlayer_make_l0_qkv_desc(
     }
 
     desc->qkv_out = (float *) qkv_out->data;
+    desc->qkv_named_out = qkv_named != qkv_out && qkv_named->data != qkv_out->data ?
+        (float *) qkv_named->data : nullptr;
     desc->wqkv_offset = wqkv_offset;
     desc->qkv_scale_offset = qkv_scale_offset;
     desc->qkv_scratch_offset = qkv_scratch_offset;
@@ -2547,6 +2560,9 @@ __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_qkv(
             if (desc->qkv_out != nullptr) {
                 desc->qkv_out[row] = v;
             }
+            if (desc->qkv_named_out != nullptr) {
+                desc->qkv_named_out[row] = v;
+            }
         }
         __syncthreads();
     }
@@ -2792,6 +2808,11 @@ static bool qwen36_superlayer_run_l0_math_enabled() {
         qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0", 0) != 0;
 }
 
+static bool qwen36_superlayer_contract_kernel_enabled() {
+    return qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_CONTRACT") ||
+        qwen36_superlayer_run_l0_math_enabled();
+}
+
 } // namespace
 
 bool ggml_cuda_rdna3_qwen36_superlayer_enabled(const int device) {
@@ -2802,6 +2823,12 @@ bool ggml_cuda_rdna3_qwen36_superlayer_enabled(const int device) {
 bool ggml_cuda_rdna3_qwen36_superlayer_required(const int device) {
     return ggml_cuda_rdna3_qwen36_superlayer_enabled(device) &&
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REQUIRED");
+}
+
+bool ggml_cuda_rdna3_qwen36_superlayer_runtime_enabled(const int device) {
+    return ggml_cuda_rdna3_qwen36_superlayer_enabled(device) &&
+        qwen36_superlayer_contract_dispatch_enabled() &&
+        qwen36_superlayer_contract_kernel_enabled();
 }
 
 bool ggml_cuda_rdna3_qwen36_superlayer_replace_l0_enabled(const int device) {
@@ -2852,7 +2879,6 @@ bool ggml_cuda_rdna3_qwen36_superlayer_prepare(
         }
         return false;
     }
-    qwen36_superlayer_device_pack_view device_pack;
 
     static std::mutex prepared_mutex;
     static std::unordered_set<uint64_t> prepared_fingerprints;
@@ -2872,10 +2898,6 @@ bool ggml_cuda_rdna3_qwen36_superlayer_prepare(
         prepared_fingerprints.insert(plan.fingerprint);
     }
 
-    if (!qwen36_superlayer_materialize_device_pack(cuda_ctx, cgraph, plan, runtime_pack, &device_pack, blocker)) {
-        return false;
-    }
-
     bool should_report = false;
     {
         std::lock_guard<std::mutex> lock(prepared_mutex);
@@ -2888,14 +2910,13 @@ bool ggml_cuda_rdna3_qwen36_superlayer_prepare(
                 " layers=40 fattn=%d gdn=%d topk=%d moe_gate_up=%d moe_down=%d mmid=%d"
                 " artifact_weightpack_tensors=%zu artifact_weightpack_bytes=%zu"
                 " runtime_weightpack_tensors=%zu runtime_bindings=%zu runtime_weightpack_bytes=%zu"
-                " device_pack=%p scratch=%p scratch_bytes=%zu"
-                " state=device-pack-ready\n",
+                " runtime_scratch_bytes=%zu"
+                " state=artifact-ready\n",
                 hex_u64(plan.fingerprint).c_str(), plan.artifact_dir.string().c_str(), plan.n_nodes,
                 plan.n_fattn, plan.n_gdn, plan.n_topk_moe, plan.n_moe_gate_up, plan.n_moe_down, plan.n_mmid,
                 artifact_pack.refs.size(), artifact_pack.total_bytes,
                 runtime_pack.refs.size(), bindings.refs.size(), runtime_pack.total_bytes,
-                device_pack.data, device_pack.scratch,
-                device_pack.runtime.scratch_bytes);
+                runtime.scratch_bytes);
     }
 
     return true;
@@ -2906,6 +2927,16 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
         const ggml_cgraph * cgraph,
         std::string * blocker) {
     if (!qwen36_superlayer_contract_dispatch_enabled()) {
+        return true;
+    }
+    if (!qwen36_superlayer_contract_kernel_enabled()) {
+        static std::atomic<int64_t> skipped_reports{0};
+        const int64_t report_id = skipped_reports.fetch_add(1, std::memory_order_relaxed);
+        if (report_id < 4) {
+            GGML_LOG_INFO(
+                    "rdna3_qwen36_superlayer: contract-kernel-skipped"
+                    " reason=no per-token superlayer work enabled l0_math=0 replace_l0=0\n");
+        }
         return true;
     }
     if (!ggml_cuda_info().devices[cuda_ctx->device].supports_cooperative_launch) {
