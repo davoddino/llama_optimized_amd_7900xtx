@@ -138,6 +138,31 @@ static bool ggml_cuda_rdna3_qwen36_superlayer_trace_enabled() {
     return ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_TRACE");
 }
 
+static bool ggml_cuda_rdna3_qwen36_superlayer_l0_env_requested() {
+    return ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_RUN_L0") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_RMS") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_QKV") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_Z") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_Z_MATH_ONLY") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_BETA") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_ALPHA");
+}
+
+static bool ggml_cuda_rdna3_qwen36_superlayer_requested_effective() {
+    return ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REQUIRED") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_CONTRACT") ||
+        ggml_cuda_rdna3_qwen36_superlayer_l0_env_requested();
+}
+
+static bool ggml_cuda_rdna3_qwen36_superlayer_dispatch_effective() {
+    return ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DISPATCH") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_SMOKE") ||
+        ggml_cuda_rdna3_qwen36_superlayer_requested_effective();
+}
+
 struct ggml_cuda_rdna3_op_profile_record {
     int64_t calls = 0;
     double  total_ms = 0.0;
@@ -704,13 +729,16 @@ static ggml_cuda_device_info ggml_cuda_init() {
     if (ggml_cuda_rdna3_qwen36_superlayer_env_present()) {
         GGML_LOG_INFO(
                 "rdna3_qwen36_superlayer: init-env graph_log=%d trace=%d superlayer=%d required=%d"
-                " dispatch=%d contract=%d run_l0=%d replace_l0=%d rms=%d qkv=%d proj=%d"
+                " dispatch=%d requested_effective=%d dispatch_effective=%d"
+                " contract=%d run_l0=%d replace_l0=%d rms=%d qkv=%d proj=%d"
                 " proj_z=%d proj_z_math_only=%d proj_beta=%d proj_alpha=%d direct_l0_proj_weights=%d\n",
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_GRAPH_LOG") ? 1 : 0,
                 ggml_cuda_rdna3_qwen36_superlayer_trace_enabled() ? 1 : 0,
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER") ? 1 : 0,
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REQUIRED") ? 1 : 0,
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DISPATCH") ? 1 : 0,
+                ggml_cuda_rdna3_qwen36_superlayer_requested_effective() ? 1 : 0,
+                ggml_cuda_rdna3_qwen36_superlayer_dispatch_effective() ? 1 : 0,
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_CONTRACT") ? 1 : 0,
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_RUN_L0") ? 1 : 0,
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0") ? 1 : 0,
