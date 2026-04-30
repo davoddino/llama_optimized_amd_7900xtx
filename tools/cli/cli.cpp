@@ -92,7 +92,7 @@ struct cli_context {
 
             // chat template settings
             task.params.chat_parser_params = common_chat_parser_params(chat_params);
-            task.params.chat_parser_params.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+            task.params.chat_parser_params.reasoning_format = chat_params.reasoning_format;
             if (!chat_params.parser.empty()) {
                 task.params.chat_parser_params.parser.load(chat_params.parser);
             }
@@ -214,7 +214,7 @@ struct cli_context {
         inputs.use_jinja             = chat_params.use_jinja;
         inputs.parallel_tool_calls   = caps["supports_parallel_tool_calls"];
         inputs.add_generation_prompt = true;
-        inputs.reasoning_format      = COMMON_REASONING_FORMAT_DEEPSEEK;
+        inputs.reasoning_format      = chat_params.reasoning_format;
         inputs.force_pure_content    = chat_params.force_pure_content;
         inputs.enable_thinking       = chat_params.enable_thinking ? common_chat_templates_support_enable_thinking(chat_params.tmpls.get()) : false;
 

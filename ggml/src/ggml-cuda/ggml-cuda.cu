@@ -1213,6 +1213,11 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
+    // The MMVQ Q8 cache owns pool allocations. Release them before the pools
+    // themselves are destroyed, otherwise the legacy pool teardown sees live
+    // allocations and trips its pool_size assertion.
+    mmvq_q8_cache.clear();
+
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
