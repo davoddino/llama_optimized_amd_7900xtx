@@ -315,12 +315,16 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
 
     if (qwen36_final) {
         if (params.has_logit_bias()) {
-            throw std::runtime_error("Qwen3.6 RDNA3 final mode currently requires the backend greedy sampler and does not support logit bias");
+            throw std::runtime_error("Qwen3.6 RDNA3 final mode currently requires a fully backend sampler chain and does not support logit bias");
         }
         if (params.mirostat != 0) {
-            throw std::runtime_error("Qwen3.6 RDNA3 final mode currently requires the backend greedy sampler and does not support mirostat");
+            throw std::runtime_error("Qwen3.6 RDNA3 final mode currently requires a fully backend sampler chain and does not support mirostat");
         }
-        samplers.push_back(llama_sampler_init_greedy());
+
+        const int32_t final_top_k = params.top_k <= 0 ? 32 : std::min<int32_t>(params.top_k, 32);
+        samplers.push_back(llama_sampler_init_top_k(final_top_k));
+        samplers.push_back(llama_sampler_init_temp_ext(params.temp, params.dynatemp_range, params.dynatemp_exponent));
+        samplers.push_back(llama_sampler_init_dist(params.seed));
     } else {
         if (params.has_logit_bias()) {
             samplers.push_back(llama_sampler_init_logit_bias(llama_vocab_n_tokens(vocab), params.logit_bias.size(), params.logit_bias.data()));

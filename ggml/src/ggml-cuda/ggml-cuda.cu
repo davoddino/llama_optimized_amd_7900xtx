@@ -146,7 +146,9 @@ static bool ggml_cuda_rdna3_qwen36_superlayer_final_requested() {
 }
 
 static bool ggml_cuda_rdna3_qwen36_superlayer_final_physical_l0_requested() {
-    return ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_FINAL_PHYSICAL_L0");
+    return ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_FINAL_PHYSICAL_L0") ||
+        (ggml_cuda_rdna3_qwen36_superlayer_final_requested() &&
+         !ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_FINAL_NO_PHYSICAL_L0"));
 }
 
 static bool ggml_cuda_rdna3_qwen36_superlayer_l0_env_requested() {
@@ -6744,7 +6746,7 @@ static void ggml_cuda_graph_evaluate_and_capture(
         const bool use_cuda_graph,
         const bool cuda_graph_update_required,
         const void * graph_key,
-        const ggml_cuda_rdna3_qwen36_one_layer_mega_plan * one_layer_plan,
+        const std::vector<ggml_cuda_rdna3_qwen36_one_layer_mega_plan> * one_layer_plans,
         const ggml_cuda_rdna3_qwen36_one_layer_mega_plan * superlayer_l0_plan) {
     bool graph_evaluated_or_captured = false;
 
@@ -6844,8 +6846,10 @@ static void ggml_cuda_graph_evaluate_and_capture(
                 stream_ctx.concurrent_events.clear();
             }
 
-            bool qwen36_one_layer_qkv_launched = false;
-            bool qwen36_one_layer_projection_bundle_launched = false;
+            std::vector<bool> qwen36_one_layer_qkv_launched(
+                    one_layer_plans != nullptr ? one_layer_plans->size() : 0, false);
+            std::vector<bool> qwen36_one_layer_projection_bundle_launched(
+                    one_layer_plans != nullptr ? one_layer_plans->size() : 0, false);
             bool qwen36_superlayer_l0_rms_qkv_launched = false;
             bool qwen36_superlayer_l0_qkv_late_launched = false;
             bool qwen36_superlayer_l0_projection_launched = false;
@@ -6981,27 +6985,45 @@ static void ggml_cuda_graph_evaluate_and_capture(
                        i == superlayer_l0_plan->alpha_biased ||
                        i == superlayer_l0_plan->alpha_softplus ||
                        i == superlayer_l0_plan->alpha_gate)));
-                const bool qwen36_one_layer_qkv_hit =
-                    one_layer_plan != nullptr &&
-                    i == one_layer_plan->rms;
-                const bool qwen36_one_layer_qkv_skip =
-                    qwen36_one_layer_qkv_launched &&
-                    one_layer_plan != nullptr &&
-                    (i == one_layer_plan->attn_norm ||
-                     i == one_layer_plan->qkv_math ||
-                     i == one_layer_plan->qkv_out ||
-                     i == one_layer_plan->qkv ||
-                     (qwen36_one_layer_projection_bundle_launched &&
-                      (i == one_layer_plan->z ||
-                       i == one_layer_plan->z_math ||
-                       i == one_layer_plan->beta ||
-                       i == one_layer_plan->beta_math ||
-                       i == one_layer_plan->beta_sigmoid ||
-                       i == one_layer_plan->alpha ||
-                       i == one_layer_plan->alpha_math ||
-                       i == one_layer_plan->alpha_biased ||
-                       i == one_layer_plan->alpha_softplus ||
-                       i == one_layer_plan->alpha_gate)));
+                int qwen36_one_layer_qkv_hit_idx = -1;
+                int qwen36_one_layer_qkv_skip_idx = -1;
+                if (one_layer_plans != nullptr) {
+                    for (int ip = 0; ip < (int) one_layer_plans->size(); ++ip) {
+                        const auto & plan = (*one_layer_plans)[ip];
+                        if (i == plan.rms) {
+                            qwen36_one_layer_qkv_hit_idx = ip;
+                            break;
+                        }
+                    }
+                    for (int ip = 0; ip < (int) one_layer_plans->size(); ++ip) {
+                        if (!qwen36_one_layer_qkv_launched[ip]) {
+                            continue;
+                        }
+                        const auto & plan = (*one_layer_plans)[ip];
+                        const bool projection_bundle_launched =
+                            qwen36_one_layer_projection_bundle_launched[ip];
+                        if (i == plan.attn_norm ||
+                                i == plan.qkv_math ||
+                                i == plan.qkv_out ||
+                                i == plan.qkv ||
+                                (projection_bundle_launched &&
+                                 (i == plan.z ||
+                                  i == plan.z_math ||
+                                  i == plan.beta ||
+                                  i == plan.beta_math ||
+                                  i == plan.beta_sigmoid ||
+                                  i == plan.alpha ||
+                                  i == plan.alpha_math ||
+                                  i == plan.alpha_biased ||
+                                  i == plan.alpha_softplus ||
+                                  i == plan.alpha_gate))) {
+                            qwen36_one_layer_qkv_skip_idx = ip;
+                            break;
+                        }
+                    }
+                }
+                const bool qwen36_one_layer_qkv_hit = qwen36_one_layer_qkv_hit_idx >= 0;
+                const bool qwen36_one_layer_qkv_skip = qwen36_one_layer_qkv_skip_idx >= 0;
 
                 if (qwen36_superlayer_l0_skip) {
                     prev_i = i;
@@ -7010,14 +7032,18 @@ static void ggml_cuda_graph_evaluate_and_capture(
 
                 if (qwen36_one_layer_qkv_hit) {
                     std::string qkv_blocker;
+                    bool projection_bundle_launched = false;
+                    const auto & plan = (*one_layer_plans)[qwen36_one_layer_qkv_hit_idx];
                     const bool qkv_ok = ggml_cuda_rdna3_qwen36_one_layer_mega_launch(
-                            cuda_ctx, cgraph, *one_layer_plan, &qkv_blocker,
-                            &qwen36_one_layer_projection_bundle_launched);
+                            cuda_ctx, cgraph, plan, &qkv_blocker,
+                            &projection_bundle_launched);
                     if (!qkv_ok) {
                         GGML_ABORT("%s: Qwen3.6 RDNA3 one-layer QKV mega failed: %s",
                                 __func__, qkv_blocker.c_str());
                     }
-                    qwen36_one_layer_qkv_launched = true;
+                    qwen36_one_layer_qkv_launched[qwen36_one_layer_qkv_hit_idx] = true;
+                    qwen36_one_layer_projection_bundle_launched[qwen36_one_layer_qkv_hit_idx] =
+                        projection_bundle_launched;
                     prev_i = i;
                     continue;
                 }
@@ -7863,7 +7889,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     const bool qwen36_one_layer_mega = ggml_cuda_rdna3_qwen36_one_layer_mega_enabled(cuda_ctx->device);
     const bool qwen36_one_layer_mega_required =
         ggml_cuda_rdna3_qwen36_one_layer_mega_required(cuda_ctx->device);
-    ggml_cuda_rdna3_qwen36_one_layer_mega_plan qwen36_one_layer_plan;
+    std::vector<ggml_cuda_rdna3_qwen36_one_layer_mega_plan> qwen36_one_layer_plans;
     bool qwen36_one_layer_mega_ready = false;
     ggml_cuda_rdna3_qwen36_one_layer_mega_plan qwen36_superlayer_l0_plan;
     bool qwen36_superlayer_l0_replace_ready = false;
@@ -7930,12 +7956,40 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
 
         if (qwen36_one_layer_mega && qwen36_mega_contract_this_eval) {
-            const int one_layer = ggml_cuda_rdna3_qwen36_one_layer_mega_layer();
-            qwen36_one_layer_plan =
-                ggml_cuda_rdna3_qwen36_one_layer_mega_make_plan(cgraph, cuda_ctx->device, one_layer);
-            const bool one_layer_ok =
-                ggml_cuda_rdna3_qwen36_one_layer_mega_plan_ok(qwen36_one_layer_plan);
-            qwen36_one_layer_mega_ready = one_layer_ok;
+            const bool final_all_layers =
+                ggml_cuda_rdna3_qwen36_superlayer_final_physical_l0_requested() &&
+                !ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_MEGA") &&
+                getenv("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_MEGA_LAYER") == nullptr;
+            const int first_layer = final_all_layers ? 0 : ggml_cuda_rdna3_qwen36_one_layer_mega_layer();
+            const int n_layers    = final_all_layers ? 40 : 1;
+            int ready_layers = 0;
+            int first_blocked_layer = -1;
+            std::string first_blocker = "none";
+            ggml_cuda_rdna3_qwen36_one_layer_mega_plan single_report_plan;
+            bool single_report_plan_ok = false;
+
+            qwen36_one_layer_plans.reserve(n_layers);
+            for (int il = 0; il < n_layers; ++il) {
+                const int layer = first_layer + il;
+                ggml_cuda_rdna3_qwen36_one_layer_mega_plan plan =
+                    ggml_cuda_rdna3_qwen36_one_layer_mega_make_plan(cgraph, cuda_ctx->device, layer);
+                const bool plan_ok = ggml_cuda_rdna3_qwen36_one_layer_mega_plan_ok(plan);
+
+                if (!final_all_layers) {
+                    single_report_plan = plan;
+                    single_report_plan_ok = plan_ok;
+                }
+
+                if (plan_ok) {
+                    qwen36_one_layer_plans.push_back(plan);
+                    ++ready_layers;
+                } else if (first_blocked_layer < 0) {
+                    first_blocked_layer = layer;
+                    first_blocker = plan.blocker.empty() ? "unknown" : plan.blocker;
+                }
+            }
+
+            qwen36_one_layer_mega_ready = !qwen36_one_layer_plans.empty();
 
             static std::atomic<int64_t> one_layer_report_count{0};
             static std::atomic<uint64_t> one_layer_report_uid{0};
@@ -7945,15 +7999,27 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 one_layer_report_uid.exchange(cgraph->uid, std::memory_order_relaxed);
             const bool one_layer_uid_change = one_layer_prev_uid != cgraph->uid;
 
-            if (rdna3_graph_log || !one_layer_ok || one_layer_report_id < 4 || one_layer_uid_change) {
+            if (final_all_layers) {
+                if (rdna3_graph_log || ready_layers != n_layers ||
+                        one_layer_report_id < 4 || one_layer_uid_change) {
+                    GGML_LOG_INFO(
+                            "rdna3_qwen36_one_layer_mega: uid=%" PRIu64
+                            " mode=final-all-layers ready=%d/%d first_layer=%d"
+                            " first_blocked_layer=%d blocker=%s\n",
+                            cgraph->uid, ready_layers, n_layers, first_layer,
+                            first_blocked_layer,
+                            first_blocker.c_str());
+                }
+            } else if (rdna3_graph_log || !single_report_plan_ok ||
+                    one_layer_report_id < 4 || one_layer_uid_change) {
                 ggml_cuda_rdna3_qwen36_one_layer_mega_report(
-                        qwen36_one_layer_plan, cgraph->uid, one_layer_ok);
+                        single_report_plan, cgraph->uid, single_report_plan_ok);
             }
 
-            if (qwen36_one_layer_mega_required && !one_layer_ok) {
+            if (qwen36_one_layer_mega_required && ready_layers != n_layers) {
                 GGML_ABORT("%s: Qwen3.6 RDNA3 one-layer mega is required but layer %d cannot enter"
                         " the one-layer contract: %s",
-                        __func__, one_layer, qwen36_one_layer_plan.blocker.c_str());
+                        __func__, first_blocked_layer, first_blocker.c_str());
             }
         }
     }
@@ -8191,7 +8257,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         qwen36_mega_required && qwen36_mega_contract_this_eval;
     ggml_cuda_graph_evaluate_and_capture(
             cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key,
-            qwen36_one_layer_mega_ready ? &qwen36_one_layer_plan : nullptr,
+            qwen36_one_layer_mega_ready ? &qwen36_one_layer_plans : nullptr,
             qwen36_superlayer_l0_replace_ready ? &qwen36_superlayer_l0_plan : nullptr);
     ggml_cuda_rdna3_qwen36_mega_decode_contract_current = false;
 
