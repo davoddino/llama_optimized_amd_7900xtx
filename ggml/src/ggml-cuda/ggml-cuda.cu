@@ -7739,8 +7739,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (qwen36_superlayer_enabled) {
         static std::atomic<int64_t> superlayer_probe_reports{0};
         const int64_t probe_report_id = superlayer_probe_reports.fetch_add(1, std::memory_order_relaxed);
-        if (ggml_cuda_rdna3_qwen36_superlayer_trace_enabled() ||
-                probe_report_id < 4 || !qwen36_superlayer_runtime) {
+        (void) probe_report_id;
+        if (ggml_cuda_rdna3_qwen36_superlayer_trace_enabled() || !qwen36_superlayer_runtime) {
             fprintf(stderr,
                     "rdna3_qwen36_superlayer: graph-probe enabled=%d runtime=%d required=%d"
                     " decode_candidate=%d has_decode_out=%d decode_out=%s l0_tokens=%" PRId64

@@ -203,6 +203,9 @@ struct qwen36_superlayer_l0_proj_desc {
     uint64_t walpha_offset = 0;
     uint64_t alpha_dt_offset = 0;
     uint64_t alpha_a_offset = 0;
+    uint64_t z_scale_offset = 0;
+    uint64_t beta_scale_offset = 0;
+    uint64_t alpha_scale_offset = 0;
     uint64_t z_scratch_offset = 0;
     uint64_t beta_scratch_offset = 0;
     uint64_t alpha_scratch_offset = 0;
@@ -216,6 +219,12 @@ struct qwen36_superlayer_l0_proj_desc {
     int32_t wz_type = GGML_TYPE_COUNT;
     int32_t wbeta_type = GGML_TYPE_COUNT;
     int32_t walpha_type = GGML_TYPE_COUNT;
+    uint32_t z_scale_n = 0;
+    uint32_t beta_scale_n = 0;
+    uint32_t alpha_scale_n = 0;
+    uint32_t has_z_scale = 0;
+    uint32_t has_beta_scale = 0;
+    uint32_t has_alpha_scale = 0;
     uint32_t ready = 0;
 };
 
@@ -1112,14 +1121,26 @@ static bool qwen36_superlayer_make_l0_qkv_desc(
     return true;
 }
 
-static const ggml_tensor * qwen36_superlayer_resolve_mul_mat(const ggml_tensor * node) {
+static const ggml_tensor * qwen36_superlayer_resolve_mul_mat_with_scale(
+        const ggml_tensor * node,
+        const ggml_tensor ** scale) {
+    if (scale != nullptr) {
+        *scale = nullptr;
+    }
+
     const ggml_tensor * out = qwen36_superlayer_strip_view_ops(node);
     const ggml_tensor * mm = out;
     if (out != nullptr && out->op == GGML_OP_MUL) {
         if (out->src[0] != nullptr && out->src[0]->op == GGML_OP_MUL_MAT) {
             mm = out->src[0];
+            if (scale != nullptr) {
+                *scale = out->src[1];
+            }
         } else if (out->src[1] != nullptr && out->src[1]->op == GGML_OP_MUL_MAT) {
             mm = out->src[1];
+            if (scale != nullptr) {
+                *scale = out->src[0];
+            }
         }
     }
     return mm != nullptr && mm->op == GGML_OP_MUL_MAT ? mm : nullptr;
@@ -1193,7 +1214,10 @@ static bool qwen36_superlayer_make_l0_proj_desc(
         return false;
     }
 
-    const ggml_tensor * z_math = qwen36_superlayer_resolve_mul_mat(z);
+    const ggml_tensor * z_scale = nullptr;
+    const ggml_tensor * beta_scale = nullptr;
+    const ggml_tensor * alpha_scale = nullptr;
+    const ggml_tensor * z_math = qwen36_superlayer_resolve_mul_mat_with_scale(z, &z_scale);
     const ggml_tensor * beta_math = nullptr;
     if (beta_sigmoid->op == GGML_OP_UNARY && ggml_get_unary_op(beta_sigmoid) == GGML_UNARY_OP_SIGMOID) {
         if (!qwen36_superlayer_same_tensor_or_view(beta_sigmoid->src[0], beta)) {
@@ -1202,9 +1226,9 @@ static bool qwen36_superlayer_make_l0_proj_desc(
             }
             return false;
         }
-        beta_math = qwen36_superlayer_resolve_mul_mat(beta);
+        beta_math = qwen36_superlayer_resolve_mul_mat_with_scale(beta, &beta_scale);
     }
-    const ggml_tensor * alpha_math = qwen36_superlayer_resolve_mul_mat(alpha);
+    const ggml_tensor * alpha_math = qwen36_superlayer_resolve_mul_mat_with_scale(alpha, &alpha_scale);
     if (z_math == nullptr || beta_math == nullptr || alpha_math == nullptr ||
             z_math->src[0] == nullptr || beta_math->src[0] == nullptr || alpha_math->src[0] == nullptr) {
         if (blocker != nullptr) {
@@ -1290,6 +1314,9 @@ static bool qwen36_superlayer_make_l0_proj_desc(
             alpha_biased->type != GGML_TYPE_F32 || alpha_softplus->type != GGML_TYPE_F32 ||
             alpha_gate->type != GGML_TYPE_F32 || alpha_dt == nullptr || alpha_a == nullptr ||
             alpha_dt->type != GGML_TYPE_F32 || alpha_a->type != GGML_TYPE_F32 ||
+            (z_scale != nullptr && z_scale->type != GGML_TYPE_F32) ||
+            (beta_scale != nullptr && beta_scale->type != GGML_TYPE_F32) ||
+            (alpha_scale != nullptr && alpha_scale->type != GGML_TYPE_F32) ||
             z->nb[0] != (int64_t) sizeof(float) ||
             z_math->nb[0] != (int64_t) sizeof(float) ||
             beta->nb[0] != (int64_t) sizeof(float) ||
@@ -1302,6 +1329,9 @@ static bool qwen36_superlayer_make_l0_proj_desc(
             alpha_gate->nb[0] != (int64_t) sizeof(float) ||
             alpha_dt->nb[0] != (int64_t) sizeof(float) ||
             alpha_a->nb[0] != (int64_t) sizeof(float) ||
+            (z_scale != nullptr && z_scale->nb[0] != (int64_t) sizeof(float)) ||
+            (beta_scale != nullptr && beta_scale->nb[0] != (int64_t) sizeof(float)) ||
+            (alpha_scale != nullptr && alpha_scale->nb[0] != (int64_t) sizeof(float)) ||
             !ggml_is_contiguous_1(z) ||
             !ggml_is_contiguous_1(z_math) ||
             !ggml_is_contiguous_1(beta) ||
@@ -1311,7 +1341,10 @@ static bool qwen36_superlayer_make_l0_proj_desc(
             !ggml_is_contiguous_1(alpha_math) ||
             !ggml_is_contiguous_1(alpha_biased) ||
             !ggml_is_contiguous_1(alpha_softplus) ||
-            !ggml_is_contiguous_1(alpha_gate)) {
+            !ggml_is_contiguous_1(alpha_gate) ||
+            (z_scale != nullptr && !ggml_is_contiguous_1(z_scale)) ||
+            (beta_scale != nullptr && !ggml_is_contiguous_1(beta_scale)) ||
+            (alpha_scale != nullptr && !ggml_is_contiguous_1(alpha_scale))) {
         if (blocker != nullptr) {
             *blocker = "L0 projection fusion requires dense F32 projection outputs and alpha constants";
         }
@@ -1338,7 +1371,10 @@ static bool qwen36_superlayer_make_l0_proj_desc(
             ggml_nelements(alpha_softplus) != alpha_math->ne[0] ||
             ggml_nelements(alpha_gate) != alpha_math->ne[0] ||
             ggml_nelements(alpha_dt) != ggml_nelements(alpha_gate) ||
-            ggml_nelements(alpha_a) != ggml_nelements(alpha_gate)) {
+            ggml_nelements(alpha_a) != ggml_nelements(alpha_gate) ||
+            (z_scale != nullptr && ggml_nelements(z_scale) != 1 && ggml_nelements(z_scale) != z_math->ne[0]) ||
+            (beta_scale != nullptr && ggml_nelements(beta_scale) != 1 && ggml_nelements(beta_scale) != beta_math->ne[0]) ||
+            (alpha_scale != nullptr && ggml_nelements(alpha_scale) != 1 && ggml_nelements(alpha_scale) != alpha_math->ne[0])) {
         if (blocker != nullptr) {
             *blocker = "L0 projection output/token dimensions do not match";
         }
@@ -1362,11 +1398,26 @@ static bool qwen36_superlayer_make_l0_proj_desc(
     uint64_t walpha_offset = 0;
     uint64_t alpha_dt_offset = 0;
     uint64_t alpha_a_offset = 0;
+    uint64_t z_scale_offset = 0;
+    uint64_t beta_scale_offset = 0;
+    uint64_t alpha_scale_offset = 0;
     if (!qwen36_superlayer_find_pack_offset_named(pack, wz, "L0 z weight", &wz_offset, blocker) ||
             !qwen36_superlayer_find_pack_offset_named(pack, wbeta, "L0 beta weight", &wbeta_offset, blocker) ||
             !qwen36_superlayer_find_pack_offset_named(pack, walpha, "L0 alpha weight", &walpha_offset, blocker) ||
             !qwen36_superlayer_find_pack_offset_named(pack, alpha_dt, "L0 alpha dt", &alpha_dt_offset, blocker) ||
             !qwen36_superlayer_find_pack_offset_named(pack, alpha_a, "L0 alpha gate scale", &alpha_a_offset, blocker)) {
+        return false;
+    }
+    if (z_scale != nullptr &&
+            !qwen36_superlayer_find_pack_offset_named(pack, z_scale, "L0 z post scale", &z_scale_offset, blocker)) {
+        return false;
+    }
+    if (beta_scale != nullptr &&
+            !qwen36_superlayer_find_pack_offset_named(pack, beta_scale, "L0 beta post scale", &beta_scale_offset, blocker)) {
+        return false;
+    }
+    if (alpha_scale != nullptr &&
+            !qwen36_superlayer_find_pack_offset_named(pack, alpha_scale, "L0 alpha post scale", &alpha_scale_offset, blocker)) {
         return false;
     }
 
@@ -1400,6 +1451,9 @@ static bool qwen36_superlayer_make_l0_proj_desc(
     desc->walpha_offset = walpha_offset;
     desc->alpha_dt_offset = alpha_dt_offset;
     desc->alpha_a_offset = alpha_a_offset;
+    desc->z_scale_offset = z_scale_offset;
+    desc->beta_scale_offset = beta_scale_offset;
+    desc->alpha_scale_offset = alpha_scale_offset;
     desc->z_scratch_offset = z_off;
     desc->beta_scratch_offset = beta_off;
     desc->alpha_scratch_offset = alpha_off;
@@ -1413,6 +1467,12 @@ static bool qwen36_superlayer_make_l0_proj_desc(
     desc->wz_type = (int32_t) wz->type;
     desc->wbeta_type = (int32_t) wbeta->type;
     desc->walpha_type = (int32_t) walpha->type;
+    desc->z_scale_n = z_scale != nullptr ? (uint32_t) ggml_nelements(z_scale) : 0u;
+    desc->beta_scale_n = beta_scale != nullptr ? (uint32_t) ggml_nelements(beta_scale) : 0u;
+    desc->alpha_scale_n = alpha_scale != nullptr ? (uint32_t) ggml_nelements(alpha_scale) : 0u;
+    desc->has_z_scale = z_scale != nullptr ? 1u : 0u;
+    desc->has_beta_scale = beta_scale != nullptr ? 1u : 0u;
+    desc->has_alpha_scale = alpha_scale != nullptr ? 1u : 0u;
     desc->ready = 1u;
     return true;
 }
@@ -2669,6 +2729,12 @@ __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_projection_bundle(
     float * alpha = (float *) (scratch + desc->alpha_scratch_offset);
     const float * alpha_dt = (const float *) (weightpack + desc->alpha_dt_offset);
     const float * alpha_a = (const float *) (weightpack + desc->alpha_a_offset);
+    const float * z_scale = desc->has_z_scale != 0 ?
+        (const float *) (weightpack + desc->z_scale_offset) : nullptr;
+    const float * beta_scale = desc->has_beta_scale != 0 ?
+        (const float *) (weightpack + desc->beta_scale_offset) : nullptr;
+    const float * alpha_scale = desc->has_alpha_scale != 0 ?
+        (const float *) (weightpack + desc->alpha_scale_offset) : nullptr;
     (void) sums;
 
     const int lane = threadIdx.x & (WARP_SIZE - 1);
@@ -2708,10 +2774,12 @@ __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_projection_bundle(
         if (lane == 0) {
             local_row = row;
             if (local_row < desc->z_out) {
-                const float v = sum;
+                const float scale = z_scale == nullptr ? 1.0f :
+                    z_scale[desc->z_scale_n == 1 ? 0 : local_row];
+                const float v = sum*scale;
                 z[local_row] = v;
                 if (write_outputs != 0 && desc->z_math_dst != nullptr) {
-                    desc->z_math_dst[local_row] = v;
+                    desc->z_math_dst[local_row] = sum;
                 }
                 if (write_outputs != 0 && desc->z_dst != nullptr) {
                     desc->z_dst[local_row] = v;
@@ -2719,11 +2787,13 @@ __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_projection_bundle(
             } else {
                 local_row -= desc->z_out;
                 if (local_row < desc->beta_out) {
-                    const float raw = sum;
+                    const float scale = beta_scale == nullptr ? 1.0f :
+                        beta_scale[desc->beta_scale_n == 1 ? 0 : local_row];
+                    const float raw = sum*scale;
                     const float v = 1.0f / (1.0f + expf(-raw));
                     beta[local_row] = v;
                     if (write_outputs != 0 && desc->beta_math_dst != nullptr) {
-                        desc->beta_math_dst[local_row] = raw;
+                        desc->beta_math_dst[local_row] = sum;
                     }
                     if (write_outputs != 0 && desc->beta_raw_dst != nullptr) {
                         desc->beta_raw_dst[local_row] = raw;
@@ -2733,13 +2803,15 @@ __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_projection_bundle(
                     }
                 } else {
                     local_row -= desc->beta_out;
-                    const float raw = sum;
+                    const float scale = alpha_scale == nullptr ? 1.0f :
+                        alpha_scale[desc->alpha_scale_n == 1 ? 0 : local_row];
+                    const float raw = sum*scale;
                     const float biased = raw + alpha_dt[local_row];
                     const float softplus = biased > 20.0f ? biased : log1pf(expf(biased));
                     const float v = softplus * alpha_a[local_row];
                     alpha[local_row] = v;
                     if (write_outputs != 0 && desc->alpha_math_dst != nullptr) {
-                        desc->alpha_math_dst[local_row] = raw;
+                        desc->alpha_math_dst[local_row] = sum;
                     }
                     if (write_outputs != 0 && desc->alpha_raw_dst != nullptr) {
                         desc->alpha_raw_dst[local_row] = raw;
@@ -3219,7 +3291,8 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
 
     static std::atomic<int64_t> contract_reports{0};
     const int64_t report_id = contract_reports.fetch_add(1, std::memory_order_relaxed);
-    if (report_id < 8) {
+    (void) report_id;
+    if (ggml_cuda_rdna3_qwen36_superlayer_trace_enabled()) {
         fprintf(stderr,
                 "rdna3_qwen36_superlayer: contract-kernel-launched fingerprint=%s blocks=%d threads=%d"
                 " weightpack_tensors=%zu runtime_bindings=%zu weightpack_bytes=%zu scratch_bytes=%zu"
