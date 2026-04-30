@@ -14,6 +14,11 @@ bool ggml_cuda_rdna3_qwen36_superlayer_prepare(
         const ggml_cgraph * cgraph,
         std::string * blocker);
 
+bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
+        ggml_backend_cuda_context * cuda_ctx,
+        const ggml_cgraph * cgraph,
+        std::string * blocker);
+
 bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_smoke(
         ggml_backend_cuda_context * cuda_ctx,
         const ggml_cgraph * cgraph,

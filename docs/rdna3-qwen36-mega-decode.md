@@ -24,21 +24,27 @@ $XDG_CACHE_HOME/llama.cpp/rdna3-qwen36-superlayer/<fingerprint>/
   layout.generated.h
   fused_model.hip
   weightpack.plan
+  weightpack.generated.h
+  weightpack.layout.json
+  runtime.layout.json
+  runtime-bindings.layout.json
 ```
 
-This artifact is intentionally not a generic layer manifest. The generated source has 40 static fused blocks in the exact graph order, with no runtime layer loop. The current state is a scaffold: it proves the load-time artifact/cache boundary and can optionally launch a single physical smoke dispatch, but it does not replace the decode math yet.
+This artifact is intentionally not a generic layer manifest. The generated source has 40 static fused blocks in the exact graph order, with no runtime layer loop. The current runtime also allocates one device-side weightpack buffer, one persistent runtime scratch buffer, uploads a 40-entry layer descriptor table, uploads runtime tensor bindings for graph inputs/cache/state/output, and copies the packed tensors into deterministic gfx1100 offsets. The generated decode math is still placeholder code and does not replace the normal ggml decode yet.
 
 Optional strict/scaffold controls:
 
 ```bash
 GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REQUIRED=1
-GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_SMOKE=1
+GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DISPATCH=1
 GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_CACHE=/path/to/cache
 GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_BLOCKS=96
 GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_THREADS=256
 ```
 
-The next implementation step is replacing `weightpack.plan` with the real gfx1100 weight pack and filling `fused_model.hip` with generated dataflow blocks instead of the placeholders.
+`GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_SMOKE=1` is kept as an alias for `DISPATCH=1`. The dispatch path launches one compiled physical contract kernel that calls 40 static layer blocks, reads through `device_pack + layer_descs`, reads runtime bindings, and touches the persistent scratch buffer. It is still a scaffold, but it is a single physical dispatch over the packed model data, not a ggml layer loop.
+
+The weightpack files define the persistent layout and the runtime log reports the process-local device buffer pointer as `device_pack=...`. The next implementation step is making the first static layer block compute real decode work from that buffer instead of only proving the physical pack/dispatch contract.
 
 The current `GGML_CUDA_RDNA3_QWEN36_MEGA_DECODE=1` implementation is a hard contract gate. It validates that the one-token graph has the Qwen3.6-35B-A3B signature:
 

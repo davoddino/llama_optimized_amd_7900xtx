@@ -7588,12 +7588,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             }
 
             if (superlayer_ok) {
-                std::string smoke_blocker;
-                const bool smoke_ok =
-                    ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_smoke(cuda_ctx, cgraph, &smoke_blocker);
-                if (!smoke_ok && ggml_cuda_rdna3_qwen36_superlayer_required(cuda_ctx->device)) {
-                    GGML_ABORT("%s: Qwen3.6 RDNA3 physical superlayer smoke dispatch failed: %s",
-                            __func__, smoke_blocker.c_str());
+                std::string contract_blocker;
+                const bool contract_ok =
+                    ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(cuda_ctx, cgraph, &contract_blocker);
+                if (!contract_ok && ggml_cuda_rdna3_qwen36_superlayer_required(cuda_ctx->device)) {
+                    GGML_ABORT("%s: Qwen3.6 RDNA3 physical superlayer contract dispatch failed: %s",
+                            __func__, contract_blocker.c_str());
                 }
             } else if (rdna3_graph_log) {
                 GGML_LOG_INFO("%s: RDNA3 Qwen3.6 physical superlayer blocked: %s\n",

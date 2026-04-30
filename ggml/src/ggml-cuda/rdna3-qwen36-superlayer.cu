@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -14,7 +15,9 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace {
 
@@ -95,6 +98,88 @@ struct qwen36_superlayer_plan {
     }
 };
 
+struct qwen36_superlayer_pack_ref {
+    const ggml_tensor * tensor = nullptr;
+    std::string role;
+    int layer = -1;
+    size_t offset = 0;
+    size_t nbytes = 0;
+    size_t alignment = 256;
+};
+
+struct qwen36_superlayer_pack_plan {
+    std::vector<qwen36_superlayer_pack_ref> refs;
+    size_t total_bytes = 0;
+};
+
+struct qwen36_superlayer_layer_pack_desc {
+    uint64_t byte_begin = 0;
+    uint64_t byte_end = 0;
+    uint32_t first_ref = 0;
+    uint32_t n_refs = 0;
+    uint32_t kind = 0;
+    uint32_t reserved = 0;
+};
+
+struct qwen36_superlayer_runtime_layout {
+    size_t activation_slot_bytes = 0;
+    size_t logits_bytes = 0;
+    size_t router_slot_bytes = 0;
+    size_t scratch_bytes = 0;
+    int64_t n_embd = 0;
+    int64_t n_vocab = 0;
+};
+
+struct qwen36_superlayer_runtime_ref {
+    const ggml_tensor * tensor = nullptr;
+    std::string role;
+    size_t nbytes = 0;
+};
+
+struct qwen36_superlayer_runtime_binding_plan {
+    std::vector<qwen36_superlayer_runtime_ref> refs;
+};
+
+struct qwen36_superlayer_runtime_tensor_desc {
+    void * data = nullptr;
+    uint64_t nbytes = 0;
+    int32_t type = 0;
+    int64_t ne[4] = { 0, 0, 0, 0 };
+    uint64_t nb[4] = { 0, 0, 0, 0 };
+    uint64_t role_hash = 0;
+    uint64_t name_hash = 0;
+};
+
+struct qwen36_superlayer_device_pack_entry {
+    int device = -1;
+    uint64_t fingerprint = 0;
+    uint64_t source_signature = 0;
+    uint64_t runtime_signature = 0;
+    void * data = nullptr;
+    qwen36_superlayer_layer_pack_desc * layers = nullptr;
+    qwen36_superlayer_runtime_tensor_desc * io_descs = nullptr;
+    void * scratch = nullptr;
+    size_t bytes = 0;
+    size_t tensors = 0;
+    size_t io_count = 0;
+    size_t io_capacity = 0;
+    qwen36_superlayer_runtime_layout runtime;
+    cudaEvent_t ready_event = nullptr;
+};
+
+struct qwen36_superlayer_device_pack_view {
+    void * data = nullptr;
+    qwen36_superlayer_layer_pack_desc * layers = nullptr;
+    qwen36_superlayer_runtime_tensor_desc * io_descs = nullptr;
+    void * scratch = nullptr;
+    size_t bytes = 0;
+    size_t tensors = 0;
+    size_t io_count = 0;
+    size_t io_capacity = 0;
+    qwen36_superlayer_runtime_layout runtime;
+    cudaEvent_t ready_event = nullptr;
+};
+
 static std::filesystem::path qwen36_superlayer_cache_root() {
     const char * explicit_root = getenv("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_CACHE");
     if (explicit_root != nullptr && explicit_root[0] != '\0') {
@@ -114,10 +199,701 @@ static std::filesystem::path qwen36_superlayer_cache_root() {
     return std::filesystem::path(".rdna3-qwen36-superlayer-cache");
 }
 
+static size_t align_up(const size_t value, const size_t alignment) {
+    return (value + alignment - 1) & ~(alignment - 1);
+}
+
+static bool qwen36_superlayer_runtime_tensor(const ggml_tensor * t) {
+    if (t == nullptr) {
+        return true;
+    }
+    if (t->flags & GGML_TENSOR_FLAG_INPUT) {
+        return true;
+    }
+
+    return tensor_name_starts_with(t, "inp_") ||
+        tensor_name_starts_with(t, "cache_") ||
+        tensor_name_starts_with(t, "positions") ||
+        tensor_name_starts_with(t, "KQ_mask") ||
+        tensor_name_starts_with(t, "attn_inp") ||
+        tensor_name_starts_with(t, "conv_states") ||
+        tensor_name_starts_with(t, "state_") ||
+        tensor_name_starts_with(t, "result_");
+}
+
+static bool qwen36_superlayer_packable_tensor(const ggml_tensor * t) {
+    if (t == nullptr || t->data == nullptr || qwen36_superlayer_runtime_tensor(t)) {
+        return false;
+    }
+    if (t->op != GGML_OP_NONE) {
+        return false;
+    }
+    if (t->name[0] == '\0') {
+        return false;
+    }
+
+    if (t->flags & GGML_TENSOR_FLAG_PARAM) {
+        return true;
+    }
+
+    return std::strstr(t->name, ".weight") != nullptr ||
+        std::strstr(t->name, ".bias") != nullptr ||
+        std::strstr(t->name, ".scale") != nullptr ||
+        std::strstr(t->name, "blk.") != nullptr ||
+        std::strstr(t->name, "output") != nullptr ||
+        std::strstr(t->name, "token_embd") != nullptr;
+}
+
+static void qwen36_superlayer_sanitize_role(std::string & role) {
+    for (char & c : role) {
+        if (!(std::isalnum((unsigned char) c) || c == '_' || c == '.')) {
+            c = '_';
+        }
+    }
+}
+
+static std::string qwen36_superlayer_role_for_src(
+        const ggml_tensor * node, const ggml_tensor * src, const int src_idx, const int layer) {
+    std::string role;
+    if (layer >= 0) {
+        role = "L" + std::to_string(layer) + ".";
+    } else {
+        role = "global.";
+    }
+
+    if (node != nullptr && node->name[0] != '\0') {
+        role += node->name;
+    } else {
+        role += "leaf";
+    }
+    role += ".src";
+    role += std::to_string(src_idx);
+
+    if (src != nullptr && src->name[0] != '\0') {
+        role += ".";
+        role += src->name;
+    }
+
+    qwen36_superlayer_sanitize_role(role);
+
+    return role;
+}
+
+static std::string qwen36_superlayer_role_for_runtime(
+        const ggml_tensor * node, const ggml_tensor * tensor, const int src_idx, const int layer) {
+    std::string role = "runtime.";
+    if (layer >= 0) {
+        role += "L" + std::to_string(layer) + ".";
+    } else {
+        role += "global.";
+    }
+
+    if (src_idx < 0) {
+        role += "dst.";
+    } else {
+        role += "src" + std::to_string(src_idx) + ".";
+    }
+
+    if (node != nullptr && node->name[0] != '\0') {
+        role += node->name;
+        role += ".";
+    }
+    if (tensor != nullptr && tensor->name[0] != '\0') {
+        role += tensor->name;
+    } else {
+        role += "tensor";
+    }
+
+    qwen36_superlayer_sanitize_role(role);
+    return role;
+}
+
+static int qwen36_superlayer_layer_for_node(const qwen36_superlayer_plan & plan, const int node_idx) {
+    for (int layer = 0; layer < 40; ++layer) {
+        if (plan.layer_start[layer] >= 0 && node_idx >= plan.layer_start[layer] && node_idx <= plan.layer_end[layer]) {
+            return layer;
+        }
+    }
+    return -1;
+}
+
+static qwen36_superlayer_pack_plan qwen36_superlayer_make_pack_plan(
+        const ggml_cgraph * cgraph, const qwen36_superlayer_plan & plan) {
+    qwen36_superlayer_pack_plan pack;
+    std::unordered_map<const ggml_tensor *, size_t> seen;
+
+    auto add_ref = [&](const ggml_tensor * tensor, const std::string & role, const int layer) {
+        if (!qwen36_superlayer_packable_tensor(tensor)) {
+            return;
+        }
+        if (seen.find(tensor) != seen.end()) {
+            return;
+        }
+
+        qwen36_superlayer_pack_ref ref;
+        ref.tensor = tensor;
+        ref.role = role;
+        ref.layer = layer;
+        ref.nbytes = ggml_nbytes(tensor);
+        ref.alignment = ggml_is_quantized(tensor->type) ? 4096 : 256;
+        seen.emplace(tensor, pack.refs.size());
+        pack.refs.push_back(std::move(ref));
+    };
+
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node == nullptr) {
+            continue;
+        }
+
+        const int layer = qwen36_superlayer_layer_for_node(plan, i);
+        const bool in_decode_span = layer >= 0 || tensor_name_starts_with(node, "result_output");
+        if (!in_decode_span) {
+            continue;
+        }
+
+        for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
+            const ggml_tensor * src = node->src[src_idx];
+            add_ref(src, qwen36_superlayer_role_for_src(node, src, src_idx, layer), layer);
+        }
+    }
+
+    std::stable_sort(pack.refs.begin(), pack.refs.end(),
+            [](const qwen36_superlayer_pack_ref & a, const qwen36_superlayer_pack_ref & b) {
+        if (a.layer != b.layer) {
+            return a.layer < b.layer;
+        }
+        return a.role < b.role;
+    });
+
+    size_t offset = 0;
+    for (qwen36_superlayer_pack_ref & ref : pack.refs) {
+        offset = align_up(offset, ref.alignment);
+        ref.offset = offset;
+        offset += ref.nbytes;
+    }
+    pack.total_bytes = align_up(offset, 4096);
+
+    return pack;
+}
+
 static std::string hex_u64(const uint64_t value) {
     char buf[32];
     std::snprintf(buf, sizeof(buf), "%016" PRIx64, value);
     return std::string(buf);
+}
+
+static uint64_t qwen36_superlayer_source_signature(const qwen36_superlayer_pack_plan & pack) {
+    uint64_t h = 1469598103934665603ull;
+    h = fnv1a_update_cstr(h, "qwen36-rdna3-superlayer-device-pack-v0");
+    h = fnv1a_update_pod(h, pack.refs.size());
+    h = fnv1a_update_pod(h, pack.total_bytes);
+
+    for (const qwen36_superlayer_pack_ref & ref : pack.refs) {
+        const ggml_tensor * t = ref.tensor;
+        const uintptr_t data = (uintptr_t) t->data;
+        h = fnv1a_update_cstr(h, ref.role.c_str());
+        h = fnv1a_update_cstr(h, t->name);
+        h = fnv1a_update_pod(h, data);
+        h = fnv1a_update_pod(h, ref.offset);
+        h = fnv1a_update_pod(h, ref.nbytes);
+        h = fnv1a_update_pod(h, t->type);
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            h = fnv1a_update_pod(h, t->ne[d]);
+            h = fnv1a_update_pod(h, t->nb[d]);
+        }
+    }
+
+    return h;
+}
+
+static std::array<qwen36_superlayer_layer_pack_desc, 40> qwen36_superlayer_make_layer_pack_descs(
+        const qwen36_superlayer_plan & plan, const qwen36_superlayer_pack_plan & pack) {
+    std::array<qwen36_superlayer_layer_pack_desc, 40> layers;
+
+    for (int layer = 0; layer < 40; ++layer) {
+        qwen36_superlayer_layer_pack_desc & desc = layers[layer];
+        desc.kind = plan.layer_recurrent[layer] ? 1u : 0u;
+        desc.first_ref = (uint32_t) -1;
+    }
+
+    for (size_t i = 0; i < pack.refs.size(); ++i) {
+        const qwen36_superlayer_pack_ref & ref = pack.refs[i];
+        if (ref.layer < 0 || ref.layer >= 40) {
+            continue;
+        }
+
+        qwen36_superlayer_layer_pack_desc & desc = layers[ref.layer];
+        if (desc.n_refs == 0) {
+            desc.first_ref = (uint32_t) i;
+            desc.byte_begin = ref.offset;
+            desc.byte_end = ref.offset + ref.nbytes;
+        } else {
+            desc.byte_begin = std::min<uint64_t>(desc.byte_begin, ref.offset);
+            desc.byte_end = std::max<uint64_t>(desc.byte_end, ref.offset + ref.nbytes);
+        }
+        desc.n_refs++;
+    }
+
+    for (qwen36_superlayer_layer_pack_desc & desc : layers) {
+        if (desc.n_refs == 0) {
+            desc.first_ref = 0;
+        }
+    }
+
+    return layers;
+}
+
+static qwen36_superlayer_runtime_layout qwen36_superlayer_make_runtime_layout(
+        const ggml_cgraph * cgraph, const qwen36_superlayer_plan & plan) {
+    qwen36_superlayer_runtime_layout layout;
+
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node == nullptr) {
+            continue;
+        }
+
+        const int layer = qwen36_superlayer_layer_for_node(plan, i);
+        const bool in_decode_span = layer >= 0 || tensor_name_starts_with(node, "result_output");
+        if (!in_decode_span) {
+            continue;
+        }
+
+        const size_t node_bytes = ggml_nbytes(node);
+        layout.activation_slot_bytes = std::max(layout.activation_slot_bytes, node_bytes);
+
+        if (tensor_name_starts_with(node, "result_output")) {
+            layout.logits_bytes = std::max(layout.logits_bytes, node_bytes);
+            layout.n_vocab = std::max<int64_t>(layout.n_vocab, node->ne[0]);
+            if (node->src[1] != nullptr) {
+                layout.n_embd = std::max<int64_t>(layout.n_embd, node->src[1]->ne[0]);
+            }
+        }
+
+        if (std::strstr(node->name, "ffn_moe") != nullptr ||
+                std::strstr(node->name, "moe") != nullptr) {
+            layout.router_slot_bytes = std::max(layout.router_slot_bytes, node_bytes);
+        }
+    }
+
+    layout.activation_slot_bytes = align_up(std::max<size_t>(layout.activation_slot_bytes, 4096), 4096);
+    layout.logits_bytes = align_up(layout.logits_bytes, 4096);
+    layout.router_slot_bytes = align_up(layout.router_slot_bytes, 4096);
+    layout.scratch_bytes = align_up(2*layout.activation_slot_bytes + layout.logits_bytes + layout.router_slot_bytes, 4096);
+
+    return layout;
+}
+
+static bool qwen36_superlayer_runtime_bindable_tensor(const ggml_tensor * t, const int device) {
+    return t != nullptr &&
+        t->data != nullptr &&
+        t->buffer != nullptr &&
+        t->buffer->buft == ggml_backend_cuda_buffer_type(device) &&
+        qwen36_superlayer_runtime_tensor(t);
+}
+
+static qwen36_superlayer_runtime_binding_plan qwen36_superlayer_make_runtime_binding_plan(
+        const ggml_cgraph * cgraph, const qwen36_superlayer_plan & plan, const int device) {
+    qwen36_superlayer_runtime_binding_plan bindings;
+    std::unordered_map<const ggml_tensor *, size_t> seen;
+
+    auto add_ref = [&](const ggml_tensor * node, const ggml_tensor * tensor, const int src_idx, const int layer) {
+        if (!qwen36_superlayer_runtime_bindable_tensor(tensor, device)) {
+            return;
+        }
+        if (seen.find(tensor) != seen.end()) {
+            return;
+        }
+
+        qwen36_superlayer_runtime_ref ref;
+        ref.tensor = tensor;
+        ref.role = qwen36_superlayer_role_for_runtime(node, tensor, src_idx, layer);
+        ref.nbytes = ggml_nbytes(tensor);
+        seen.emplace(tensor, bindings.refs.size());
+        bindings.refs.push_back(std::move(ref));
+    };
+
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node == nullptr) {
+            continue;
+        }
+
+        const int layer = qwen36_superlayer_layer_for_node(plan, i);
+        const bool in_decode_span = layer >= 0 || tensor_name_starts_with(node, "result_output");
+        if (!in_decode_span) {
+            continue;
+        }
+
+        add_ref(node, node, -1, layer);
+        for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
+            add_ref(node, node->src[src_idx], src_idx, layer);
+        }
+    }
+
+    std::stable_sort(bindings.refs.begin(), bindings.refs.end(),
+            [](const qwen36_superlayer_runtime_ref & a, const qwen36_superlayer_runtime_ref & b) {
+        return a.role < b.role;
+    });
+
+    return bindings;
+}
+
+static uint64_t qwen36_superlayer_hash_string(const char * value) {
+    return fnv1a_update_cstr(1469598103934665603ull, value);
+}
+
+static std::vector<qwen36_superlayer_runtime_tensor_desc> qwen36_superlayer_make_runtime_descs(
+        const qwen36_superlayer_runtime_binding_plan & bindings) {
+    std::vector<qwen36_superlayer_runtime_tensor_desc> descs;
+    descs.reserve(bindings.refs.size());
+
+    for (const qwen36_superlayer_runtime_ref & ref : bindings.refs) {
+        const ggml_tensor * t = ref.tensor;
+        qwen36_superlayer_runtime_tensor_desc desc;
+        desc.data = t->data;
+        desc.nbytes = ref.nbytes;
+        desc.type = (int32_t) t->type;
+        desc.role_hash = qwen36_superlayer_hash_string(ref.role.c_str());
+        desc.name_hash = qwen36_superlayer_hash_string(t->name);
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            desc.ne[d] = t->ne[d];
+            desc.nb[d] = (uint64_t) t->nb[d];
+        }
+        descs.push_back(desc);
+    }
+
+    return descs;
+}
+
+static uint64_t qwen36_superlayer_runtime_signature(
+        const qwen36_superlayer_runtime_binding_plan & bindings) {
+    uint64_t h = 1469598103934665603ull;
+    h = fnv1a_update_cstr(h, "qwen36-rdna3-superlayer-runtime-bindings-v0");
+    h = fnv1a_update_pod(h, bindings.refs.size());
+
+    for (const qwen36_superlayer_runtime_ref & ref : bindings.refs) {
+        const ggml_tensor * t = ref.tensor;
+        const uintptr_t data = (uintptr_t) t->data;
+        h = fnv1a_update_cstr(h, ref.role.c_str());
+        h = fnv1a_update_cstr(h, t->name);
+        h = fnv1a_update_pod(h, data);
+        h = fnv1a_update_pod(h, ref.nbytes);
+        h = fnv1a_update_pod(h, t->type);
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            h = fnv1a_update_pod(h, t->ne[d]);
+            h = fnv1a_update_pod(h, t->nb[d]);
+        }
+    }
+
+    return h;
+}
+
+static std::string qwen36_superlayer_device_pack_key(
+        const int device,
+        const uint64_t fingerprint,
+        const uint64_t source_signature) {
+    return "d" + std::to_string(device) + "-" + hex_u64(fingerprint) +
+        "-" + hex_u64(source_signature);
+}
+
+static void qwen36_superlayer_set_cuda_blocker(
+        std::string * blocker, const char * action, const cudaError_t err) {
+    if (blocker != nullptr) {
+        *blocker = std::string(action) + ": " + cudaGetErrorString(err);
+    }
+}
+
+static bool qwen36_superlayer_tensor_on_device(
+        const ggml_tensor * t, const int device, std::string * blocker) {
+    if (t == nullptr || t->data == nullptr) {
+        if (blocker != nullptr) {
+            *blocker = "weightpack tensor is missing data";
+        }
+        return false;
+    }
+    if (t->buffer == nullptr || t->buffer->buft != ggml_backend_cuda_buffer_type(device)) {
+        if (blocker != nullptr) {
+            *blocker = "weightpack tensor is not resident on target CUDA/HIP device: ";
+            *blocker += t->name;
+        }
+        return false;
+    }
+    return true;
+}
+
+static bool qwen36_superlayer_materialize_device_pack(
+        ggml_backend_cuda_context * cuda_ctx,
+        const ggml_cgraph * cgraph,
+        const qwen36_superlayer_plan & plan,
+        const qwen36_superlayer_pack_plan & pack,
+        qwen36_superlayer_device_pack_view * view,
+        std::string * blocker) {
+    const uint64_t source_signature = qwen36_superlayer_source_signature(pack);
+    const qwen36_superlayer_runtime_binding_plan bindings =
+        qwen36_superlayer_make_runtime_binding_plan(cgraph, plan, cuda_ctx->device);
+    if (bindings.refs.empty()) {
+        if (blocker != nullptr) {
+            *blocker = "superlayer runtime binding table would be empty";
+        }
+        return false;
+    }
+    const uint64_t runtime_signature = qwen36_superlayer_runtime_signature(bindings);
+    const std::string key =
+        qwen36_superlayer_device_pack_key(cuda_ctx->device, plan.fingerprint, source_signature);
+    const std::vector<qwen36_superlayer_runtime_tensor_desc> io_descs_host =
+        qwen36_superlayer_make_runtime_descs(bindings);
+
+    static std::mutex device_pack_mutex;
+    static std::unordered_map<std::string, qwen36_superlayer_device_pack_entry> device_packs;
+    static std::unordered_set<std::string> reported_device_packs;
+
+    qwen36_superlayer_device_pack_view local_view;
+    bool should_report = false;
+
+    {
+        std::lock_guard<std::mutex> lock(device_pack_mutex);
+        auto it = device_packs.find(key);
+        if (it == device_packs.end()) {
+            for (const qwen36_superlayer_pack_ref & ref : pack.refs) {
+                if (!qwen36_superlayer_tensor_on_device(ref.tensor, cuda_ctx->device, blocker)) {
+                    return false;
+                }
+            }
+
+            ggml_cuda_set_device(cuda_ctx->device);
+            const qwen36_superlayer_runtime_layout runtime =
+                qwen36_superlayer_make_runtime_layout(cgraph, plan);
+
+            void * data = nullptr;
+            cudaError_t err = cudaMalloc(&data, pack.total_bytes);
+            if (err != cudaSuccess) {
+                (void) cudaGetLastError();
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to allocate superlayer device weightpack", err);
+                return false;
+            }
+
+            qwen36_superlayer_layer_pack_desc * layer_descs = nullptr;
+            err = cudaMalloc((void **) &layer_descs, sizeof(qwen36_superlayer_layer_pack_desc)*40);
+            if (err != cudaSuccess) {
+                (void) cudaFree(data);
+                (void) cudaGetLastError();
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to allocate superlayer layer descriptors", err);
+                return false;
+            }
+
+            void * scratch = nullptr;
+            err = cudaMalloc(&scratch, runtime.scratch_bytes);
+            if (err != cudaSuccess) {
+                (void) cudaFree(layer_descs);
+                (void) cudaFree(data);
+                (void) cudaGetLastError();
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to allocate superlayer runtime scratch", err);
+                return false;
+            }
+
+            qwen36_superlayer_runtime_tensor_desc * io_descs = nullptr;
+            err = cudaMalloc((void **) &io_descs, sizeof(qwen36_superlayer_runtime_tensor_desc)*io_descs_host.size());
+            if (err != cudaSuccess) {
+                (void) cudaFree(scratch);
+                (void) cudaFree(layer_descs);
+                (void) cudaFree(data);
+                (void) cudaGetLastError();
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to allocate superlayer runtime bindings", err);
+                return false;
+            }
+
+            err = cudaMemsetAsync(data, 0, pack.total_bytes, cuda_ctx->stream());
+            if (err != cudaSuccess) {
+                (void) cudaFree(io_descs);
+                (void) cudaFree(scratch);
+                (void) cudaFree(layer_descs);
+                (void) cudaFree(data);
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to clear superlayer device weightpack", err);
+                return false;
+            }
+            err = cudaMemsetAsync(scratch, 0, runtime.scratch_bytes, cuda_ctx->stream());
+            if (err != cudaSuccess) {
+                (void) cudaFree(io_descs);
+                (void) cudaFree(scratch);
+                (void) cudaFree(layer_descs);
+                (void) cudaFree(data);
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to clear superlayer runtime scratch", err);
+                return false;
+            }
+
+            const auto layer_descs_host = qwen36_superlayer_make_layer_pack_descs(plan, pack);
+            err = cudaMemcpy(
+                    layer_descs, layer_descs_host.data(), sizeof(qwen36_superlayer_layer_pack_desc)*40,
+                    cudaMemcpyHostToDevice);
+            if (err != cudaSuccess) {
+                (void) cudaFree(io_descs);
+                (void) cudaFree(scratch);
+                (void) cudaFree(layer_descs);
+                (void) cudaFree(data);
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to upload superlayer layer descriptors", err);
+                return false;
+            }
+            err = cudaMemcpy(
+                    io_descs, io_descs_host.data(),
+                    sizeof(qwen36_superlayer_runtime_tensor_desc)*io_descs_host.size(),
+                    cudaMemcpyHostToDevice);
+            if (err != cudaSuccess) {
+                (void) cudaFree(io_descs);
+                (void) cudaFree(scratch);
+                (void) cudaFree(layer_descs);
+                (void) cudaFree(data);
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to upload superlayer runtime bindings", err);
+                return false;
+            }
+
+            for (const qwen36_superlayer_pack_ref & ref : pack.refs) {
+                err = cudaMemcpyAsync(
+                        (char *) data + ref.offset, ref.tensor->data, ref.nbytes,
+                        cudaMemcpyDeviceToDevice, cuda_ctx->stream());
+                if (err != cudaSuccess) {
+                    (void) cudaFree(io_descs);
+                    (void) cudaFree(scratch);
+                    (void) cudaFree(layer_descs);
+                    (void) cudaFree(data);
+                    qwen36_superlayer_set_cuda_blocker(
+                            blocker, "failed to copy tensor into superlayer device weightpack", err);
+                    return false;
+                }
+            }
+
+            cudaEvent_t ready_event = nullptr;
+            err = cudaEventCreateWithFlags(&ready_event, cudaEventDisableTiming);
+            if (err != cudaSuccess) {
+                (void) cudaFree(io_descs);
+                (void) cudaFree(scratch);
+                (void) cudaFree(layer_descs);
+                (void) cudaFree(data);
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to create superlayer weightpack event", err);
+                return false;
+            }
+
+            err = cudaEventRecord(ready_event, cuda_ctx->stream());
+            if (err != cudaSuccess) {
+                (void) cudaEventDestroy(ready_event);
+                (void) cudaFree(io_descs);
+                (void) cudaFree(scratch);
+                (void) cudaFree(layer_descs);
+                (void) cudaFree(data);
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to record superlayer weightpack event", err);
+                return false;
+            }
+
+            qwen36_superlayer_device_pack_entry entry;
+            entry.device = cuda_ctx->device;
+            entry.fingerprint = plan.fingerprint;
+            entry.source_signature = source_signature;
+            entry.runtime_signature = runtime_signature;
+            entry.data = data;
+            entry.layers = layer_descs;
+            entry.io_descs = io_descs;
+            entry.scratch = scratch;
+            entry.bytes = pack.total_bytes;
+            entry.tensors = pack.refs.size();
+            entry.io_count = io_descs_host.size();
+            entry.io_capacity = io_descs_host.size();
+            entry.runtime = runtime;
+            entry.ready_event = ready_event;
+
+            it = device_packs.emplace(key, entry).first;
+            should_report = reported_device_packs.insert(key).second;
+        } else {
+            ggml_cuda_set_device(cuda_ctx->device);
+            const qwen36_superlayer_runtime_layout runtime =
+                qwen36_superlayer_make_runtime_layout(cgraph, plan);
+            if (io_descs_host.size() > it->second.io_capacity) {
+                qwen36_superlayer_runtime_tensor_desc * io_descs = nullptr;
+                cudaError_t err = cudaMalloc(
+                        (void **) &io_descs,
+                        sizeof(qwen36_superlayer_runtime_tensor_desc)*io_descs_host.size());
+                if (err != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    qwen36_superlayer_set_cuda_blocker(
+                            blocker, "failed to resize superlayer runtime bindings", err);
+                    return false;
+                }
+                (void) cudaFree(it->second.io_descs);
+                it->second.io_descs = io_descs;
+                it->second.io_capacity = io_descs_host.size();
+            }
+            if (runtime.scratch_bytes > it->second.runtime.scratch_bytes) {
+                void * scratch = nullptr;
+                cudaError_t err = cudaMalloc(&scratch, runtime.scratch_bytes);
+                if (err != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    qwen36_superlayer_set_cuda_blocker(
+                            blocker, "failed to grow superlayer runtime scratch", err);
+                    return false;
+                }
+                err = cudaMemsetAsync(scratch, 0, runtime.scratch_bytes, cuda_ctx->stream());
+                if (err != cudaSuccess) {
+                    (void) cudaFree(scratch);
+                    qwen36_superlayer_set_cuda_blocker(
+                            blocker, "failed to clear grown superlayer runtime scratch", err);
+                    return false;
+                }
+                (void) cudaFree(it->second.scratch);
+                it->second.scratch = scratch;
+            }
+
+            cudaError_t err = cudaMemcpy(
+                    it->second.io_descs, io_descs_host.data(),
+                    sizeof(qwen36_superlayer_runtime_tensor_desc)*io_descs_host.size(),
+                    cudaMemcpyHostToDevice);
+            if (err != cudaSuccess) {
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to refresh superlayer runtime bindings", err);
+                return false;
+            }
+
+            it->second.runtime_signature = runtime_signature;
+            it->second.io_count = io_descs_host.size();
+            it->second.runtime = runtime;
+        }
+
+        local_view.data = it->second.data;
+        local_view.layers = it->second.layers;
+        local_view.io_descs = it->second.io_descs;
+        local_view.scratch = it->second.scratch;
+        local_view.bytes = it->second.bytes;
+        local_view.tensors = it->second.tensors;
+        local_view.io_count = it->second.io_count;
+        local_view.io_capacity = it->second.io_capacity;
+        local_view.runtime = it->second.runtime;
+        local_view.ready_event = it->second.ready_event;
+    }
+
+    const cudaError_t err = cudaStreamWaitEvent(cuda_ctx->stream(), local_view.ready_event, 0);
+    if (err != cudaSuccess) {
+        qwen36_superlayer_set_cuda_blocker(blocker, "failed to wait for superlayer device weightpack", err);
+        return false;
+    }
+
+    if (view != nullptr) {
+        *view = local_view;
+    }
+
+    if (should_report) {
+        GGML_LOG_INFO(
+                "rdna3_qwen36_superlayer: device-pack-ready fingerprint=%s source=%s runtime=%s"
+                " ptr=%p layer_descs=%p io_descs=%p scratch=%p tensors=%zu io=%zu bytes=%zu"
+                " scratch_bytes=%zu activation_slot=%zu logits_bytes=%zu router_slot=%zu"
+                " n_embd=%" PRId64 " n_vocab=%" PRId64 "\n",
+                hex_u64(plan.fingerprint).c_str(), hex_u64(source_signature).c_str(),
+                hex_u64(runtime_signature).c_str(),
+                local_view.data, local_view.layers, local_view.io_descs, local_view.scratch,
+                local_view.tensors, local_view.io_count, local_view.bytes,
+                local_view.runtime.scratch_bytes, local_view.runtime.activation_slot_bytes,
+                local_view.runtime.logits_bytes, local_view.runtime.router_slot_bytes,
+                local_view.runtime.n_embd, local_view.runtime.n_vocab);
+    }
+
+    return true;
 }
 
 static uint64_t qwen36_superlayer_fingerprint(const ggml_cgraph * cgraph, const int device) {
@@ -295,13 +1071,37 @@ static bool write_text_file(const std::filesystem::path & path, const std::strin
     return true;
 }
 
-static std::string qwen36_superlayer_layout_source(const qwen36_superlayer_plan & plan, const int device) {
+static std::string c_escape(const std::string & value) {
+    std::string escaped;
+    escaped.reserve(value.size() + 8);
+    for (char c : value) {
+        switch (c) {
+            case '\\': escaped += "\\\\"; break;
+            case '"':  escaped += "\\\""; break;
+            case '\n': escaped += "\\n";  break;
+            case '\r': escaped += "\\r";  break;
+            case '\t': escaped += "\\t";  break;
+            default:   escaped += c;       break;
+        }
+    }
+    return escaped;
+}
+
+static std::string qwen36_superlayer_layout_source(
+        const qwen36_superlayer_plan & plan,
+        const qwen36_superlayer_pack_plan & pack,
+        const qwen36_superlayer_runtime_binding_plan & bindings,
+        const int device) {
     std::ostringstream out;
     out << "#pragma once\n\n";
+    out << "#include <cstdint>\n\n";
     out << "#define QWEN36_RDNA3_SUPERLAYER_FINGERPRINT 0x" << hex_u64(plan.fingerprint) << "ull\n";
     out << "#define QWEN36_RDNA3_SUPERLAYER_DEVICE_CC " << ggml_cuda_info().devices[device].cc << "\n";
     out << "#define QWEN36_RDNA3_SUPERLAYER_DEVICE_CU " << ggml_cuda_info().devices[device].nsm << "\n";
     out << "#define QWEN36_RDNA3_SUPERLAYER_LOGICAL_LAYERS 40\n\n";
+    out << "#define QWEN36_RDNA3_WEIGHTPACK_TENSORS " << pack.refs.size() << "\n";
+    out << "#define QWEN36_RDNA3_WEIGHTPACK_BYTES " << pack.total_bytes << "ull\n\n";
+    out << "#define QWEN36_RDNA3_RUNTIME_BINDINGS " << bindings.refs.size() << "\n\n";
     out << "enum qwen36_rdna3_layer_kind {\n";
     out << "    QWEN36_LAYER_ATTN = 0,\n";
     out << "    QWEN36_LAYER_GDN  = 1,\n";
@@ -311,6 +1111,61 @@ static std::string qwen36_superlayer_layout_source(const qwen36_superlayer_plan 
         out << "    " << (plan.layer_recurrent[layer] ? "QWEN36_LAYER_GDN" : "QWEN36_LAYER_ATTN")
             << (layer == 39 ? "\n" : ",\n");
     }
+    out << "};\n\n";
+
+    out << "struct qwen36_rdna3_layer_pack_desc {\n";
+    out << "    uint64_t byte_begin;\n";
+    out << "    uint64_t byte_end;\n";
+    out << "    uint32_t first_ref;\n";
+    out << "    uint32_t n_refs;\n";
+    out << "    uint32_t kind;\n";
+    out << "    uint32_t reserved;\n";
+    out << "};\n\n";
+    out << "struct qwen36_rdna3_runtime_tensor_desc {\n";
+    out << "    void * data;\n";
+    out << "    uint64_t nbytes;\n";
+    out << "    int32_t type;\n";
+    out << "    int64_t ne[4];\n";
+    out << "    uint64_t nb[4];\n";
+    out << "    uint64_t role_hash;\n";
+    out << "    uint64_t name_hash;\n";
+    out << "};\n\n";
+    out << "static constexpr qwen36_rdna3_layer_pack_desc QWEN36_LAYER_PACK[40] = {\n";
+    const auto layer_descs = qwen36_superlayer_make_layer_pack_descs(plan, pack);
+    for (int layer = 0; layer < 40; ++layer) {
+        const qwen36_superlayer_layer_pack_desc & desc = layer_descs[layer];
+        out << "    { " << desc.byte_begin << "ull, " << desc.byte_end << "ull, "
+            << desc.first_ref << "u, " << desc.n_refs << "u, " << desc.kind << "u, 0u }"
+            << (layer == 39 ? "\n" : ",\n");
+    }
+    out << "};\n";
+    return out.str();
+}
+
+static std::string qwen36_superlayer_weightpack_header(const qwen36_superlayer_pack_plan & pack) {
+    std::ostringstream out;
+    out << "#pragma once\n\n";
+    out << "#include <cstdint>\n\n";
+    out << "struct qwen36_rdna3_weight_ref {\n";
+    out << "    uint64_t offset;\n";
+    out << "    uint64_t nbytes;\n";
+    out << "    int32_t  layer;\n";
+    out << "    int32_t  type;\n";
+    out << "    int64_t  ne[4];\n";
+    out << "    int64_t  nb[4];\n";
+    out << "    const char * role;\n";
+    out << "    const char * tensor;\n";
+    out << "};\n\n";
+    out << "static constexpr qwen36_rdna3_weight_ref QWEN36_RDNA3_WEIGHTPACK[] = {\n";
+    for (const qwen36_superlayer_pack_ref & ref : pack.refs) {
+        const ggml_tensor * t = ref.tensor;
+        out << "    { " << ref.offset << "ull, " << ref.nbytes << "ull, " << ref.layer
+            << ", " << (int) t->type << ", { "
+            << t->ne[0] << ", " << t->ne[1] << ", " << t->ne[2] << ", " << t->ne[3]
+            << " }, { "
+            << t->nb[0] << ", " << t->nb[1] << ", " << t->nb[2] << ", " << t->nb[3]
+            << " }, \"" << c_escape(ref.role) << "\", \"" << c_escape(t->name) << "\" },\n";
+    }
     out << "};\n";
     return out.str();
 }
@@ -319,12 +1174,34 @@ static std::string qwen36_superlayer_generated_source(const qwen36_superlayer_pl
     std::ostringstream out;
     out << "// Generated scaffold for the RDNA3 Qwen3.6 physical superlayer.\n";
     out << "// This file is intentionally topology-specific. It is not a ggml graph executor.\n\n";
+    out << "#include <cstdint>\n\n";
     out << "#include \"layout.generated.h\"\n\n";
-    out << "struct qwen36_superlayer_runtime;\n\n";
+    out << "#include \"weightpack.generated.h\"\n\n";
+    out << "struct qwen36_superlayer_runtime {\n";
+    out << "    const uint8_t * weightpack;\n";
+    out << "    const qwen36_rdna3_runtime_tensor_desc * io_descs;\n";
+    out << "    uint32_t io_count;\n";
+    out << "    uint8_t * scratch;\n";
+    out << "    uint64_t scratch_bytes;\n";
+    out << "    uint64_t checksum;\n";
+    out << "};\n\n";
     for (int layer = 0; layer < 40; ++layer) {
         out << "__device__ __forceinline__ void qwen36_l" << (layer < 10 ? "0" : "") << layer
             << "_" << (plan.layer_recurrent[layer] ? "gdn" : "attn")
-            << "_fused(qwen36_superlayer_runtime &) {\n";
+            << "_fused(qwen36_superlayer_runtime & rt) {\n";
+        out << "    constexpr qwen36_rdna3_layer_pack_desc desc = QWEN36_LAYER_PACK[" << layer << "];\n";
+        out << "    if (rt.weightpack != nullptr && desc.n_refs != 0 && desc.byte_end > desc.byte_begin) {\n";
+        out << "        rt.checksum ^= ((uint64_t) rt.weightpack[desc.byte_begin] << " << ((layer & 7)*8)
+            << ") ^ desc.byte_end;\n";
+        out << "    }\n";
+        out << "    if (rt.scratch != nullptr && rt.scratch_bytes > " << layer << ") {\n";
+        out << "        rt.scratch[" << layer << "] = (uint8_t) rt.checksum;\n";
+        out << "    }\n";
+        out << "    if (rt.io_descs != nullptr && rt.io_count != 0) {\n";
+        out << "        const qwen36_rdna3_runtime_tensor_desc io = rt.io_descs[" << layer
+            << " % rt.io_count];\n";
+        out << "        rt.checksum ^= io.role_hash ^ io.name_hash ^ io.nbytes;\n";
+        out << "    }\n";
         out << "    // TODO: generated RDNA3 dataflow for physical layer " << layer << ".\n";
         out << "}\n\n";
     }
@@ -338,11 +1215,16 @@ static std::string qwen36_superlayer_generated_source(const qwen36_superlayer_pl
     return out.str();
 }
 
-static std::string qwen36_superlayer_manifest_json(const qwen36_superlayer_plan & plan, const int device) {
+static std::string qwen36_superlayer_manifest_json(
+        const qwen36_superlayer_plan & plan,
+        const qwen36_superlayer_pack_plan & pack,
+        const qwen36_superlayer_runtime_layout & runtime,
+        const qwen36_superlayer_runtime_binding_plan & bindings,
+        const int device) {
     std::ostringstream out;
     out << "{\n";
     out << "  \"artifact\": \"qwen36-rdna3-7900xtx-superlayer\",\n";
-    out << "  \"state\": \"scaffold\",\n";
+    out << "  \"state\": \"device-pack-layout\",\n";
     out << "  \"fingerprint\": \"" << hex_u64(plan.fingerprint) << "\",\n";
     out << "  \"device_cc\": " << ggml_cuda_info().devices[device].cc << ",\n";
     out << "  \"device_cu\": " << ggml_cuda_info().devices[device].nsm << ",\n";
@@ -354,17 +1236,92 @@ static std::string qwen36_superlayer_manifest_json(const qwen36_superlayer_plan 
     out << "  \"n_moe_gate_up\": " << plan.n_moe_gate_up << ",\n";
     out << "  \"n_moe_down\": " << plan.n_moe_down << ",\n";
     out << "  \"n_mmid\": " << plan.n_mmid << ",\n";
+    out << "  \"weightpack_tensors\": " << pack.refs.size() << ",\n";
+    out << "  \"weightpack_bytes\": " << pack.total_bytes << ",\n";
+    out << "  \"runtime_bindings\": " << bindings.refs.size() << ",\n";
+    out << "  \"activation_slot_bytes\": " << runtime.activation_slot_bytes << ",\n";
+    out << "  \"logits_bytes\": " << runtime.logits_bytes << ",\n";
+    out << "  \"router_slot_bytes\": " << runtime.router_slot_bytes << ",\n";
+    out << "  \"scratch_bytes\": " << runtime.scratch_bytes << ",\n";
+    out << "  \"n_embd\": " << runtime.n_embd << ",\n";
+    out << "  \"n_vocab\": " << runtime.n_vocab << ",\n";
+    out << "  \"runtime_device_weightpack\": true,\n";
     out << "  \"fusion_contract\": \"load-time generated physical superlayer; no generic layer loop in generated source\"\n";
     out << "}\n";
     return out.str();
 }
 
-static std::string qwen36_superlayer_weightpack_plan(const qwen36_superlayer_plan & plan) {
+static std::string qwen36_superlayer_runtime_json(
+        const qwen36_superlayer_runtime_layout & runtime,
+        const qwen36_superlayer_runtime_binding_plan & bindings) {
+    std::ostringstream out;
+    out << "{\n";
+    out << "  \"runtime_bindings\": " << bindings.refs.size() << ",\n";
+    out << "  \"activation_slot_bytes\": " << runtime.activation_slot_bytes << ",\n";
+    out << "  \"logits_bytes\": " << runtime.logits_bytes << ",\n";
+    out << "  \"router_slot_bytes\": " << runtime.router_slot_bytes << ",\n";
+    out << "  \"scratch_bytes\": " << runtime.scratch_bytes << ",\n";
+    out << "  \"n_embd\": " << runtime.n_embd << ",\n";
+    out << "  \"n_vocab\": " << runtime.n_vocab << ",\n";
+    out << "  \"buffers\": {\n";
+    out << "    \"activation_a_offset\": 0,\n";
+    out << "    \"activation_b_offset\": " << runtime.activation_slot_bytes << ",\n";
+    out << "    \"logits_offset\": " << 2*runtime.activation_slot_bytes << ",\n";
+    out << "    \"router_offset\": " << 2*runtime.activation_slot_bytes + runtime.logits_bytes << "\n";
+    out << "  }\n";
+    out << "}\n";
+    return out.str();
+}
+
+static std::string qwen36_superlayer_runtime_bindings_json(
+        const qwen36_superlayer_runtime_binding_plan & bindings) {
+    std::ostringstream out;
+    out << "{\n";
+    out << "  \"binding_count\": " << bindings.refs.size() << ",\n";
+    out << "  \"bindings\": [\n";
+    for (size_t i = 0; i < bindings.refs.size(); ++i) {
+        const qwen36_superlayer_runtime_ref & ref = bindings.refs[i];
+        const ggml_tensor * t = ref.tensor;
+        out << "    { \"index\": " << i
+            << ", \"role\": \"" << c_escape(ref.role) << "\""
+            << ", \"tensor\": \"" << c_escape(t->name) << "\""
+            << ", \"nbytes\": " << ref.nbytes
+            << ", \"type\": \"" << ggml_type_name(t->type) << "\""
+            << ", \"role_hash\": \"" << hex_u64(qwen36_superlayer_hash_string(ref.role.c_str())) << "\""
+            << ", \"name_hash\": \"" << hex_u64(qwen36_superlayer_hash_string(t->name)) << "\""
+            << ", \"ne\": [" << t->ne[0] << ", " << t->ne[1] << ", " << t->ne[2] << ", " << t->ne[3] << "]"
+            << ", \"nb\": [" << t->nb[0] << ", " << t->nb[1] << ", " << t->nb[2] << ", " << t->nb[3] << "] }"
+            << (i + 1 == bindings.refs.size() ? "\n" : ",\n");
+    }
+    out << "  ]\n";
+    out << "}\n";
+    return out.str();
+}
+
+static std::string qwen36_superlayer_weightpack_plan(const qwen36_superlayer_plan & plan, const qwen36_superlayer_pack_plan & pack) {
     std::ostringstream out;
     out << "# RDNA3 Qwen3.6 7900 XTX Weight Pack Plan\n\n";
     out << "fingerprint: " << hex_u64(plan.fingerprint) << "\n";
-    out << "state: scaffold\n\n";
-    out << "The final artifact must replace this plan with a physical weight pack ordered for gfx1100 wave32 access.\n";
+    out << "state: device-pack-layout\n";
+    out << "tensor_count: " << pack.refs.size() << "\n";
+    out << "total_bytes: " << pack.total_bytes << "\n\n";
+    out << "This is the deterministic physical pack order for gfx1100. At runtime the backend\n";
+    out << "allocates one device-side buffer and copies these tensors into the listed offsets.\n";
+    out << "The next step is to replace original tensor loads with offsets into that buffer.\n\n";
+    out << "Packed tensors:\n\n";
+    for (const qwen36_superlayer_pack_ref & ref : pack.refs) {
+        const ggml_tensor * t = ref.tensor;
+        out << "- offset=" << ref.offset
+            << " bytes=" << ref.nbytes
+            << " align=" << ref.alignment
+            << " layer=" << ref.layer
+            << " type=" << ggml_type_name(t->type)
+            << " role=" << ref.role
+            << " tensor=" << t->name
+            << " ne=[" << t->ne[0] << "," << t->ne[1] << "," << t->ne[2] << "," << t->ne[3] << "]"
+            << " nb=[" << t->nb[0] << "," << t->nb[1] << "," << t->nb[2] << "," << t->nb[3] << "]\n";
+    }
+    out << "\n";
     out << "Layer spans detected from the decode graph:\n\n";
     for (int layer = 0; layer < 40; ++layer) {
         out << "- layer " << layer << ": "
@@ -374,7 +1331,38 @@ static std::string qwen36_superlayer_weightpack_plan(const qwen36_superlayer_pla
     return out.str();
 }
 
-static bool qwen36_superlayer_materialize_artifact(const qwen36_superlayer_plan & plan, const int device, std::string * blocker) {
+static std::string qwen36_superlayer_weightpack_json(const qwen36_superlayer_pack_plan & pack) {
+    std::ostringstream out;
+    out << "{\n";
+    out << "  \"tensor_count\": " << pack.refs.size() << ",\n";
+    out << "  \"total_bytes\": " << pack.total_bytes << ",\n";
+    out << "  \"tensors\": [\n";
+    for (size_t i = 0; i < pack.refs.size(); ++i) {
+        const qwen36_superlayer_pack_ref & ref = pack.refs[i];
+        const ggml_tensor * t = ref.tensor;
+        out << "    { \"offset\": " << ref.offset
+            << ", \"nbytes\": " << ref.nbytes
+            << ", \"alignment\": " << ref.alignment
+            << ", \"layer\": " << ref.layer
+            << ", \"type\": \"" << ggml_type_name(t->type) << "\""
+            << ", \"role\": \"" << c_escape(ref.role) << "\""
+            << ", \"tensor\": \"" << c_escape(t->name) << "\""
+            << ", \"ne\": [" << t->ne[0] << ", " << t->ne[1] << ", " << t->ne[2] << ", " << t->ne[3] << "]"
+            << ", \"nb\": [" << t->nb[0] << ", " << t->nb[1] << ", " << t->nb[2] << ", " << t->nb[3] << "] }"
+            << (i + 1 == pack.refs.size() ? "\n" : ",\n");
+    }
+    out << "  ]\n";
+    out << "}\n";
+    return out.str();
+}
+
+static bool qwen36_superlayer_materialize_artifact(
+        const qwen36_superlayer_plan & plan,
+        const qwen36_superlayer_pack_plan & pack,
+        const qwen36_superlayer_runtime_layout & runtime,
+        const qwen36_superlayer_runtime_binding_plan & bindings,
+        const int device,
+        std::string * blocker) {
     try {
         std::filesystem::create_directories(plan.artifact_dir);
     } catch (const std::filesystem::filesystem_error & e) {
@@ -388,39 +1376,157 @@ static bool qwen36_superlayer_materialize_artifact(const qwen36_superlayer_plan 
     const std::filesystem::path layout_path   = plan.artifact_dir / "layout.generated.h";
     const std::filesystem::path source_path   = plan.artifact_dir / "fused_model.hip";
     const std::filesystem::path pack_path     = plan.artifact_dir / "weightpack.plan";
+    const std::filesystem::path pack_h_path   = plan.artifact_dir / "weightpack.generated.h";
+    const std::filesystem::path pack_json_path = plan.artifact_dir / "weightpack.layout.json";
+    const std::filesystem::path runtime_json_path = plan.artifact_dir / "runtime.layout.json";
+    const std::filesystem::path runtime_bindings_path = plan.artifact_dir / "runtime-bindings.layout.json";
 
-    if (!write_text_file(manifest_path, qwen36_superlayer_manifest_json(plan, device), blocker)) {
+    if (!write_text_file(manifest_path, qwen36_superlayer_manifest_json(plan, pack, runtime, bindings, device), blocker)) {
         return false;
     }
-    if (!write_text_file(layout_path, qwen36_superlayer_layout_source(plan, device), blocker)) {
+    if (!write_text_file(layout_path, qwen36_superlayer_layout_source(plan, pack, bindings, device), blocker)) {
         return false;
     }
     if (!write_text_file(source_path, qwen36_superlayer_generated_source(plan), blocker)) {
         return false;
     }
-    if (!write_text_file(pack_path, qwen36_superlayer_weightpack_plan(plan), blocker)) {
+    if (!write_text_file(pack_path, qwen36_superlayer_weightpack_plan(plan, pack), blocker)) {
+        return false;
+    }
+    if (!write_text_file(pack_h_path, qwen36_superlayer_weightpack_header(pack), blocker)) {
+        return false;
+    }
+    if (!write_text_file(pack_json_path, qwen36_superlayer_weightpack_json(pack), blocker)) {
+        return false;
+    }
+    if (!write_text_file(runtime_json_path, qwen36_superlayer_runtime_json(runtime, bindings), blocker)) {
+        return false;
+    }
+    if (!write_text_file(runtime_bindings_path, qwen36_superlayer_runtime_bindings_json(bindings), blocker)) {
         return false;
     }
 
     return true;
 }
 
-struct qwen36_superlayer_smoke_state {
+struct qwen36_superlayer_contract_state {
     uint64_t fingerprint;
+    uint64_t weightpack_bytes;
+    uint64_t scratch_bytes;
+    uint64_t checksum;
     uint32_t n_nodes;
     uint32_t n_blocks;
+    uint32_t weightpack_tensors;
+    uint32_t touched_layers;
+    uint32_t active_lanes;
 };
 
-__global__ void qwen36_rdna3_superlayer_smoke_kernel(qwen36_superlayer_smoke_state * state) {
-    const uint32_t tid = (uint32_t) blockIdx.x*blockDim.x + threadIdx.x;
-    if (tid == 0) {
+template<int L>
+__device__ __forceinline__ uint64_t qwen36_rdna3_superlayer_contract_layer(
+        const uint8_t * weightpack,
+        const qwen36_superlayer_layer_pack_desc * layer_descs,
+        const uint64_t lane) {
+    const qwen36_superlayer_layer_pack_desc desc = layer_descs[L];
+    if (weightpack == nullptr || desc.n_refs == 0 || desc.byte_end <= desc.byte_begin) {
+        return 0x9e3779b97f4a7c15ull ^ ((uint64_t) L << 32);
+    }
+
+    const uint64_t span = desc.byte_end - desc.byte_begin;
+    const uint64_t rel = (lane*1315423911ull + (uint64_t) L*2654435761ull) % span;
+    const uint64_t value = (uint64_t) weightpack[desc.byte_begin + rel];
+
+    return (value << ((L & 7)*8)) ^
+        desc.byte_begin ^
+        (desc.byte_end << 1) ^
+        ((uint64_t) desc.n_refs << 40) ^
+        ((uint64_t) desc.kind << 56) ^
+        ((uint64_t) L << 48);
+}
+
+__global__ void qwen36_rdna3_superlayer_contract_kernel(
+        qwen36_superlayer_contract_state * state,
+        const uint8_t * weightpack,
+        const qwen36_superlayer_layer_pack_desc * layer_descs,
+        const qwen36_superlayer_runtime_tensor_desc * io_descs,
+        const uint32_t io_count,
+        uint8_t * scratch,
+        const uint64_t scratch_bytes,
+        const uint64_t weightpack_bytes) {
+    const uint64_t lane = (uint64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    uint64_t checksum = 0x7900011000360001ull ^ lane ^ weightpack_bytes ^ scratch_bytes ^ io_count;
+
+#define QWEN36_SUPERLAYER_CONTRACT_LAYER(L) \
+    checksum ^= qwen36_rdna3_superlayer_contract_layer<L>(weightpack, layer_descs, lane)
+
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(0);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(1);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(2);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(3);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(4);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(5);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(6);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(7);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(8);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(9);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(10);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(11);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(12);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(13);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(14);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(15);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(16);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(17);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(18);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(19);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(20);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(21);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(22);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(23);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(24);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(25);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(26);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(27);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(28);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(29);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(30);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(31);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(32);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(33);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(34);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(35);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(36);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(37);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(38);
+    QWEN36_SUPERLAYER_CONTRACT_LAYER(39);
+
+#undef QWEN36_SUPERLAYER_CONTRACT_LAYER
+
+    if (io_descs != nullptr && io_count > 0) {
+        const qwen36_superlayer_runtime_tensor_desc io = io_descs[lane % io_count];
+        checksum ^= io.role_hash ^ io.name_hash ^ io.nbytes;
+        if (io.data != nullptr && io.nbytes > 0) {
+            const uint8_t * io_data = (const uint8_t *) io.data;
+            checksum ^= (uint64_t) io_data[lane % io.nbytes] << 32;
+        }
+    }
+
+    if (scratch != nullptr && lane < scratch_bytes) {
+        scratch[lane] = (uint8_t) checksum;
+    }
+
+    if (lane == 0) {
         state->fingerprint ^= 0x7900'0110'0036'0001ull;
+        state->fingerprint ^= checksum;
+        state->checksum = checksum;
         state->n_blocks = gridDim.x;
+        state->touched_layers = 40;
+        state->active_lanes = gridDim.x*blockDim.x;
     }
 }
 
-static bool qwen36_superlayer_smoke_enabled() {
-    return qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_SMOKE");
+static bool qwen36_superlayer_contract_dispatch_enabled() {
+    return qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DISPATCH") ||
+        qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_SMOKE");
 }
 
 } // namespace
@@ -453,6 +1559,23 @@ bool ggml_cuda_rdna3_qwen36_superlayer_prepare(
         }
         return false;
     }
+    qwen36_superlayer_pack_plan pack = qwen36_superlayer_make_pack_plan(cgraph, plan);
+    if (pack.refs.empty()) {
+        if (blocker != nullptr) {
+            *blocker = "superlayer weight pack would be empty";
+        }
+        return false;
+    }
+    const qwen36_superlayer_runtime_layout runtime = qwen36_superlayer_make_runtime_layout(cgraph, plan);
+    const qwen36_superlayer_runtime_binding_plan bindings =
+        qwen36_superlayer_make_runtime_binding_plan(cgraph, plan, cuda_ctx->device);
+    if (bindings.refs.empty()) {
+        if (blocker != nullptr) {
+            *blocker = "superlayer runtime binding table would be empty";
+        }
+        return false;
+    }
+    qwen36_superlayer_device_pack_view device_pack;
 
     static std::mutex prepared_mutex;
     static std::unordered_set<uint64_t> prepared_fingerprints;
@@ -465,11 +1588,15 @@ bool ggml_cuda_rdna3_qwen36_superlayer_prepare(
     }
 
     if (!already_prepared) {
-        if (!qwen36_superlayer_materialize_artifact(plan, cuda_ctx->device, blocker)) {
+        if (!qwen36_superlayer_materialize_artifact(plan, pack, runtime, bindings, cuda_ctx->device, blocker)) {
             return false;
         }
         std::lock_guard<std::mutex> lock(prepared_mutex);
         prepared_fingerprints.insert(plan.fingerprint);
+    }
+
+    if (!qwen36_superlayer_materialize_device_pack(cuda_ctx, cgraph, plan, pack, &device_pack, blocker)) {
+        return false;
     }
 
     bool should_report = false;
@@ -482,19 +1609,23 @@ bool ggml_cuda_rdna3_qwen36_superlayer_prepare(
         GGML_LOG_INFO(
                 "rdna3_qwen36_superlayer: artifact-ready fingerprint=%s dir=%s nodes=%d"
                 " layers=40 fattn=%d gdn=%d topk=%d moe_gate_up=%d moe_down=%d mmid=%d"
-                " state=scaffold\n",
+                " weightpack_tensors=%zu runtime_bindings=%zu weightpack_bytes=%zu device_pack=%p"
+                " scratch=%p scratch_bytes=%zu"
+                " state=device-pack-ready\n",
                 hex_u64(plan.fingerprint).c_str(), plan.artifact_dir.string().c_str(), plan.n_nodes,
-                plan.n_fattn, plan.n_gdn, plan.n_topk_moe, plan.n_moe_gate_up, plan.n_moe_down, plan.n_mmid);
+                plan.n_fattn, plan.n_gdn, plan.n_topk_moe, plan.n_moe_gate_up, plan.n_moe_down, plan.n_mmid,
+                pack.refs.size(), bindings.refs.size(), pack.total_bytes, device_pack.data, device_pack.scratch,
+                device_pack.runtime.scratch_bytes);
     }
 
     return true;
 }
 
-bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_smoke(
+bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
         ggml_backend_cuda_context * cuda_ctx,
         const ggml_cgraph * cgraph,
         std::string * blocker) {
-    if (!qwen36_superlayer_smoke_enabled()) {
+    if (!qwen36_superlayer_contract_dispatch_enabled()) {
         return true;
     }
 
@@ -505,14 +1636,32 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_smoke(
         }
         return false;
     }
+    qwen36_superlayer_pack_plan pack = qwen36_superlayer_make_pack_plan(cgraph, plan);
+    if (pack.refs.empty()) {
+        if (blocker != nullptr) {
+            *blocker = "superlayer weight pack would be empty";
+        }
+        return false;
+    }
+    qwen36_superlayer_device_pack_view device_pack;
+    if (!qwen36_superlayer_materialize_device_pack(cuda_ctx, cgraph, plan, pack, &device_pack, blocker)) {
+        return false;
+    }
 
-    ggml_cuda_pool_alloc<qwen36_superlayer_smoke_state> smoke_state(cuda_ctx->pool(), 1);
-    qwen36_superlayer_smoke_state host_state = {
-        /*.fingerprint =*/ plan.fingerprint,
-        /*.n_nodes     =*/ (uint32_t) plan.n_nodes,
-        /*.n_blocks    =*/ 0,
+    ggml_cuda_pool_alloc<qwen36_superlayer_contract_state> contract_state(cuda_ctx->pool(), 1);
+    qwen36_superlayer_contract_state host_state = {
+        /*.fingerprint         =*/ plan.fingerprint,
+        /*.weightpack_bytes    =*/ (uint64_t) device_pack.bytes,
+        /*.scratch_bytes       =*/ (uint64_t) device_pack.runtime.scratch_bytes,
+        /*.checksum            =*/ 0,
+        /*.n_nodes             =*/ (uint32_t) plan.n_nodes,
+        /*.n_blocks            =*/ 0,
+        /*.weightpack_tensors  =*/ (uint32_t) device_pack.tensors,
+        /*.touched_layers      =*/ 0,
+        /*.active_lanes        =*/ 0,
     };
-    CUDA_CHECK(cudaMemcpyAsync(smoke_state.ptr, &host_state, sizeof(host_state), cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    CUDA_CHECK(cudaMemcpyAsync(
+            contract_state.ptr, &host_state, sizeof(host_state), cudaMemcpyHostToDevice, cuda_ctx->stream()));
 
     const int default_blocks = std::max(1, ggml_cuda_info().devices[cuda_ctx->device].nsm);
     const int blocks = (int) std::max<int64_t>(1, qwen36_superlayer_env_i64(
@@ -520,17 +1669,34 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_smoke(
     const int threads = (int) std::max<int64_t>(32, qwen36_superlayer_env_i64(
             "GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_THREADS", 256));
 
-    qwen36_rdna3_superlayer_smoke_kernel<<<blocks, threads, 0, cuda_ctx->stream()>>>(smoke_state.ptr);
+    qwen36_rdna3_superlayer_contract_kernel<<<blocks, threads, 0, cuda_ctx->stream()>>>(
+            contract_state.ptr,
+            (const uint8_t *) device_pack.data,
+            device_pack.layers,
+            device_pack.io_descs,
+            (uint32_t) device_pack.io_count,
+            (uint8_t *) device_pack.scratch,
+            (uint64_t) device_pack.runtime.scratch_bytes,
+            (uint64_t) device_pack.bytes);
     CUDA_CHECK(cudaGetLastError());
 
-    static std::atomic<int64_t> smoke_reports{0};
-    const int64_t report_id = smoke_reports.fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<int64_t> contract_reports{0};
+    const int64_t report_id = contract_reports.fetch_add(1, std::memory_order_relaxed);
     if (report_id < 8) {
         GGML_LOG_INFO(
-                "rdna3_qwen36_superlayer: smoke-kernel-launched fingerprint=%s blocks=%d threads=%d"
-                " note=single physical dispatch scaffold\n",
-                hex_u64(plan.fingerprint).c_str(), blocks, threads);
+                "rdna3_qwen36_superlayer: contract-kernel-launched fingerprint=%s blocks=%d threads=%d"
+                " weightpack_tensors=%zu runtime_bindings=%zu weightpack_bytes=%zu scratch_bytes=%zu"
+                " note=single physical 40-layer dispatch scaffold\n",
+                hex_u64(plan.fingerprint).c_str(), blocks, threads,
+                device_pack.tensors, device_pack.io_count, device_pack.bytes, device_pack.runtime.scratch_bytes);
     }
 
     return true;
+}
+
+bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_smoke(
+        ggml_backend_cuda_context * cuda_ctx,
+        const ggml_cgraph * cgraph,
+        std::string * blocker) {
+    return ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(cuda_ctx, cgraph, blocker);
 }
