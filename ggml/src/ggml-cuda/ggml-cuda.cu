@@ -6688,6 +6688,7 @@ static void ggml_cuda_graph_evaluate_and_capture(
 
             bool qwen36_one_layer_qkv_launched = false;
             bool qwen36_one_layer_projection_bundle_launched = false;
+            bool qwen36_superlayer_l0_launched = false;
             const bool qwen36_superlayer_l0_replace_rms =
                 superlayer_l0_plan != nullptr &&
                 ggml_cuda_rdna3_qwen36_superlayer_replace_l0_rms_enabled(cuda_ctx->device);
@@ -6699,6 +6700,23 @@ static void ggml_cuda_graph_evaluate_and_capture(
                 ggml_cuda_rdna3_qwen36_superlayer_replace_l0_proj_enabled(cuda_ctx->device);
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+                if (superlayer_l0_plan != nullptr &&
+                        !qwen36_superlayer_l0_launched &&
+                        i == superlayer_l0_plan->rms) {
+                    std::string superlayer_l0_blocker;
+                    const bool superlayer_l0_ok =
+                        ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
+                                cuda_ctx, cgraph, &superlayer_l0_blocker);
+                    if (!superlayer_l0_ok) {
+                        GGML_ABORT("%s: Qwen3.6 RDNA3 physical superlayer L0 dispatch failed at"
+                                " graph node %d: %s", __func__, i, superlayer_l0_blocker.c_str());
+                    }
+                    qwen36_superlayer_l0_launched = true;
+                    if (ggml_cuda_rdna3_graph_log_enabled(cuda_ctx->device)) {
+                        GGML_LOG_INFO("%s: RDNA3 Qwen3.6 physical superlayer L0 dispatched at node %d (%s)\n",
+                                __func__, i, node->name);
+                    }
+                }
                 const bool qwen36_superlayer_l0_skip =
                     superlayer_l0_plan != nullptr &&
                     ((qwen36_superlayer_l0_replace_rms &&
@@ -7655,14 +7673,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             }
 
             if (superlayer_ok) {
-                std::string contract_blocker;
-                const bool contract_ok =
-                    ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(cuda_ctx, cgraph, &contract_blocker);
-                if (!contract_ok && ggml_cuda_rdna3_qwen36_superlayer_required(cuda_ctx->device)) {
-                    GGML_ABORT("%s: Qwen3.6 RDNA3 physical superlayer contract dispatch failed: %s",
-                            __func__, contract_blocker.c_str());
-                }
-                if (contract_ok && ggml_cuda_rdna3_qwen36_superlayer_replace_l0_enabled(cuda_ctx->device)) {
+                if (ggml_cuda_rdna3_qwen36_superlayer_replace_l0_enabled(cuda_ctx->device)) {
                     qwen36_superlayer_l0_plan =
                         ggml_cuda_rdna3_qwen36_one_layer_mega_make_plan(cgraph, cuda_ctx->device, 0);
                     qwen36_superlayer_l0_replace_ready =
@@ -7678,6 +7689,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                                 qwen36_superlayer_l0_replace_ready ? "ready" : "blocked",
                                 qwen36_superlayer_l0_replace_ready ? "" : ": ",
                                 qwen36_superlayer_l0_replace_ready ? "" : qwen36_superlayer_l0_plan.blocker.c_str());
+                    }
+                } else {
+                    std::string contract_blocker;
+                    const bool contract_ok =
+                        ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(cuda_ctx, cgraph, &contract_blocker);
+                    if (!contract_ok && ggml_cuda_rdna3_qwen36_superlayer_required(cuda_ctx->device)) {
+                        GGML_ABORT("%s: Qwen3.6 RDNA3 physical superlayer contract dispatch failed: %s",
+                                __func__, contract_blocker.c_str());
                     }
                 }
             } else if (rdna3_graph_log) {
@@ -7771,6 +7790,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 __func__, cgraph->n_nodes, cgraph->uid);
     }
 #endif // USE_CUDA_GRAPH
+
+    if (qwen36_superlayer_l0_replace_ready) {
+        if (rdna3_graph_log && use_cuda_graph) {
+            GGML_LOG_INFO("%s: RDNA3 graph disabled for this evaluation: physical superlayer L0"
+                    " replacement launches at the RMS node\n", __func__);
+        }
+        use_cuda_graph = false;
+        cuda_graph_update_required = false;
+        qwen36_mega_graph_skip = "superlayer L0 replacement direct dispatch";
+    }
 
     if (qwen36_mega_require_graph && qwen36_mega_contract_this_eval) {
         static std::atomic<int64_t> qwen36_mega_direct_graph_evals{0};
