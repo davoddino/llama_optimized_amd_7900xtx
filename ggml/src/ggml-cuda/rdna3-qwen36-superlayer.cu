@@ -489,7 +489,7 @@ static bool qwen36_superlayer_runtime_bindable_tensor(const ggml_tensor * t, con
     return t != nullptr &&
         t->data != nullptr &&
         t->buffer != nullptr &&
-        t->buffer->buft == ggml_backend_cuda_buffer_type(device) &&
+        ggml_backend_buffer_get_type(t->buffer) == ggml_backend_cuda_buffer_type(device) &&
         qwen36_superlayer_runtime_tensor(t);
 }
 
@@ -613,7 +613,8 @@ static bool qwen36_superlayer_tensor_on_device(
         }
         return false;
     }
-    if (t->buffer == nullptr || t->buffer->buft != ggml_backend_cuda_buffer_type(device)) {
+    if (t->buffer == nullptr ||
+            ggml_backend_buffer_get_type(t->buffer) != ggml_backend_cuda_buffer_type(device)) {
         if (blocker != nullptr) {
             *blocker = "weightpack tensor is not resident on target CUDA/HIP device: ";
             *blocker += t->name;
