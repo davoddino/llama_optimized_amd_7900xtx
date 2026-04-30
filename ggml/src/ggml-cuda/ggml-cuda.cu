@@ -743,16 +743,30 @@ static ggml_cuda_device_info ggml_cuda_init() {
     total_vram = 0;
 
     if (ggml_cuda_rdna3_qwen36_superlayer_env_present()) {
+        const bool qwen36_final_env = ggml_cuda_rdna3_qwen36_superlayer_final_requested();
+        const bool qwen36_mega_decode_effective =
+            ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_DECODE") || qwen36_final_env;
+        const bool qwen36_mega_required_effective =
+            qwen36_mega_decode_effective &&
+            (ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_REQUIRED") || qwen36_final_env);
+        const bool qwen36_mega_graph_required_effective =
+            qwen36_mega_decode_effective &&
+            (ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_REQUIRE_GRAPH") || qwen36_final_env);
+        const bool qwen36_fastpath_effective =
+            ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_FASTPATH") ||
+            qwen36_mega_decode_effective;
         GGML_LOG_INFO(
                 "rdna3_qwen36_superlayer: init-env graph_log=%d trace=%d final=%d superlayer=%d required=%d"
                 " dispatch=%d requested_effective=%d dispatch_effective=%d"
                 " mega_decode_env=%d mega_required_env=%d mega_graph_required_env=%d fastpath_env=%d"
+                " mega_decode_effective=%d mega_required_effective=%d mega_graph_required_effective=%d"
+                " fastpath_effective=%d"
                 " contract=%d run_l0=%d replace_l0=%d rms=%d qkv=%d proj=%d"
                 " proj_z=%d proj_z_math_only=%d proj_beta=%d proj_alpha=%d single_l0=%d"
                 " direct_l0_proj_weights=%d\n",
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_GRAPH_LOG") ? 1 : 0,
                 ggml_cuda_rdna3_qwen36_superlayer_trace_enabled() ? 1 : 0,
-                ggml_cuda_rdna3_qwen36_superlayer_final_requested() ? 1 : 0,
+                qwen36_final_env ? 1 : 0,
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER") ? 1 : 0,
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REQUIRED") ? 1 : 0,
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DISPATCH") ? 1 : 0,
@@ -762,6 +776,10 @@ static ggml_cuda_device_info ggml_cuda_init() {
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_REQUIRED") ? 1 : 0,
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_REQUIRE_GRAPH") ? 1 : 0,
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_FASTPATH") ? 1 : 0,
+                qwen36_mega_decode_effective ? 1 : 0,
+                qwen36_mega_required_effective ? 1 : 0,
+                qwen36_mega_graph_required_effective ? 1 : 0,
+                qwen36_fastpath_effective ? 1 : 0,
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_CONTRACT") ? 1 : 0,
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_RUN_L0") ? 1 : 0,
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0") ? 1 : 0,
@@ -7830,26 +7848,49 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         const int64_t report_id = mega_decode_report_count.fetch_add(1, std::memory_order_relaxed);
         const uint64_t prev_report_uid = mega_decode_report_uid.exchange(cgraph->uid, std::memory_order_relaxed);
         const bool report_uid_change = prev_report_uid != cgraph->uid;
-        if (rdna3_graph_log || !mega_ok || report_id < 4 || report_uid_change) {
+        if (!qwen36_superlayer_final &&
+                (rdna3_graph_log || !mega_ok || report_id < 4 || report_uid_change)) {
             ggml_cuda_rdna3_qwen36_mega_decode_report(mega_plan, cgraph->uid, mega_ok);
         }
-        if (ggml_cuda_rdna3_qwen36_superlayer_final_requested() &&
-                (rdna3_graph_log || !mega_ok || report_id < 16 || report_uid_change)) {
-            fprintf(stderr,
-                    "rdna3_qwen36_final: uid=%" PRIu64 " mega_decode=1 status=%s"
-                    " decode_candidate=%d graph_required=%d fastpath=%d nodes=%d"
-                    " fattn=%d gdn=%d topk=%d moe_gate_up=%d moe_down=%d mmid=%d"
-                    " mmid_host_sync=%d blocker=%s\n",
-                    cgraph->uid,
-                    mega_ok ? "ready-contract" : "blocked",
-                    qwen36_mega_contract_this_eval ? 1 : 0,
-                    qwen36_mega_require_graph ? 1 : 0,
-                    ggml_cuda_rdna3_qwen36_fastpath_enabled(cuda_ctx->device) ? 1 : 0,
-                    mega_plan.n_nodes, mega_plan.n_fattn, mega_plan.n_gdn,
-                    mega_plan.n_topk_moe, mega_plan.n_moe_gate_up, mega_plan.n_moe_down,
-                    mega_plan.n_mmid, mega_plan.n_mmid_host_sync,
-                    mega_plan.blocker.empty() ? "none" : mega_plan.blocker.c_str());
-            fflush(stderr);
+        if (qwen36_superlayer_final) {
+            static std::atomic<int64_t> final_report_count{0};
+            static std::atomic<int64_t> final_ready_decode_reports{0};
+            static std::atomic<int64_t> final_blocked_decode_reports{0};
+            static std::atomic<uint64_t> final_report_uid{0};
+            const int64_t final_report_id = final_report_count.fetch_add(1, std::memory_order_relaxed);
+            const uint64_t final_prev_uid = final_report_uid.exchange(cgraph->uid, std::memory_order_relaxed);
+            const bool final_uid_change = final_prev_uid != cgraph->uid;
+            const bool final_ready_decode = mega_ok && qwen36_mega_contract_this_eval;
+            const bool final_blocked_decode = !mega_ok && qwen36_mega_contract_this_eval;
+            bool final_should_report = false;
+            if (final_ready_decode) {
+                const int64_t ready_report_id =
+                    final_ready_decode_reports.fetch_add(1, std::memory_order_relaxed);
+                final_should_report = ready_report_id == 0 || (final_uid_change && final_report_id < 16);
+            } else if (final_blocked_decode) {
+                const int64_t blocked_report_id =
+                    final_blocked_decode_reports.fetch_add(1, std::memory_order_relaxed);
+                final_should_report = blocked_report_id < 16;
+            } else {
+                final_should_report = (rdna3_graph_log || !mega_ok) && final_report_id < 4;
+            }
+            if (final_should_report) {
+                fprintf(stderr,
+                        "rdna3_qwen36_final: uid=%" PRIu64 " mega_decode=1 status=%s"
+                        " decode_candidate=%d graph_required=%d fastpath=%d nodes=%d"
+                        " fattn=%d gdn=%d topk=%d moe_gate_up=%d moe_down=%d mmid=%d"
+                        " mmid_host_sync=%d blocker=%s\n",
+                        cgraph->uid,
+                        mega_ok ? "ready-contract" : "blocked",
+                        qwen36_mega_contract_this_eval ? 1 : 0,
+                        qwen36_mega_require_graph ? 1 : 0,
+                        ggml_cuda_rdna3_qwen36_fastpath_enabled(cuda_ctx->device) ? 1 : 0,
+                        mega_plan.n_nodes, mega_plan.n_fattn, mega_plan.n_gdn,
+                        mega_plan.n_topk_moe, mega_plan.n_moe_gate_up, mega_plan.n_moe_down,
+                        mega_plan.n_mmid, mega_plan.n_mmid_host_sync,
+                        mega_plan.blocker.empty() ? "none" : mega_plan.blocker.c_str());
+                fflush(stderr);
+            }
         }
         if (qwen36_mega_required && qwen36_mega_contract_this_eval && !mega_ok) {
             GGML_ABORT("%s: Qwen3.6 RDNA3 mega decode is required but this graph cannot enter the"
