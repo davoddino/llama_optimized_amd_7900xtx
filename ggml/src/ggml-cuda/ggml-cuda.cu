@@ -6754,8 +6754,9 @@ static void ggml_cuda_graph_evaluate_and_capture(
                     }
                     qwen36_superlayer_l0_launched = true;
                     if (ggml_cuda_rdna3_graph_log_enabled(cuda_ctx->device)) {
-                        GGML_LOG_INFO("%s: RDNA3 Qwen3.6 physical superlayer L0 dispatched at node %d (%s)\n",
+                        fprintf(stderr, "%s: RDNA3 Qwen3.6 physical superlayer L0 dispatched at node %d (%s)\n",
                                 __func__, i, node->name);
+                        fflush(stderr);
                     }
                 }
                 const bool qwen36_superlayer_l0_skip =
@@ -7623,7 +7624,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             superlayer_compute_entry_reports.fetch_add(1, std::memory_order_relaxed);
         const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
         if (ggml_cuda_env_enabled("GGML_CUDA_RDNA3_GRAPH_LOG") || entry_report_id < 16) {
-            GGML_LOG_INFO(
+            fprintf(stderr,
                     "rdna3_qwen36_superlayer: compute-entry device=%d cc_raw=0x%x cc_visible=0x%x"
                     " rdna3=%d nodes=%d uid=%" PRIu64 "\n",
                     cuda_ctx->device,
@@ -7632,6 +7633,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     GGML_CUDA_CC_IS_RDNA3(cc) ? 1 : 0,
                     cgraph->n_nodes,
                     cgraph->uid);
+            fflush(stderr);
         }
     }
 
@@ -7732,7 +7734,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         static std::atomic<int64_t> superlayer_probe_reports{0};
         const int64_t probe_report_id = superlayer_probe_reports.fetch_add(1, std::memory_order_relaxed);
         if (rdna3_graph_log || probe_report_id < 16 || !qwen36_superlayer_runtime || !superlayer_decode_candidate) {
-            GGML_LOG_INFO(
+            fprintf(stderr,
                     "rdna3_qwen36_superlayer: graph-probe enabled=%d runtime=%d required=%d"
                     " decode_candidate=%d has_decode_out=%d decode_out=%s l0_tokens=%" PRId64
                     " attn_norm=%s nodes=%d uid=%" PRIu64 "\n",
@@ -7746,6 +7748,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     superlayer_attn_norm_name,
                     cgraph->n_nodes,
                     cgraph->uid);
+            fflush(stderr);
         }
     }
 
@@ -7771,11 +7774,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                                 __func__, qwen36_superlayer_l0_plan.blocker.c_str());
                     }
                     if (rdna3_graph_log) {
-                        GGML_LOG_INFO("%s: RDNA3 Qwen3.6 physical superlayer L0 replacement %s%s%s\n",
+                        fprintf(stderr, "%s: RDNA3 Qwen3.6 physical superlayer L0 replacement %s%s%s\n",
                                 __func__,
                                 qwen36_superlayer_l0_replace_ready ? "ready" : "blocked",
                                 qwen36_superlayer_l0_replace_ready ? "" : ": ",
                                 qwen36_superlayer_l0_replace_ready ? "" : qwen36_superlayer_l0_plan.blocker.c_str());
+                        fflush(stderr);
                     }
                 } else {
                     std::string contract_blocker;
@@ -7787,12 +7791,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     }
                 }
             } else if (rdna3_graph_log) {
-                GGML_LOG_INFO("%s: RDNA3 Qwen3.6 physical superlayer blocked: %s\n",
+                fprintf(stderr, "%s: RDNA3 Qwen3.6 physical superlayer blocked: %s\n",
                         __func__, superlayer_blocker.c_str());
+                fflush(stderr);
             }
         } else if (rdna3_graph_log && superlayer_has_decode_out) {
-            GGML_LOG_INFO("%s: RDNA3 Qwen3.6 physical superlayer skipped non-decode graph:"
+            fprintf(stderr, "%s: RDNA3 Qwen3.6 physical superlayer skipped non-decode graph:"
                     " attn_norm-0 tokens=%" PRId64 "\n", __func__, superlayer_l0_tokens);
+            fflush(stderr);
         }
     }
 
@@ -7880,8 +7886,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     if (qwen36_superlayer_l0_replace_ready) {
         if (rdna3_graph_log && use_cuda_graph) {
-            GGML_LOG_INFO("%s: RDNA3 graph disabled for this evaluation: physical superlayer L0"
+            fprintf(stderr, "%s: RDNA3 graph disabled for this evaluation: physical superlayer L0"
                     " replacement launches at the RMS node\n", __func__);
+            fflush(stderr);
         }
         use_cuda_graph = false;
         cuda_graph_update_required = false;

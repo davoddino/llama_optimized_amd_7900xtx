@@ -1826,7 +1826,7 @@ static bool qwen36_superlayer_materialize_device_pack(
     }
 
     if (should_report) {
-        GGML_LOG_INFO(
+        fprintf(stderr,
                 "rdna3_qwen36_superlayer: device-pack-ready fingerprint=%s source=%s runtime=%s"
                 " ptr=%p layer_descs=%p io_descs=%p l0_norm=%p l0_qkv=%p l0_proj=%p scratch=%p tensors=%zu io=%zu bytes=%zu"
                 " scratch_bytes=%zu activation_slot=%zu projection_slot=%zu logits_bytes=%zu router_slot=%zu"
@@ -1839,6 +1839,7 @@ static bool qwen36_superlayer_materialize_device_pack(
                 local_view.runtime.scratch_bytes, local_view.runtime.activation_slot_bytes,
                 local_view.runtime.projection_slot_bytes, local_view.runtime.logits_bytes, local_view.runtime.router_slot_bytes,
                 local_view.runtime.n_embd, local_view.runtime.n_vocab);
+        fflush(stderr);
     }
 
     return true;
@@ -2975,7 +2976,7 @@ bool ggml_cuda_rdna3_qwen36_superlayer_enabled(const int device) {
         static std::atomic<int64_t> enabled_reports{0};
         const int64_t report_id = enabled_reports.fetch_add(1, std::memory_order_relaxed);
         if (qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_GRAPH_LOG") || report_id < 16) {
-            GGML_LOG_INFO(
+            fprintf(stderr,
                     "rdna3_qwen36_superlayer: enabled-check device=%d requested=%d rdna3=%d"
                     " enabled=%d cc_raw=0x%x cc_visible=0x%x dispatch=%d contract=%d"
                     " run_l0_math=%d replace_l0_any=%d\n",
@@ -2989,6 +2990,7 @@ bool ggml_cuda_rdna3_qwen36_superlayer_enabled(const int device) {
                     qwen36_superlayer_contract_kernel_enabled() ? 1 : 0,
                     qwen36_superlayer_run_l0_math_enabled() ? 1 : 0,
                     qwen36_superlayer_replace_l0_any_requested() ? 1 : 0);
+            fflush(stderr);
         }
     }
     return enabled;
@@ -3097,7 +3099,7 @@ bool ggml_cuda_rdna3_qwen36_superlayer_prepare(
     }
 
     if (should_report) {
-        GGML_LOG_INFO(
+        fprintf(stderr,
                 "rdna3_qwen36_superlayer: artifact-ready fingerprint=%s dir=%s nodes=%d"
                 " layers=40 fattn=%d gdn=%d topk=%d moe_gate_up=%d moe_down=%d mmid=%d"
                 " artifact_weightpack_tensors=%zu artifact_weightpack_bytes=%zu"
@@ -3109,6 +3111,7 @@ bool ggml_cuda_rdna3_qwen36_superlayer_prepare(
                 artifact_pack.refs.size(), artifact_pack.total_bytes,
                 runtime_pack.refs.size(), bindings.refs.size(), runtime_pack.total_bytes,
                 runtime.scratch_bytes);
+        fflush(stderr);
     }
 
     return true;
@@ -3125,9 +3128,10 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
         static std::atomic<int64_t> skipped_reports{0};
         const int64_t report_id = skipped_reports.fetch_add(1, std::memory_order_relaxed);
         if (report_id < 4) {
-            GGML_LOG_INFO(
+            fprintf(stderr,
                     "rdna3_qwen36_superlayer: contract-kernel-skipped"
                     " reason=no per-token superlayer work enabled l0_math=0 replace_l0=0\n");
+            fflush(stderr);
         }
         return true;
     }
@@ -3224,7 +3228,7 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
     static std::atomic<int64_t> contract_reports{0};
     const int64_t report_id = contract_reports.fetch_add(1, std::memory_order_relaxed);
     if (report_id < 8) {
-        GGML_LOG_INFO(
+        fprintf(stderr,
                 "rdna3_qwen36_superlayer: contract-kernel-launched fingerprint=%s blocks=%d threads=%d"
                 " weightpack_tensors=%zu runtime_bindings=%zu weightpack_bytes=%zu scratch_bytes=%zu"
                 " l0_stage_mask=0x%x l0_rms_norm=%s l0_qkv=%s l0_projection=%s replace_l0=%d"
@@ -3236,6 +3240,7 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
                 (l0_stage_mask_arg & 0x2u) != 0 ? "on" : "off",
                 (l0_stage_mask_arg & 0x4u) != 0 ? "on" : "off",
                 ggml_cuda_rdna3_qwen36_superlayer_replace_l0_enabled(cuda_ctx->device) ? 1 : 0);
+        fflush(stderr);
     }
 
     return true;
