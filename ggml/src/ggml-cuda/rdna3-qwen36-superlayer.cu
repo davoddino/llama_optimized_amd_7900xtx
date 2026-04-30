@@ -488,7 +488,7 @@ static qwen36_superlayer_pack_plan qwen36_superlayer_repack_refs(
 
 static qwen36_superlayer_pack_plan qwen36_superlayer_make_runtime_pack_plan(
         const qwen36_superlayer_pack_plan & full_pack) {
-    if (qwen36_superlayer_final_requested() ||
+    if (qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_FINAL") ||
             qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_FULL_WEIGHTPACK")) {
         return full_pack;
     }
