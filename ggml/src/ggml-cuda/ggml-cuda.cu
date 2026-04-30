@@ -6748,9 +6748,7 @@ static void ggml_cuda_graph_evaluate_and_capture(
             bool qwen36_one_layer_projection_bundle_launched = false;
             bool qwen36_superlayer_l0_rms_qkv_launched = false;
             bool qwen36_superlayer_l0_qkv_late_launched = false;
-            bool qwen36_superlayer_l0_proj_z_launched = false;
-            bool qwen36_superlayer_l0_proj_beta_launched = false;
-            bool qwen36_superlayer_l0_proj_alpha_launched = false;
+            bool qwen36_superlayer_l0_projection_launched = false;
             const bool qwen36_superlayer_l0_replace_rms =
                 superlayer_l0_plan != nullptr &&
                 ggml_cuda_rdna3_qwen36_superlayer_replace_l0_rms_enabled(cuda_ctx->device);
@@ -6781,6 +6779,17 @@ static void ggml_cuda_graph_evaluate_and_capture(
                 qwen36_superlayer_l0_replace_proj_beta ? 0x8u : 0u;
             const uint32_t qwen36_superlayer_l0_proj_alpha_mask =
                 qwen36_superlayer_l0_replace_proj_alpha ? 0x10u : 0u;
+            const uint32_t qwen36_superlayer_l0_projection_mask =
+                qwen36_superlayer_l0_proj_z_mask |
+                qwen36_superlayer_l0_proj_beta_mask |
+                qwen36_superlayer_l0_proj_alpha_mask;
+            const int qwen36_superlayer_l0_projection_node =
+                qwen36_superlayer_l0_proj_alpha_mask != 0 ? superlayer_l0_plan->alpha_gate :
+                qwen36_superlayer_l0_proj_beta_mask != 0  ? superlayer_l0_plan->beta_sigmoid :
+                qwen36_superlayer_l0_proj_z_mask != 0     ?
+                    (qwen36_superlayer_l0_replace_proj_z_math_only ?
+                        superlayer_l0_plan->z_math : superlayer_l0_plan->z) :
+                    -1;
             auto qwen36_superlayer_l0_launch_mask = [&](const int node_idx, const char * stage, const uint32_t mask) {
                 if (mask == 0) {
                     return;
@@ -6820,26 +6829,11 @@ static void ggml_cuda_graph_evaluate_and_capture(
                     qwen36_superlayer_l0_qkv_late_launched = true;
                 }
                 if (superlayer_l0_plan != nullptr &&
-                        !qwen36_superlayer_l0_proj_z_launched &&
-                        i == (qwen36_superlayer_l0_replace_proj_z_math_only ?
-                            superlayer_l0_plan->z_math : superlayer_l0_plan->z) &&
-                        qwen36_superlayer_l0_proj_z_mask != 0) {
-                    qwen36_superlayer_l0_launch_mask(i, "proj-z", qwen36_superlayer_l0_proj_z_mask);
-                    qwen36_superlayer_l0_proj_z_launched = true;
-                }
-                if (superlayer_l0_plan != nullptr &&
-                        !qwen36_superlayer_l0_proj_beta_launched &&
-                        i == superlayer_l0_plan->beta_sigmoid &&
-                        qwen36_superlayer_l0_proj_beta_mask != 0) {
-                    qwen36_superlayer_l0_launch_mask(i, "proj-beta", qwen36_superlayer_l0_proj_beta_mask);
-                    qwen36_superlayer_l0_proj_beta_launched = true;
-                }
-                if (superlayer_l0_plan != nullptr &&
-                        !qwen36_superlayer_l0_proj_alpha_launched &&
-                        i == superlayer_l0_plan->alpha_gate &&
-                        qwen36_superlayer_l0_proj_alpha_mask != 0) {
-                    qwen36_superlayer_l0_launch_mask(i, "proj-alpha", qwen36_superlayer_l0_proj_alpha_mask);
-                    qwen36_superlayer_l0_proj_alpha_launched = true;
+                        !qwen36_superlayer_l0_projection_launched &&
+                        i == qwen36_superlayer_l0_projection_node &&
+                        qwen36_superlayer_l0_projection_mask != 0) {
+                    qwen36_superlayer_l0_launch_mask(i, "projection", qwen36_superlayer_l0_projection_mask);
+                    qwen36_superlayer_l0_projection_launched = true;
                 }
                 const bool qwen36_superlayer_l0_skip =
                     superlayer_l0_plan != nullptr &&
