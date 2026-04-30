@@ -32,13 +32,11 @@ static bool qwen36_superlayer_final_enabled() {
 }
 
 static bool qwen36_mega_no_raw_logits_enabled() {
-    return qwen36_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_NO_RAW_LOGITS") ||
-        qwen36_superlayer_final_enabled();
+    return qwen36_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_NO_RAW_LOGITS");
 }
 
 static bool qwen36_mega_sample_token_only_enabled() {
-    return qwen36_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_SAMPLE_TOKEN_ONLY") ||
-        qwen36_superlayer_final_enabled();
+    return qwen36_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_SAMPLE_TOKEN_ONLY");
 }
 
 llama_context::llama_context(
