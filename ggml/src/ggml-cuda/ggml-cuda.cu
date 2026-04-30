@@ -6688,25 +6688,37 @@ static void ggml_cuda_graph_evaluate_and_capture(
 
             bool qwen36_one_layer_qkv_launched = false;
             bool qwen36_one_layer_projection_bundle_launched = false;
+            const bool qwen36_superlayer_l0_replace_rms =
+                superlayer_l0_plan != nullptr &&
+                ggml_cuda_rdna3_qwen36_superlayer_replace_l0_rms_enabled(cuda_ctx->device);
+            const bool qwen36_superlayer_l0_replace_qkv =
+                superlayer_l0_plan != nullptr &&
+                ggml_cuda_rdna3_qwen36_superlayer_replace_l0_qkv_enabled(cuda_ctx->device);
+            const bool qwen36_superlayer_l0_replace_proj =
+                superlayer_l0_plan != nullptr &&
+                ggml_cuda_rdna3_qwen36_superlayer_replace_l0_proj_enabled(cuda_ctx->device);
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 const bool qwen36_superlayer_l0_skip =
                     superlayer_l0_plan != nullptr &&
-                    (i == superlayer_l0_plan->rms ||
-                     i == superlayer_l0_plan->attn_norm ||
-                     i == superlayer_l0_plan->qkv_math ||
-                     i == superlayer_l0_plan->qkv_out ||
-                     i == superlayer_l0_plan->qkv ||
-                     i == superlayer_l0_plan->z ||
-                     i == superlayer_l0_plan->z_math ||
-                     i == superlayer_l0_plan->beta ||
-                     i == superlayer_l0_plan->beta_math ||
-                     i == superlayer_l0_plan->beta_sigmoid ||
-                     i == superlayer_l0_plan->alpha ||
-                     i == superlayer_l0_plan->alpha_math ||
-                     i == superlayer_l0_plan->alpha_biased ||
-                     i == superlayer_l0_plan->alpha_softplus ||
-                     i == superlayer_l0_plan->alpha_gate);
+                    ((qwen36_superlayer_l0_replace_rms &&
+                      (i == superlayer_l0_plan->rms ||
+                       i == superlayer_l0_plan->attn_norm)) ||
+                     (qwen36_superlayer_l0_replace_qkv &&
+                      (i == superlayer_l0_plan->qkv_math ||
+                       i == superlayer_l0_plan->qkv_out ||
+                       i == superlayer_l0_plan->qkv)) ||
+                     (qwen36_superlayer_l0_replace_proj &&
+                      (i == superlayer_l0_plan->z ||
+                       i == superlayer_l0_plan->z_math ||
+                       i == superlayer_l0_plan->beta ||
+                       i == superlayer_l0_plan->beta_math ||
+                       i == superlayer_l0_plan->beta_sigmoid ||
+                       i == superlayer_l0_plan->alpha ||
+                       i == superlayer_l0_plan->alpha_math ||
+                       i == superlayer_l0_plan->alpha_biased ||
+                       i == superlayer_l0_plan->alpha_softplus ||
+                       i == superlayer_l0_plan->alpha_gate)));
                 const bool qwen36_one_layer_qkv_hit =
                     one_layer_plan != nullptr &&
                     i == one_layer_plan->rms;
