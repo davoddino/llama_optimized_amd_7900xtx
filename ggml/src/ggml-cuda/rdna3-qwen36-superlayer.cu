@@ -198,6 +198,14 @@ struct qwen36_superlayer_l0_proj_desc {
     float * alpha_biased_dst = nullptr;
     float * alpha_softplus_dst = nullptr;
     float * alpha_dst = nullptr;
+    const char * wz_data = nullptr;
+    const char * wbeta_data = nullptr;
+    const char * walpha_data = nullptr;
+    const float * alpha_dt_data = nullptr;
+    const float * alpha_a_data = nullptr;
+    const float * z_scale_data = nullptr;
+    const float * beta_scale_data = nullptr;
+    const float * alpha_scale_data = nullptr;
     uint64_t wz_offset = 0;
     uint64_t wbeta_offset = 0;
     uint64_t walpha_offset = 0;
@@ -225,6 +233,7 @@ struct qwen36_superlayer_l0_proj_desc {
     uint32_t has_z_scale = 0;
     uint32_t has_beta_scale = 0;
     uint32_t has_alpha_scale = 0;
+    uint32_t use_direct_weights = 0;
     uint32_t ready = 0;
 };
 
@@ -1446,6 +1455,14 @@ static bool qwen36_superlayer_make_l0_proj_desc(
     desc->alpha_biased_dst = (float *) alpha_biased->data;
     desc->alpha_softplus_dst = (float *) alpha_softplus->data;
     desc->alpha_dst = (float *) alpha_gate->data;
+    desc->wz_data = (const char *) wz->data;
+    desc->wbeta_data = (const char *) wbeta->data;
+    desc->walpha_data = (const char *) walpha->data;
+    desc->alpha_dt_data = (const float *) alpha_dt->data;
+    desc->alpha_a_data = (const float *) alpha_a->data;
+    desc->z_scale_data = z_scale != nullptr ? (const float *) z_scale->data : nullptr;
+    desc->beta_scale_data = beta_scale != nullptr ? (const float *) beta_scale->data : nullptr;
+    desc->alpha_scale_data = alpha_scale != nullptr ? (const float *) alpha_scale->data : nullptr;
     desc->wz_offset = wz_offset;
     desc->wbeta_offset = wbeta_offset;
     desc->walpha_offset = walpha_offset;
@@ -1473,6 +1490,8 @@ static bool qwen36_superlayer_make_l0_proj_desc(
     desc->has_z_scale = z_scale != nullptr ? 1u : 0u;
     desc->has_beta_scale = beta_scale != nullptr ? 1u : 0u;
     desc->has_alpha_scale = alpha_scale != nullptr ? 1u : 0u;
+    desc->use_direct_weights =
+        qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DIRECT_L0_PROJ_WEIGHTS") ? 1u : 0u;
     desc->ready = 1u;
     return true;
 }
@@ -2727,14 +2746,17 @@ __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_projection_bundle(
     float * z = (float *) (scratch + desc->z_scratch_offset);
     float * beta = (float *) (scratch + desc->beta_scratch_offset);
     float * alpha = (float *) (scratch + desc->alpha_scratch_offset);
-    const float * alpha_dt = (const float *) (weightpack + desc->alpha_dt_offset);
-    const float * alpha_a = (const float *) (weightpack + desc->alpha_a_offset);
+    const bool use_direct_weights = desc->use_direct_weights != 0;
+    const float * alpha_dt = use_direct_weights ?
+        desc->alpha_dt_data : (const float *) (weightpack + desc->alpha_dt_offset);
+    const float * alpha_a = use_direct_weights ?
+        desc->alpha_a_data : (const float *) (weightpack + desc->alpha_a_offset);
     const float * z_scale = desc->has_z_scale != 0 ?
-        (const float *) (weightpack + desc->z_scale_offset) : nullptr;
+        (use_direct_weights ? desc->z_scale_data : (const float *) (weightpack + desc->z_scale_offset)) : nullptr;
     const float * beta_scale = desc->has_beta_scale != 0 ?
-        (const float *) (weightpack + desc->beta_scale_offset) : nullptr;
+        (use_direct_weights ? desc->beta_scale_data : (const float *) (weightpack + desc->beta_scale_offset)) : nullptr;
     const float * alpha_scale = desc->has_alpha_scale != 0 ?
-        (const float *) (weightpack + desc->alpha_scale_offset) : nullptr;
+        (use_direct_weights ? desc->alpha_scale_data : (const float *) (weightpack + desc->alpha_scale_offset)) : nullptr;
     (void) sums;
     const bool write_z = (write_outputs & 0x4u) != 0;
     const bool write_beta = (write_outputs & 0x8u) != 0;
@@ -2753,7 +2775,7 @@ __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_projection_bundle(
             if (!write_z) {
                 continue;
             }
-            w = (const char *) (weightpack + desc->wz_offset);
+            w = use_direct_weights ? desc->wz_data : (const char *) (weightpack + desc->wz_offset);
             w_nb1 = desc->wz_nb1;
             wtype = (ggml_type) desc->wz_type;
         } else {
@@ -2762,7 +2784,7 @@ __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_projection_bundle(
                 if (!write_beta) {
                     continue;
                 }
-                w = (const char *) (weightpack + desc->wbeta_offset);
+                w = use_direct_weights ? desc->wbeta_data : (const char *) (weightpack + desc->wbeta_offset);
                 w_nb1 = desc->wbeta_nb1;
                 wtype = (ggml_type) desc->wbeta_type;
             } else {
@@ -2770,7 +2792,7 @@ __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_projection_bundle(
                 if (!write_alpha) {
                     continue;
                 }
-                w = (const char *) (weightpack + desc->walpha_offset);
+                w = use_direct_weights ? desc->walpha_data : (const char *) (weightpack + desc->walpha_offset);
                 w_nb1 = desc->walpha_nb1;
                 wtype = (ggml_type) desc->walpha_type;
             }
@@ -3370,7 +3392,7 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
                 " weightpack_tensors=%zu runtime_bindings=%zu weightpack_bytes=%zu scratch_bytes=%zu"
                 " l0_stage_mask=0x%x l0_rms_norm=%s l0_qkv=%s l0_projection=%s replace_l0=%d"
                 " l0_proj_z=%s l0_proj_z_math_only=%s l0_proj_beta=%s l0_proj_alpha=%s"
-                " note=single physical cooperative 40-layer dispatch scaffold\n",
+                " direct_l0_proj_weights=%d note=single physical cooperative 40-layer dispatch scaffold\n",
                 hex_u64(plan.fingerprint).c_str(), blocks, threads,
                 device_pack.tensors, device_pack.io_count, device_pack.bytes, device_pack.runtime.scratch_bytes,
                 l0_stage_mask_arg,
@@ -3381,7 +3403,8 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
                 (l0_stage_mask_arg & 0x4u) != 0 ? "on" : "off",
                 (l0_stage_mask_arg & 0x20u) != 0 ? "on" : "off",
                 (l0_stage_mask_arg & 0x8u) != 0 ? "on" : "off",
-                (l0_stage_mask_arg & 0x10u) != 0 ? "on" : "off");
+                (l0_stage_mask_arg & 0x10u) != 0 ? "on" : "off",
+                qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DIRECT_L0_PROJ_WEIGHTS") ? 1 : 0);
         fflush(stderr);
     }
 

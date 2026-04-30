@@ -130,7 +130,8 @@ static bool ggml_cuda_rdna3_qwen36_superlayer_env_present() {
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_Z") ||
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_Z_MATH_ONLY") ||
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_BETA") ||
-        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_ALPHA");
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_ALPHA") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DIRECT_L0_PROJ_WEIGHTS");
 }
 
 static bool ggml_cuda_rdna3_qwen36_superlayer_trace_enabled() {
@@ -704,7 +705,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
         GGML_LOG_INFO(
                 "rdna3_qwen36_superlayer: init-env graph_log=%d trace=%d superlayer=%d required=%d"
                 " dispatch=%d contract=%d run_l0=%d replace_l0=%d rms=%d qkv=%d proj=%d"
-                " proj_z=%d proj_z_math_only=%d proj_beta=%d proj_alpha=%d\n",
+                " proj_z=%d proj_z_math_only=%d proj_beta=%d proj_alpha=%d direct_l0_proj_weights=%d\n",
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_GRAPH_LOG") ? 1 : 0,
                 ggml_cuda_rdna3_qwen36_superlayer_trace_enabled() ? 1 : 0,
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER") ? 1 : 0,
@@ -719,7 +720,8 @@ static ggml_cuda_device_info ggml_cuda_init() {
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_Z") ? 1 : 0,
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_Z_MATH_ONLY") ? 1 : 0,
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_BETA") ? 1 : 0,
-                ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_ALPHA") ? 1 : 0);
+                ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_ALPHA") ? 1 : 0,
+                ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DIRECT_L0_PROJ_WEIGHTS") ? 1 : 0);
     }
 
     std::vector<std::pair<int, std::string>> turing_devices_without_mma;
