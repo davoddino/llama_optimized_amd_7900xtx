@@ -41,9 +41,10 @@ GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_CACHE=/path/to/cache
 GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_BLOCKS=96
 GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_THREADS=256
 GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0=1
+GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_FULL_WEIGHTPACK=0
 ```
 
-`GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_SMOKE=1` is kept as an alias for `DISPATCH=1`. `GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0` defaults to `1` when dispatch is enabled; set it to `0` to keep the L0 dispatch diagnostic-only. The dispatch path launches one compiled physical contract kernel that calls 40 static layer blocks, reads through `device_pack + layer_descs`, reads runtime bindings, runs L0 RMSNorm, L0 QKV, and L0 projection-bundle math in-block, writes real L0 graph outputs, and touches the persistent scratch buffer. It is still mostly scaffold, but it is a single physical dispatch over the packed model data, not a ggml layer loop.
+`GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_SMOKE=1` is kept as an alias for `DISPATCH=1`. `GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0` defaults to `1` when dispatch is enabled; set it to `0` to keep the L0 dispatch diagnostic-only. The artifact still records the full 40-layer pack layout, but the runtime device pack defaults to the implemented L0 tensor subset to avoid duplicating the full model in VRAM. `GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_FULL_WEIGHTPACK=1` restores the full duplicate device pack and is expected to exceed 24 GB on the target model. The dispatch path launches one compiled physical contract kernel that calls 40 static layer blocks, reads through `device_pack + layer_descs`, reads runtime bindings, runs L0 RMSNorm, L0 QKV, and L0 projection-bundle math in-block, writes real L0 graph outputs, and touches the persistent scratch buffer. It is still mostly scaffold, but it is a single physical dispatch over the packed model data, not a ggml layer loop.
 
 The weightpack files define the persistent layout and the runtime log reports the process-local device buffer pointer as `device_pack=...`. The next implementation step is replacing the first recurrent attention state update with direct reads from the RMSNorm/QKV/projection scratch outputs and packed weights.
 

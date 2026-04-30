@@ -433,6 +433,38 @@ static qwen36_superlayer_pack_plan qwen36_superlayer_make_pack_plan(
     return pack;
 }
 
+static qwen36_superlayer_pack_plan qwen36_superlayer_repack_refs(
+        const std::vector<qwen36_superlayer_pack_ref> & refs) {
+    qwen36_superlayer_pack_plan pack;
+    pack.refs.reserve(refs.size());
+
+    size_t offset = 0;
+    for (qwen36_superlayer_pack_ref ref : refs) {
+        offset = align_up(offset, ref.alignment);
+        ref.offset = offset;
+        offset += ref.nbytes;
+        pack.refs.push_back(std::move(ref));
+    }
+    pack.total_bytes = align_up(offset, 4096);
+    return pack;
+}
+
+static qwen36_superlayer_pack_plan qwen36_superlayer_make_runtime_pack_plan(
+        const qwen36_superlayer_pack_plan & full_pack) {
+    if (qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_FULL_WEIGHTPACK")) {
+        return full_pack;
+    }
+
+    std::vector<qwen36_superlayer_pack_ref> refs;
+    refs.reserve(full_pack.refs.size());
+    for (const qwen36_superlayer_pack_ref & ref : full_pack.refs) {
+        if (ref.layer == 0) {
+            refs.push_back(ref);
+        }
+    }
+    return qwen36_superlayer_repack_refs(refs);
+}
+
 static std::string hex_u64(const uint64_t value) {
     char buf[32];
     std::snprintf(buf, sizeof(buf), "%016" PRIx64, value);
@@ -2749,10 +2781,18 @@ bool ggml_cuda_rdna3_qwen36_superlayer_prepare(
         }
         return false;
     }
-    qwen36_superlayer_pack_plan pack = qwen36_superlayer_make_pack_plan(cgraph, plan);
-    if (pack.refs.empty()) {
+    qwen36_superlayer_pack_plan artifact_pack = qwen36_superlayer_make_pack_plan(cgraph, plan);
+    if (artifact_pack.refs.empty()) {
         if (blocker != nullptr) {
             *blocker = "superlayer weight pack would be empty";
+        }
+        return false;
+    }
+    qwen36_superlayer_pack_plan runtime_pack =
+        qwen36_superlayer_make_runtime_pack_plan(artifact_pack);
+    if (runtime_pack.refs.empty()) {
+        if (blocker != nullptr) {
+            *blocker = "superlayer runtime weight pack would be empty";
         }
         return false;
     }
@@ -2778,14 +2818,14 @@ bool ggml_cuda_rdna3_qwen36_superlayer_prepare(
     }
 
     if (!already_prepared) {
-        if (!qwen36_superlayer_materialize_artifact(plan, pack, runtime, bindings, cuda_ctx->device, blocker)) {
+        if (!qwen36_superlayer_materialize_artifact(plan, artifact_pack, runtime, bindings, cuda_ctx->device, blocker)) {
             return false;
         }
         std::lock_guard<std::mutex> lock(prepared_mutex);
         prepared_fingerprints.insert(plan.fingerprint);
     }
 
-    if (!qwen36_superlayer_materialize_device_pack(cuda_ctx, cgraph, plan, pack, &device_pack, blocker)) {
+    if (!qwen36_superlayer_materialize_device_pack(cuda_ctx, cgraph, plan, runtime_pack, &device_pack, blocker)) {
         return false;
     }
 
@@ -2799,12 +2839,15 @@ bool ggml_cuda_rdna3_qwen36_superlayer_prepare(
         GGML_LOG_INFO(
                 "rdna3_qwen36_superlayer: artifact-ready fingerprint=%s dir=%s nodes=%d"
                 " layers=40 fattn=%d gdn=%d topk=%d moe_gate_up=%d moe_down=%d mmid=%d"
-                " weightpack_tensors=%zu runtime_bindings=%zu weightpack_bytes=%zu device_pack=%p"
-                " scratch=%p scratch_bytes=%zu"
+                " artifact_weightpack_tensors=%zu artifact_weightpack_bytes=%zu"
+                " runtime_weightpack_tensors=%zu runtime_bindings=%zu runtime_weightpack_bytes=%zu"
+                " device_pack=%p scratch=%p scratch_bytes=%zu"
                 " state=device-pack-ready\n",
                 hex_u64(plan.fingerprint).c_str(), plan.artifact_dir.string().c_str(), plan.n_nodes,
                 plan.n_fattn, plan.n_gdn, plan.n_topk_moe, plan.n_moe_gate_up, plan.n_moe_down, plan.n_mmid,
-                pack.refs.size(), bindings.refs.size(), pack.total_bytes, device_pack.data, device_pack.scratch,
+                artifact_pack.refs.size(), artifact_pack.total_bytes,
+                runtime_pack.refs.size(), bindings.refs.size(), runtime_pack.total_bytes,
+                device_pack.data, device_pack.scratch,
                 device_pack.runtime.scratch_bytes);
     }
 
@@ -2826,10 +2869,17 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
         }
         return false;
     }
-    qwen36_superlayer_pack_plan pack = qwen36_superlayer_make_pack_plan(cgraph, plan);
-    if (pack.refs.empty()) {
+    qwen36_superlayer_pack_plan full_pack = qwen36_superlayer_make_pack_plan(cgraph, plan);
+    if (full_pack.refs.empty()) {
         if (blocker != nullptr) {
             *blocker = "superlayer weight pack would be empty";
+        }
+        return false;
+    }
+    qwen36_superlayer_pack_plan pack = qwen36_superlayer_make_runtime_pack_plan(full_pack);
+    if (pack.refs.empty()) {
+        if (blocker != nullptr) {
+            *blocker = "superlayer runtime weight pack would be empty";
         }
         return false;
     }
