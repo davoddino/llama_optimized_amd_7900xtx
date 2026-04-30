@@ -219,6 +219,12 @@ static bool ggml_cuda_rdna3_qwen36_linear_mmvq_fast_enabled(const int device) {
         GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[device].cc);
 }
 
+static bool ggml_cuda_rdna3_qwen36_topk_fastpath_enabled(const int device) {
+    return (ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_TOPK_FASTPATH") ||
+            ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_TOPK_FASTPATH_UNSAFE")) &&
+        GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[device].cc);
+}
+
 static bool ggml_cuda_rdna3_qwen36_mega_decode_enabled(const int device) {
     return (ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_DECODE") ||
             ggml_cuda_rdna3_qwen36_superlayer_final_requested()) &&
@@ -371,6 +377,7 @@ static bool ggml_cuda_rdna3_qwen36_topk_moe_decode_shape(
         const int device, const ggml_tensor * logits, const ggml_tensor * weights, const ggml_tensor * ids,
         const ggml_tensor * bias, const ggml_cuda_topk_moe_args & args) {
     if (!ggml_cuda_rdna3_qwen36_fastpath_enabled(device) || logits == nullptr || weights == nullptr ||
+            !ggml_cuda_rdna3_qwen36_topk_fastpath_enabled(device) ||
             ids == nullptr || bias != nullptr) {
         return false;
     }
@@ -775,6 +782,8 @@ static ggml_cuda_device_info ggml_cuda_init() {
         const bool qwen36_linear_mmvq_effective =
             ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_LINEAR_MMVQ_FAST") ||
             qwen36_mega_decode_effective;
+        const bool qwen36_topk_fastpath_effective =
+            ggml_cuda_rdna3_qwen36_topk_fastpath_enabled(0);
         const bool qwen36_one_layer_mega_unsafe =
             ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_MEGA_UNSAFE") ||
             ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_FINAL_PHYSICAL_L0_UNSAFE");
@@ -809,7 +818,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
                 qwen36_mega_graph_required_effective ? 1 : 0,
                 qwen36_fastpath_effective ? 1 : 0,
                 qwen36_linear_mmvq_effective ? 1 : 0,
-                qwen36_fastpath_effective ? 1 : 0,
+                qwen36_topk_fastpath_effective ? 1 : 0,
                 qwen36_one_layer_mega_effective ? 1 : 0,
                 qwen36_one_layer_mega_unsafe ? 1 : 0,
                 ggml_cuda_rdna3_qwen36_superlayer_final_physical_l0_requested() ? 1 : 0,
