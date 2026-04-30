@@ -2967,8 +2967,31 @@ static bool qwen36_superlayer_requested() {
 } // namespace
 
 bool ggml_cuda_rdna3_qwen36_superlayer_enabled(const int device) {
-    return qwen36_superlayer_requested() &&
-        GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[device].cc);
+    const int cc = ggml_cuda_info().devices[device].cc;
+    const bool requested = qwen36_superlayer_requested();
+    const bool rdna3 = GGML_CUDA_CC_IS_RDNA3(cc);
+    const bool enabled = requested && rdna3;
+    if (requested || qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_GRAPH_LOG")) {
+        static std::atomic<int64_t> enabled_reports{0};
+        const int64_t report_id = enabled_reports.fetch_add(1, std::memory_order_relaxed);
+        if (qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_GRAPH_LOG") || report_id < 16) {
+            GGML_LOG_INFO(
+                    "rdna3_qwen36_superlayer: enabled-check device=%d requested=%d rdna3=%d"
+                    " enabled=%d cc_raw=0x%x cc_visible=0x%x dispatch=%d contract=%d"
+                    " run_l0_math=%d replace_l0_any=%d\n",
+                    device,
+                    requested ? 1 : 0,
+                    rdna3 ? 1 : 0,
+                    enabled ? 1 : 0,
+                    cc,
+                    cc & 0xffff,
+                    qwen36_superlayer_contract_dispatch_enabled() ? 1 : 0,
+                    qwen36_superlayer_contract_kernel_enabled() ? 1 : 0,
+                    qwen36_superlayer_run_l0_math_enabled() ? 1 : 0,
+                    qwen36_superlayer_replace_l0_any_requested() ? 1 : 0);
+        }
+    }
+    return enabled;
 }
 
 bool ggml_cuda_rdna3_qwen36_superlayer_required(const int device) {

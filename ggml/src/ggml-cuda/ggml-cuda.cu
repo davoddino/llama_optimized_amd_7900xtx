@@ -115,6 +115,19 @@ static int64_t ggml_cuda_env_i64(const char * name, const int64_t default_value)
     return parsed;
 }
 
+static bool ggml_cuda_rdna3_qwen36_superlayer_env_present() {
+    return ggml_cuda_env_enabled("GGML_CUDA_RDNA3_GRAPH_LOG") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REQUIRED") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DISPATCH") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_CONTRACT") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_RUN_L0") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_RMS") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_QKV") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ");
+}
+
 struct ggml_cuda_rdna3_op_profile_record {
     int64_t calls = 0;
     double  total_ms = 0.0;
@@ -678,16 +691,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
                   __func__, info.device_count, (size_t)(total_vram / (1024 * 1024)));
     total_vram = 0;
 
-    if (ggml_cuda_env_enabled("GGML_CUDA_RDNA3_GRAPH_LOG") ||
-            ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER") ||
-            ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REQUIRED") ||
-            ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DISPATCH") ||
-            ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_CONTRACT") ||
-            ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_RUN_L0") ||
-            ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0") ||
-            ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_RMS") ||
-            ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_QKV") ||
-            ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ")) {
+    if (ggml_cuda_rdna3_qwen36_superlayer_env_present()) {
         GGML_LOG_INFO(
                 "rdna3_qwen36_superlayer: init-env graph_log=%d superlayer=%d required=%d"
                 " dispatch=%d contract=%d run_l0=%d replace_l0=%d rms=%d qkv=%d proj=%d\n",
@@ -758,6 +762,18 @@ static ggml_cuda_device_info ggml_cuda_init() {
                       id, prop.name, prop.gcnArchName, info.devices[id].cc & 0xffff,
                       device_vmm ? "yes" : "no", prop.warpSize,
                       (size_t)(prop.totalGlobalMem / (1024 * 1024)));
+        if (ggml_cuda_rdna3_qwen36_superlayer_env_present()) {
+            GGML_LOG_INFO(
+                    "rdna3_qwen36_superlayer: init-device device=%d cc_raw=0x%x cc_visible=0x%x"
+                    " rdna3=%d coop=%d nsm=%d wave=%d\n",
+                    id,
+                    info.devices[id].cc,
+                    info.devices[id].cc & 0xffff,
+                    GGML_CUDA_CC_IS_RDNA3(info.devices[id].cc) ? 1 : 0,
+                    info.devices[id].supports_cooperative_launch ? 1 : 0,
+                    info.devices[id].nsm,
+                    prop.warpSize);
+        }
 #elif defined(GGML_USE_MUSA)
         // FIXME: Ensure compatibility with varying warp sizes across different MUSA archs.
         info.devices[id].warp_size = 32;
@@ -7600,6 +7616,24 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+    if (ggml_cuda_rdna3_qwen36_superlayer_env_present()) {
+        static std::atomic<int64_t> superlayer_compute_entry_reports{0};
+        const int64_t entry_report_id =
+            superlayer_compute_entry_reports.fetch_add(1, std::memory_order_relaxed);
+        const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+        if (ggml_cuda_env_enabled("GGML_CUDA_RDNA3_GRAPH_LOG") || entry_report_id < 16) {
+            GGML_LOG_INFO(
+                    "rdna3_qwen36_superlayer: compute-entry device=%d cc_raw=0x%x cc_visible=0x%x"
+                    " rdna3=%d nodes=%d uid=%" PRIu64 "\n",
+                    cuda_ctx->device,
+                    cc,
+                    cc & 0xffff,
+                    GGML_CUDA_CC_IS_RDNA3(cc) ? 1 : 0,
+                    cgraph->n_nodes,
+                    cgraph->uid);
+        }
+    }
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
