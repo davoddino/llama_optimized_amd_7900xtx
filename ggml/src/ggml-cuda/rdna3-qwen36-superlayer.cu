@@ -2606,26 +2606,21 @@ __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_qkv(
         (const float *) (weightpack + desc->qkv_scale_offset) : nullptr;
     const ggml_type wqkv_type = (ggml_type) desc->wqkv_type;
 
-    const int tid = threadIdx.x;
-    for (uint32_t row = blockIdx.x; row < n_out; row += gridDim.x) {
+    (void) sums;
+
+    const int lane = threadIdx.x & (WARP_SIZE - 1);
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int rows_per_block = max(1, blockDim.x / WARP_SIZE);
+    for (uint32_t row = blockIdx.x*rows_per_block + warp; row < n_out; row += gridDim.x*rows_per_block) {
         float acc = 0.0f;
-        for (uint32_t col = tid; col < n_embd; col += blockDim.x) {
+        for (uint32_t col = lane; col < n_embd; col += WARP_SIZE) {
             const float w = qwen36_rdna3_superlayer_dequant_weight(
                     wqkv, wqkv_type, (int64_t) desc->wqkv_nb1, row, col);
             acc += norm[col]*w;
         }
 
-        sums[tid] = acc;
-        __syncthreads();
-        for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-            if (tid < stride) {
-                sums[tid] += sums[tid + stride];
-            }
-            __syncthreads();
-        }
-
-        if (tid == 0) {
-            const float raw = sums[0];
+        const float raw = warp_reduce_sum<WARP_SIZE>(acc);
+        if (lane == 0) {
             if (write_outputs != 0 && desc->qkv_math_out != nullptr) {
                 desc->qkv_math_out[row] = raw;
             }
@@ -2640,7 +2635,6 @@ __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_qkv(
                 desc->qkv_named_out[row] = v;
             }
         }
-        __syncthreads();
     }
 }
 
@@ -2671,9 +2665,12 @@ __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_projection_bundle(
     float * alpha = (float *) (scratch + desc->alpha_scratch_offset);
     const float * alpha_dt = (const float *) (weightpack + desc->alpha_dt_offset);
     const float * alpha_a = (const float *) (weightpack + desc->alpha_a_offset);
-    const int tid = threadIdx.x;
+    (void) sums;
 
-    for (uint32_t row = blockIdx.x; row < total_out; row += gridDim.x) {
+    const int lane = threadIdx.x & (WARP_SIZE - 1);
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int rows_per_block = max(1, blockDim.x / WARP_SIZE);
+    for (uint32_t row = blockIdx.x*rows_per_block + warp; row < total_out; row += gridDim.x*rows_per_block) {
         const char * w = nullptr;
         uint64_t w_nb1 = 0;
         ggml_type wtype = GGML_TYPE_COUNT;
@@ -2697,25 +2694,17 @@ __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_projection_bundle(
         }
 
         float acc = 0.0f;
-        for (uint32_t col = tid; col < n_embd; col += blockDim.x) {
+        for (uint32_t col = lane; col < n_embd; col += WARP_SIZE) {
             const float ww = qwen36_rdna3_superlayer_dequant_weight(
                     w, wtype, (int64_t) w_nb1, local_row, col);
             acc += norm[col]*ww;
         }
 
-        sums[tid] = acc;
-        __syncthreads();
-        for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-            if (tid < stride) {
-                sums[tid] += sums[tid + stride];
-            }
-            __syncthreads();
-        }
-
-        if (tid == 0) {
+        const float sum = warp_reduce_sum<WARP_SIZE>(acc);
+        if (lane == 0) {
             local_row = row;
             if (local_row < desc->z_out) {
-                const float v = sums[0];
+                const float v = sum;
                 z[local_row] = v;
                 if (write_outputs != 0 && desc->z_math_dst != nullptr) {
                     desc->z_math_dst[local_row] = v;
@@ -2726,7 +2715,7 @@ __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_projection_bundle(
             } else {
                 local_row -= desc->z_out;
                 if (local_row < desc->beta_out) {
-                    const float raw = sums[0];
+                    const float raw = sum;
                     const float v = 1.0f / (1.0f + expf(-raw));
                     beta[local_row] = v;
                     if (write_outputs != 0 && desc->beta_math_dst != nullptr) {
@@ -2740,7 +2729,7 @@ __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_projection_bundle(
                     }
                 } else {
                     local_row -= desc->beta_out;
-                    const float raw = sums[0];
+                    const float raw = sum;
                     const float biased = raw + alpha_dt[local_row];
                     const float softplus = biased > 20.0f ? biased : log1pf(expf(biased));
                     const float v = softplus * alpha_a[local_row];
@@ -2763,7 +2752,6 @@ __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_projection_bundle(
                 }
             }
         }
-        __syncthreads();
     }
 }
 
