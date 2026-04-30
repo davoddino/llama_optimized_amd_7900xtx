@@ -24,22 +24,16 @@ static bool qwen36_env_enabled(const char * name) {
     return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
-static bool qwen36_superlayer_final_enabled() {
-    return qwen36_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_FINAL");
-}
-
 static bool qwen36_mega_no_host_io_enabled() {
     return qwen36_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_NO_HOST_IO");
 }
 
 static bool qwen36_mega_sample_token_only_enabled() {
-    return qwen36_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_SAMPLE_TOKEN_ONLY") ||
-        qwen36_superlayer_final_enabled();
+    return qwen36_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_SAMPLE_TOKEN_ONLY");
 }
 
 static bool qwen36_mega_async_inputs_enabled() {
-    return qwen36_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_ASYNC_INPUTS") ||
-        qwen36_superlayer_final_enabled();
+    return qwen36_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_ASYNC_INPUTS");
 }
 
 static thread_local ggml_backend_sched_t llm_graph_input_sched = nullptr;
