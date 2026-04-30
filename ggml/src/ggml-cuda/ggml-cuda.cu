@@ -7587,6 +7587,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     const bool qwen36_mega_decode = ggml_cuda_rdna3_qwen36_mega_decode_enabled(cuda_ctx->device);
     const bool qwen36_mega_required = ggml_cuda_rdna3_qwen36_mega_decode_required(cuda_ctx->device);
     const bool qwen36_mega_require_graph = ggml_cuda_rdna3_qwen36_mega_graph_required(cuda_ctx->device);
+    const bool qwen36_superlayer_enabled =
+        ggml_cuda_rdna3_qwen36_superlayer_enabled(cuda_ctx->device);
     const bool qwen36_superlayer_runtime =
         ggml_cuda_rdna3_qwen36_superlayer_runtime_enabled(cuda_ctx->device);
     const bool qwen36_one_layer_mega = ggml_cuda_rdna3_qwen36_one_layer_mega_enabled(cuda_ctx->device);
@@ -7648,21 +7650,47 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
     }
 
-    if (qwen36_superlayer_runtime) {
-        bool superlayer_has_decode_out = false;
-        bool superlayer_decode_candidate = false;
-        int64_t superlayer_l0_tokens = -1;
+    bool superlayer_has_decode_out = false;
+    int64_t superlayer_l0_tokens = -1;
+    const char * superlayer_decode_out_name = "<none>";
+    const char * superlayer_attn_norm_name = "<none>";
+    if (qwen36_superlayer_enabled) {
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             const ggml_tensor * node = cgraph->nodes[i];
             if (ggml_cuda_rdna3_tensor_name_starts_with(node, "result_output") && node->ne[1] == 1) {
                 superlayer_has_decode_out = true;
+                superlayer_decode_out_name = node->name;
             }
             if (ggml_cuda_rdna3_tensor_name_matches_layer(node, "attn_norm", 0) && node->ne[0] > 0) {
                 superlayer_l0_tokens = ggml_nelements(node) / node->ne[0];
+                superlayer_attn_norm_name = node->name;
             }
         }
-        superlayer_decode_candidate = superlayer_has_decode_out && superlayer_l0_tokens == 1;
+    }
+    const bool superlayer_decode_candidate = superlayer_has_decode_out && superlayer_l0_tokens == 1;
 
+    if (qwen36_superlayer_enabled) {
+        static std::atomic<int64_t> superlayer_probe_reports{0};
+        const int64_t probe_report_id = superlayer_probe_reports.fetch_add(1, std::memory_order_relaxed);
+        if (rdna3_graph_log || probe_report_id < 16 || !qwen36_superlayer_runtime || !superlayer_decode_candidate) {
+            GGML_LOG_INFO(
+                    "rdna3_qwen36_superlayer: graph-probe enabled=%d runtime=%d required=%d"
+                    " decode_candidate=%d has_decode_out=%d decode_out=%s l0_tokens=%" PRId64
+                    " attn_norm=%s nodes=%d uid=%" PRIu64 "\n",
+                    qwen36_superlayer_enabled ? 1 : 0,
+                    qwen36_superlayer_runtime ? 1 : 0,
+                    ggml_cuda_rdna3_qwen36_superlayer_required(cuda_ctx->device) ? 1 : 0,
+                    superlayer_decode_candidate ? 1 : 0,
+                    superlayer_has_decode_out ? 1 : 0,
+                    superlayer_decode_out_name,
+                    superlayer_l0_tokens,
+                    superlayer_attn_norm_name,
+                    cgraph->n_nodes,
+                    cgraph->uid);
+        }
+    }
+
+    if (qwen36_superlayer_runtime) {
         if (superlayer_decode_candidate) {
             std::string superlayer_blocker;
             const bool superlayer_ok =
