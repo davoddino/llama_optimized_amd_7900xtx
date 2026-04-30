@@ -2739,6 +2739,7 @@ __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_projection_bundle(
     const bool write_z = (write_outputs & 0x4u) != 0;
     const bool write_beta = (write_outputs & 0x8u) != 0;
     const bool write_alpha = (write_outputs & 0x10u) != 0;
+    const bool z_math_only = (write_outputs & 0x20u) != 0;
 
     const int lane = threadIdx.x & (WARP_SIZE - 1);
     const int warp = threadIdx.x / WARP_SIZE;
@@ -2789,11 +2790,13 @@ __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_projection_bundle(
                 const float scale = z_scale == nullptr ? 1.0f :
                     z_scale[desc->z_scale_n == 1 ? 0 : local_row];
                 const float v = sum*scale;
-                z[local_row] = v;
                 if (desc->z_math_dst != nullptr) {
                     desc->z_math_dst[local_row] = sum;
                 }
-                if (desc->z_dst != nullptr) {
+                if (!z_math_only) {
+                    z[local_row] = v;
+                }
+                if (!z_math_only && desc->z_dst != nullptr) {
                     desc->z_dst[local_row] = v;
                 }
             } else {
@@ -2943,7 +2946,7 @@ __global__ void qwen36_rdna3_superlayer_contract_kernel(
         l0_proj != nullptr ? l0_proj->beta_scratch_offset + (uint64_t) l0_proj->beta_out*sizeof(float) : 0;
     const uint64_t l0_proj_alpha_end =
         l0_proj != nullptr ? l0_proj->alpha_scratch_offset + (uint64_t) l0_proj->alpha_out*sizeof(float) : 0;
-    const uint32_t l0_proj_stage_mask = l0_stage_mask & 0x1cu;
+    const uint32_t l0_proj_stage_mask = l0_stage_mask & 0x3cu;
     const bool l0_proj_ready =
         l0_proj_stage_mask != 0 &&
         l0_proj != nullptr && l0_proj->ready != 0 && scratch != nullptr && weightpack != nullptr &&
@@ -3001,6 +3004,7 @@ static bool qwen36_superlayer_replace_l0_proj_requested() {
     return qwen36_superlayer_replace_l0_all_requested() ||
         qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ", 0) != 0 ||
         qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_Z", 0) != 0 ||
+        qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_Z_MATH_ONLY", 0) != 0 ||
         qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_BETA", 0) != 0 ||
         qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_ALPHA", 0) != 0;
 }
@@ -3012,7 +3016,12 @@ static bool qwen36_superlayer_replace_l0_proj_all_requested() {
 
 static bool qwen36_superlayer_replace_l0_proj_z_requested() {
     return qwen36_superlayer_replace_l0_proj_all_requested() ||
-        qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_Z", 0) != 0;
+        qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_Z", 0) != 0 ||
+        qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_Z_MATH_ONLY", 0) != 0;
+}
+
+static bool qwen36_superlayer_replace_l0_proj_z_math_only_requested() {
+    return qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_Z_MATH_ONLY", 0) != 0;
 }
 
 static bool qwen36_superlayer_replace_l0_proj_beta_requested() {
@@ -3045,6 +3054,9 @@ static uint32_t qwen36_superlayer_l0_stage_mask() {
     }
     if (qwen36_superlayer_replace_l0_proj_z_requested()) {
         mask |= 0x4u;
+    }
+    if (qwen36_superlayer_replace_l0_proj_z_math_only_requested()) {
+        mask |= 0x20u;
     }
     if (qwen36_superlayer_replace_l0_proj_beta_requested()) {
         mask |= 0x8u;
@@ -3357,7 +3369,7 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
                 "rdna3_qwen36_superlayer: contract-kernel-launched fingerprint=%s blocks=%d threads=%d"
                 " weightpack_tensors=%zu runtime_bindings=%zu weightpack_bytes=%zu scratch_bytes=%zu"
                 " l0_stage_mask=0x%x l0_rms_norm=%s l0_qkv=%s l0_projection=%s replace_l0=%d"
-                " l0_proj_z=%s l0_proj_beta=%s l0_proj_alpha=%s"
+                " l0_proj_z=%s l0_proj_z_math_only=%s l0_proj_beta=%s l0_proj_alpha=%s"
                 " note=single physical cooperative 40-layer dispatch scaffold\n",
                 hex_u64(plan.fingerprint).c_str(), blocks, threads,
                 device_pack.tensors, device_pack.io_count, device_pack.bytes, device_pack.runtime.scratch_bytes,
@@ -3367,6 +3379,7 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
                 (l0_stage_mask_arg & 0x1cu) != 0 ? "on" : "off",
                 ggml_cuda_rdna3_qwen36_superlayer_replace_l0_enabled(cuda_ctx->device) ? 1 : 0,
                 (l0_stage_mask_arg & 0x4u) != 0 ? "on" : "off",
+                (l0_stage_mask_arg & 0x20u) != 0 ? "on" : "off",
                 (l0_stage_mask_arg & 0x8u) != 0 ? "on" : "off",
                 (l0_stage_mask_arg & 0x10u) != 0 ? "on" : "off");
         fflush(stderr);
