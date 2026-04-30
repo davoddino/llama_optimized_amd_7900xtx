@@ -4235,6 +4235,7 @@ static bool ggml_cuda_rdna3_qwen36_one_layer_mega_launch(
     ggml_tensor * alpha_biased = plan.alpha_biased >= 0 ? cgraph->nodes[plan.alpha_biased] : nullptr;
     ggml_tensor * alpha_softplus = plan.alpha_softplus >= 0 ? cgraph->nodes[plan.alpha_softplus] : nullptr;
     const ggml_tensor * alpha_gate_math = ggml_cuda_rdna3_strip_view_ops(alpha_gate);
+    bool projection_bundle_ok = plan.projection_bundle;
     if (rms == nullptr || attn_norm == nullptr || qkv_out == nullptr || qkv_math == nullptr ||
             rms->op != GGML_OP_RMS_NORM || qkv_math->op != GGML_OP_MUL_MAT ||
             rms->src[0] == nullptr || qkv_math->src[0] == nullptr || qkv_math->src[1] == nullptr) {
@@ -4243,23 +4244,17 @@ static bool ggml_cuda_rdna3_qwen36_one_layer_mega_launch(
         }
         return false;
     }
-    if (z_out == nullptr || z_math == nullptr || beta_out == nullptr || beta_math == nullptr ||
+    if (projection_bundle_ok && (z_out == nullptr || z_math == nullptr || beta_out == nullptr || beta_math == nullptr ||
             alpha_gate == nullptr || alpha_math == nullptr || alpha_biased == nullptr || alpha_softplus == nullptr ||
             z_math->op != GGML_OP_MUL_MAT || beta_math->op != GGML_OP_MUL_MAT ||
             alpha_math->op != GGML_OP_MUL_MAT || beta_out->op != GGML_OP_UNARY ||
             alpha_biased->op != GGML_OP_ADD || alpha_softplus->op != GGML_OP_UNARY ||
-            alpha_gate_math == nullptr || alpha_gate_math->op != GGML_OP_MUL) {
-        if (blocker) {
-            *blocker = "missing first projection bundle operands";
-        }
-        return false;
+            alpha_gate_math == nullptr || alpha_gate_math->op != GGML_OP_MUL)) {
+        projection_bundle_ok = false;
     }
-    if (ggml_get_unary_op(beta_out) != GGML_UNARY_OP_SIGMOID ||
-            ggml_get_unary_op(alpha_softplus) != GGML_UNARY_OP_SOFTPLUS) {
-        if (blocker) {
-            *blocker = "projection bundle unary ops are not beta sigmoid and alpha softplus";
-        }
-        return false;
+    if (projection_bundle_ok && (ggml_get_unary_op(beta_out) != GGML_UNARY_OP_SIGMOID ||
+            ggml_get_unary_op(alpha_softplus) != GGML_UNARY_OP_SOFTPLUS)) {
+        projection_bundle_ok = false;
     }
 
     const ggml_tensor * x = rms->src[0];
@@ -4283,36 +4278,36 @@ static bool ggml_cuda_rdna3_qwen36_one_layer_mega_launch(
     }
 
     const ggml_tensor * wqkv = qkv_math->src[0];
-    const ggml_tensor * wz = z_math->src[0];
-    const ggml_tensor * wbeta = beta_math->src[0];
-    const ggml_tensor * walpha = alpha_math->src[0];
-    if (z_math->src[1] != attn_norm || beta_math->src[1] != attn_norm || alpha_math->src[1] != attn_norm) {
-        if (blocker) {
-            *blocker = "projection bundle MUL_MAT inputs are not the selected attn_norm";
-        }
-        return false;
+    const ggml_tensor * wz = projection_bundle_ok ? z_math->src[0] : nullptr;
+    const ggml_tensor * wbeta = projection_bundle_ok ? beta_math->src[0] : nullptr;
+    const ggml_tensor * walpha = projection_bundle_ok ? alpha_math->src[0] : nullptr;
+    if (projection_bundle_ok &&
+            (z_math->src[1] != attn_norm || beta_math->src[1] != attn_norm || alpha_math->src[1] != attn_norm)) {
+        projection_bundle_ok = false;
     }
 
     const ggml_tensor * alpha_base =
-        ggml_cuda_rdna3_strip_view_ops(plan.alpha >= 0 ? cgraph->nodes[plan.alpha] : nullptr);
+        projection_bundle_ok ? ggml_cuda_rdna3_strip_view_ops(plan.alpha >= 0 ? cgraph->nodes[plan.alpha] : nullptr) : nullptr;
 
     const ggml_tensor * alpha_dt = nullptr;
-    if (ggml_cuda_rdna3_same_tensor_or_view(alpha_biased->src[0], alpha_base)) {
-        alpha_dt = alpha_biased->src[1];
-    } else if (ggml_cuda_rdna3_same_tensor_or_view(alpha_biased->src[1], alpha_base)) {
-        alpha_dt = alpha_biased->src[0];
+    if (projection_bundle_ok) {
+        if (ggml_cuda_rdna3_same_tensor_or_view(alpha_biased->src[0], alpha_base)) {
+            alpha_dt = alpha_biased->src[1];
+        } else if (ggml_cuda_rdna3_same_tensor_or_view(alpha_biased->src[1], alpha_base)) {
+            alpha_dt = alpha_biased->src[0];
+        }
     }
     const ggml_tensor * alpha_a = nullptr;
-    if (ggml_cuda_rdna3_same_tensor_or_view(alpha_gate_math->src[0], alpha_softplus)) {
-        alpha_a = alpha_gate_math->src[1];
-    } else if (ggml_cuda_rdna3_same_tensor_or_view(alpha_gate_math->src[1], alpha_softplus)) {
-        alpha_a = alpha_gate_math->src[0];
-    }
-    if (alpha_dt == nullptr || alpha_a == nullptr || alpha_dt->type != GGML_TYPE_F32 || alpha_a->type != GGML_TYPE_F32) {
-        if (blocker) {
-            *blocker = "alpha gate constants are not f32 tensors";
+    if (projection_bundle_ok) {
+        if (ggml_cuda_rdna3_same_tensor_or_view(alpha_gate_math->src[0], alpha_softplus)) {
+            alpha_a = alpha_gate_math->src[1];
+        } else if (ggml_cuda_rdna3_same_tensor_or_view(alpha_gate_math->src[1], alpha_softplus)) {
+            alpha_a = alpha_gate_math->src[0];
         }
-        return false;
+    }
+    if (projection_bundle_ok &&
+            (alpha_dt == nullptr || alpha_a == nullptr || alpha_dt->type != GGML_TYPE_F32 || alpha_a->type != GGML_TYPE_F32)) {
+        projection_bundle_ok = false;
     }
 
     const ggml_tensor * qkv_scale = nullptr;
@@ -4341,49 +4336,61 @@ static bool ggml_cuda_rdna3_qwen36_one_layer_mega_launch(
     }
     if (x->type != GGML_TYPE_F32 || rms->type != GGML_TYPE_F32 || attn_norm->type != GGML_TYPE_F32 ||
             qkv_math->type != GGML_TYPE_F32 || qkv_out->type != GGML_TYPE_F32 ||
-            z_math->type != GGML_TYPE_F32 || z_out->type != GGML_TYPE_F32 ||
-            beta_math->type != GGML_TYPE_F32 || beta_out->type != GGML_TYPE_F32 ||
-            alpha_math->type != GGML_TYPE_F32 || alpha_gate->type != GGML_TYPE_F32 ||
-            alpha_biased->type != GGML_TYPE_F32 || alpha_softplus->type != GGML_TYPE_F32 ||
             (norm_w != nullptr && norm_w->type != GGML_TYPE_F32) ||
             (qkv_scale != nullptr && qkv_scale->type != GGML_TYPE_F32)) {
         if (blocker) {
-            *blocker = "projection bundle only supports f32 activations and scales";
+            *blocker = "one-layer QKV only supports f32 activations and scales";
         }
         return false;
+    }
+    if (projection_bundle_ok &&
+            (z_math->type != GGML_TYPE_F32 || z_out->type != GGML_TYPE_F32 ||
+             beta_math->type != GGML_TYPE_F32 || beta_out->type != GGML_TYPE_F32 ||
+             alpha_math->type != GGML_TYPE_F32 || alpha_gate->type != GGML_TYPE_F32 ||
+             alpha_biased->type != GGML_TYPE_F32 || alpha_softplus->type != GGML_TYPE_F32)) {
+        projection_bundle_ok = false;
     }
     if (!ggml_is_contiguous_1(x) || !ggml_is_contiguous_1(attn_norm) || !ggml_is_contiguous_1(qkv_out) ||
-            !ggml_is_contiguous(z_out) || !ggml_is_contiguous(beta_out) || !ggml_is_contiguous(alpha_gate) ||
             (norm_w != nullptr && !ggml_is_contiguous(norm_w)) ||
-            (qkv_scale != nullptr && !ggml_is_contiguous(qkv_scale)) ||
-            !ggml_is_contiguous(alpha_dt) || !ggml_is_contiguous(alpha_a)) {
+            (qkv_scale != nullptr && !ggml_is_contiguous(qkv_scale))) {
         if (blocker) {
-            *blocker = "projection bundle requires contiguous tensors";
+            *blocker = "one-layer QKV requires contiguous tensors";
         }
         return false;
     }
+    if (projection_bundle_ok &&
+            (!ggml_is_contiguous(z_out) || !ggml_is_contiguous(beta_out) || !ggml_is_contiguous(alpha_gate) ||
+             !ggml_is_contiguous(alpha_dt) || !ggml_is_contiguous(alpha_a))) {
+        projection_bundle_ok = false;
+    }
     if (x->ne[0] != attn_norm->ne[0] || x->ne[0] != wqkv->ne[0] ||
-            x->ne[0] != wz->ne[0] || x->ne[0] != wbeta->ne[0] || x->ne[0] != walpha->ne[0] ||
-            qkv_math->ne[0] != wqkv->ne[1] || qkv_out->ne[0] != qkv_math->ne[0] ||
-            z_math->ne[0] != wz->ne[1] || beta_math->ne[0] != wbeta->ne[1] ||
-            alpha_math->ne[0] != walpha->ne[1]) {
+            qkv_math->ne[0] != wqkv->ne[1] || qkv_out->ne[0] != qkv_math->ne[0]) {
         if (blocker) {
-            *blocker = "projection bundle tensor dimensions do not match";
+            *blocker = "one-layer QKV tensor dimensions do not match";
         }
         return false;
+    }
+    if (projection_bundle_ok &&
+            (x->ne[0] != wz->ne[0] || x->ne[0] != wbeta->ne[0] || x->ne[0] != walpha->ne[0] ||
+             z_math->ne[0] != wz->ne[1] || beta_math->ne[0] != wbeta->ne[1] ||
+             alpha_math->ne[0] != walpha->ne[1])) {
+        projection_bundle_ok = false;
     }
     if (ggml_nelements(attn_norm) != ggml_nelements(x) ||
             ggml_nelements(qkv_math) != ggml_nelements(qkv_out) ||
-            ggml_nelements(z_math) != ggml_nelements(z_out) ||
-            ggml_nelements(beta_math) != ggml_nelements(beta_out) ||
-            ggml_nelements(alpha_math) != ggml_nelements(alpha_gate) ||
-            ggml_nelements(alpha_dt) != ggml_nelements(alpha_gate) ||
-            ggml_nelements(alpha_a) != ggml_nelements(alpha_gate) ||
             ggml_nelements(qkv_out) / qkv_out->ne[0] != ggml_nelements(x) / x->ne[0]) {
         if (blocker) {
-            *blocker = "projection bundle token dimensions do not match";
+            *blocker = "one-layer QKV token dimensions do not match";
         }
         return false;
+    }
+    if (projection_bundle_ok &&
+            (ggml_nelements(z_math) != ggml_nelements(z_out) ||
+             ggml_nelements(beta_math) != ggml_nelements(beta_out) ||
+             ggml_nelements(alpha_math) != ggml_nelements(alpha_gate) ||
+             ggml_nelements(alpha_dt) != ggml_nelements(alpha_gate) ||
+             ggml_nelements(alpha_a) != ggml_nelements(alpha_gate))) {
+        projection_bundle_ok = false;
     }
     if (norm_w != nullptr && ggml_nelements(norm_w) != x->ne[0]) {
         if (blocker) {
@@ -4413,12 +4420,15 @@ static bool ggml_cuda_rdna3_qwen36_one_layer_mega_launch(
                 return false;
         }
     };
-    if (!supported_projection_weight(wqkv) || !supported_projection_weight(wz) ||
-            !supported_projection_weight(wbeta) || !supported_projection_weight(walpha)) {
+    if (!supported_projection_weight(wqkv)) {
         if (blocker) {
-            *blocker = "projection weight type is not implemented in the one-layer mega kernel";
+            *blocker = "QKV weight type is not implemented in the one-layer mega kernel";
         }
         return false;
+    }
+    if (projection_bundle_ok &&
+            (!supported_projection_weight(wz) || !supported_projection_weight(wbeta) || !supported_projection_weight(walpha))) {
+        projection_bundle_ok = false;
     }
 
     float eps;
@@ -4431,7 +4441,12 @@ static bool ggml_cuda_rdna3_qwen36_one_layer_mega_launch(
     bool used_coop_kernel = false;
     bool used_q8_dp4a = false;
     bool used_projection_bundle = false;
-    if (n_tokens == 1 && ggml_cuda_info().devices[cuda_ctx->device].supports_cooperative_launch) {
+    const bool use_coop_q8 =
+        n_tokens == 1 &&
+        wqkv->type == GGML_TYPE_Q8_0 &&
+        n_embd % QK8_1 == 0 &&
+        ggml_cuda_info().devices[cuda_ctx->device].supports_cooperative_launch;
+    if (use_coop_q8) {
         const int coop_blocks = std::max(1, std::min(ggml_cuda_info().devices[cuda_ctx->device].nsm, n_out));
         ggml_cuda_pool_alloc<float> coop_scratch(cuda_ctx->pool(), coop_blocks + 1);
 
@@ -4460,41 +4475,38 @@ static bool ggml_cuda_rdna3_qwen36_one_layer_mega_launch(
         params.qkv_ne2      = qkv_out->ne[2];
         params.n_embd       = n_embd;
         params.n_out        = n_out;
-        params.z_out        = (int) ggml_nelements(z_out);
-        params.beta_out     = (int) ggml_nelements(beta_out);
-        params.alpha_out    = (int) ggml_nelements(alpha_gate);
+        params.z_out        = projection_bundle_ok ? (int) ggml_nelements(z_out) : 0;
+        params.beta_out     = projection_bundle_ok ? (int) ggml_nelements(beta_out) : 0;
+        params.alpha_out    = projection_bundle_ok ? (int) ggml_nelements(alpha_gate) : 0;
         params.eps          = eps;
         params.partial_sums = coop_scratch.ptr;
         params.inv_rms      = coop_scratch.ptr + coop_blocks;
         params.x_q8_1       = nullptr;
         params.n_q8_1       = 0;
-        params.wz           = (const char *) wz->data;
-        params.wbeta        = (const char *) wbeta->data;
-        params.walpha       = (const char *) walpha->data;
-        params.wz_type      = wz->type;
-        params.wbeta_type   = wbeta->type;
-        params.walpha_type  = walpha->type;
-        params.wz_nb1       = wz->nb[1];
-        params.wbeta_nb1    = wbeta->nb[1];
-        params.walpha_nb1   = walpha->nb[1];
-        params.z_base       = (char *) z_out->data;
-        params.beta_base    = (char *) beta_out->data;
-        params.alpha_gate_base = (char *) alpha_gate->data;
-        params.alpha_dt     = (const float *) alpha_dt->data;
-        params.alpha_a      = (const float *) alpha_a->data;
+        params.wz           = projection_bundle_ok ? (const char *) wz->data : nullptr;
+        params.wbeta        = projection_bundle_ok ? (const char *) wbeta->data : nullptr;
+        params.walpha       = projection_bundle_ok ? (const char *) walpha->data : nullptr;
+        params.wz_type      = projection_bundle_ok ? wz->type : GGML_TYPE_COUNT;
+        params.wbeta_type   = projection_bundle_ok ? wbeta->type : GGML_TYPE_COUNT;
+        params.walpha_type  = projection_bundle_ok ? walpha->type : GGML_TYPE_COUNT;
+        params.wz_nb1       = projection_bundle_ok ? wz->nb[1] : 0;
+        params.wbeta_nb1    = projection_bundle_ok ? wbeta->nb[1] : 0;
+        params.walpha_nb1   = projection_bundle_ok ? walpha->nb[1] : 0;
+        params.z_base       = projection_bundle_ok ? (char *) z_out->data : nullptr;
+        params.beta_base    = projection_bundle_ok ? (char *) beta_out->data : nullptr;
+        params.alpha_gate_base = projection_bundle_ok ? (char *) alpha_gate->data : nullptr;
+        params.alpha_dt     = projection_bundle_ok ? (const float *) alpha_dt->data : nullptr;
+        params.alpha_a      = projection_bundle_ok ? (const float *) alpha_a->data : nullptr;
         params.projection_bundle = false;
 
         ggml_cuda_pool_alloc<block_q8_1> x_q8_1(cuda_ctx->pool());
-        if (wqkv->type == GGML_TYPE_Q8_0 && n_embd % QK8_1 == 0) {
-            params.n_q8_1 = n_embd / QK8_1;
-            params.x_q8_1 = x_q8_1.alloc(params.n_q8_1);
-            used_q8_dp4a = true;
-            params.projection_bundle =
-                plan.projection_bundle && n_tokens == 1;
-            used_projection_bundle = params.projection_bundle;
-            if (projection_bundle_used != nullptr) {
-                *projection_bundle_used = used_projection_bundle;
-            }
+        params.n_q8_1 = n_embd / QK8_1;
+        params.x_q8_1 = x_q8_1.alloc(params.n_q8_1);
+        used_q8_dp4a = true;
+        params.projection_bundle = projection_bundle_ok;
+        used_projection_bundle = params.projection_bundle;
+        if (projection_bundle_used != nullptr) {
+            *projection_bundle_used = used_projection_bundle;
         }
 
         void * kernel_args[] = { (void *) &params };
@@ -4534,7 +4546,9 @@ static bool ggml_cuda_rdna3_qwen36_one_layer_mega_launch(
                 plan.alpha, plan.alpha_math, plan.alpha_biased, plan.alpha_softplus, plan.alpha_gate,
                 rms->name, attn_norm->name, wqkv->name, qkv_out->name,
                 qkv_scale == nullptr ? "none" : qkv_scale->name,
-                ggml_type_name(wz->type), ggml_type_name(wbeta->type), ggml_type_name(walpha->type),
+                wz == nullptr ? "none" : ggml_type_name(wz->type),
+                wbeta == nullptr ? "none" : ggml_type_name(wbeta->type),
+                walpha == nullptr ? "none" : ggml_type_name(walpha->type),
                 n_tokens, n_embd, n_out, ggml_type_name(wqkv->type),
                 used_projection_bundle ? "coop-proj-q8dp4a" :
                     (used_q8_dp4a ? "coop-q8dp4a" : (used_coop_kernel ? "coop-float" : "row-block")));
