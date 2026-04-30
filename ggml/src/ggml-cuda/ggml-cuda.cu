@@ -250,6 +250,7 @@ static bool ggml_cuda_rdna3_qwen36_mega_no_host_output(const int device) {
 static bool ggml_cuda_rdna3_qwen36_one_layer_mega_enabled(const int device) {
     return ggml_cuda_rdna3_qwen36_mega_decode_enabled(device) &&
         (ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_MEGA") ||
+         ggml_cuda_rdna3_qwen36_superlayer_final_requested() ||
          ggml_cuda_rdna3_qwen36_superlayer_final_physical_l0_requested());
 }
 
@@ -774,6 +775,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
             qwen36_mega_decode_effective;
         const bool qwen36_one_layer_mega_effective =
             ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_MEGA") ||
+            qwen36_final_env ||
             ggml_cuda_rdna3_qwen36_superlayer_final_physical_l0_requested();
         GGML_LOG_INFO(
                 "rdna3_qwen36_superlayer: init-env graph_log=%d trace=%d final=%d superlayer=%d required=%d"
@@ -7952,12 +7954,18 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
 
         if (qwen36_one_layer_mega && qwen36_mega_contract_this_eval) {
+            const bool final_auto_layers =
+                qwen36_superlayer_final &&
+                !ggml_cuda_rdna3_qwen36_superlayer_final_physical_l0_requested() &&
+                !ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_MEGA") &&
+                getenv("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_MEGA_LAYER") == nullptr;
             const bool final_all_layers =
                 ggml_cuda_rdna3_qwen36_superlayer_final_physical_l0_requested() &&
                 !ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_MEGA") &&
                 getenv("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_MEGA_LAYER") == nullptr;
-            const int first_layer = final_all_layers ? 0 : ggml_cuda_rdna3_qwen36_one_layer_mega_layer();
-            const int n_layers    = final_all_layers ? 40 : 1;
+            const int first_layer = (final_auto_layers || final_all_layers) ?
+                0 : ggml_cuda_rdna3_qwen36_one_layer_mega_layer();
+            const int n_layers    = (final_auto_layers || final_all_layers) ? 40 : 1;
             int ready_layers = 0;
             int first_blocked_layer = -1;
             std::string first_blocker = "none";
@@ -7971,7 +7979,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     ggml_cuda_rdna3_qwen36_one_layer_mega_make_plan(cgraph, cuda_ctx->device, layer);
                 const bool plan_ok = ggml_cuda_rdna3_qwen36_one_layer_mega_plan_ok(plan);
 
-                if (!final_all_layers) {
+                if (!final_auto_layers && !final_all_layers) {
                     single_report_plan = plan;
                     single_report_plan_ok = plan_ok;
                 }
@@ -7995,7 +8003,18 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 one_layer_report_uid.exchange(cgraph->uid, std::memory_order_relaxed);
             const bool one_layer_uid_change = one_layer_prev_uid != cgraph->uid;
 
-            if (final_all_layers) {
+            if (final_auto_layers) {
+                if (rdna3_graph_log || ready_layers == 0 ||
+                        one_layer_report_id < 4 || one_layer_uid_change) {
+                    GGML_LOG_INFO(
+                            "rdna3_qwen36_one_layer_mega: uid=%" PRIu64
+                            " mode=final-auto-ready ready=%d/%d first_layer=%d"
+                            " first_blocked_layer=%d blocker=%s\n",
+                            cgraph->uid, ready_layers, n_layers, first_layer,
+                            first_blocked_layer,
+                            first_blocker.c_str());
+                }
+            } else if (final_all_layers) {
                 if (rdna3_graph_log || ready_layers != n_layers ||
                         one_layer_report_id < 4 || one_layer_uid_change) {
                     GGML_LOG_INFO(
@@ -8010,6 +8029,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     one_layer_report_id < 4 || one_layer_uid_change) {
                 ggml_cuda_rdna3_qwen36_one_layer_mega_report(
                         single_report_plan, cgraph->uid, single_report_plan_ok);
+            }
+
+            if (final_auto_layers && ready_layers == 0) {
+                GGML_ABORT("%s: Qwen3.6 RDNA3 final mega could not fuse any layer: %s",
+                        __func__, first_blocker.c_str());
             }
 
             if (qwen36_one_layer_mega_required && ready_layers != n_layers) {

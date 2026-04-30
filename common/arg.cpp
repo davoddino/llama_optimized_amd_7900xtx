@@ -632,17 +632,12 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         throw std::invalid_argument("error: --model is required\n");
     }
 
-    if (common_qwen36_superlayer_final_enabled() && !params.sampling.backend_sampling) {
-        params.sampling.backend_sampling = true;
-        LOG_INF("rdna3_qwen36_final: enabling backend sampling by default for final mode\n");
-    }
     if (common_qwen36_superlayer_final_enabled()) {
         if (params.enable_reasoning < 0) {
             params.enable_reasoning = 0;
             params.default_template_kwargs["enable_thinking"] = "false";
             LOG_INF("rdna3_qwen36_final: disabling reasoning by default for final low-latency mode\n");
         }
-        LOG_INF("rdna3_qwen36_final: using backend top-k<=32, temperature, dist sampler for token-only final mode\n");
     }
 
     if (params.escape) {

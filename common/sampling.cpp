@@ -313,7 +313,7 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
 
     const bool qwen36_final = sampling_qwen36_superlayer_final_enabled();
 
-    if (qwen36_final) {
+    if (qwen36_final && params.backend_sampling) {
         if (params.has_logit_bias()) {
             throw std::runtime_error("Qwen3.6 RDNA3 final mode currently requires a fully backend sampler chain and does not support logit bias");
         }
