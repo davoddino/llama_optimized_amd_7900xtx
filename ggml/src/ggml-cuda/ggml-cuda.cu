@@ -117,6 +117,7 @@ static int64_t ggml_cuda_env_i64(const char * name, const int64_t default_value)
 
 static bool ggml_cuda_rdna3_qwen36_superlayer_env_present() {
     return ggml_cuda_env_enabled("GGML_CUDA_RDNA3_GRAPH_LOG") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_TRACE") ||
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER") ||
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REQUIRED") ||
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DISPATCH") ||
@@ -126,6 +127,10 @@ static bool ggml_cuda_rdna3_qwen36_superlayer_env_present() {
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_RMS") ||
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_QKV") ||
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ");
+}
+
+static bool ggml_cuda_rdna3_qwen36_superlayer_trace_enabled() {
+    return ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_TRACE");
 }
 
 struct ggml_cuda_rdna3_op_profile_record {
@@ -693,9 +698,10 @@ static ggml_cuda_device_info ggml_cuda_init() {
 
     if (ggml_cuda_rdna3_qwen36_superlayer_env_present()) {
         GGML_LOG_INFO(
-                "rdna3_qwen36_superlayer: init-env graph_log=%d superlayer=%d required=%d"
+                "rdna3_qwen36_superlayer: init-env graph_log=%d trace=%d superlayer=%d required=%d"
                 " dispatch=%d contract=%d run_l0=%d replace_l0=%d rms=%d qkv=%d proj=%d\n",
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_GRAPH_LOG") ? 1 : 0,
+                ggml_cuda_rdna3_qwen36_superlayer_trace_enabled() ? 1 : 0,
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER") ? 1 : 0,
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REQUIRED") ? 1 : 0,
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DISPATCH") ? 1 : 0,
@@ -6753,7 +6759,7 @@ static void ggml_cuda_graph_evaluate_and_capture(
                                 " graph node %d: %s", __func__, i, superlayer_l0_blocker.c_str());
                     }
                     qwen36_superlayer_l0_launched = true;
-                    if (ggml_cuda_rdna3_graph_log_enabled(cuda_ctx->device)) {
+                    if (ggml_cuda_rdna3_qwen36_superlayer_trace_enabled()) {
                         fprintf(stderr, "%s: RDNA3 Qwen3.6 physical superlayer L0 dispatched at node %d (%s)\n",
                                 __func__, i, node->name);
                         fflush(stderr);
@@ -7618,12 +7624,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
 
-    if (ggml_cuda_rdna3_qwen36_superlayer_env_present()) {
+    if (ggml_cuda_rdna3_qwen36_superlayer_trace_enabled()) {
         static std::atomic<int64_t> superlayer_compute_entry_reports{0};
         const int64_t entry_report_id =
             superlayer_compute_entry_reports.fetch_add(1, std::memory_order_relaxed);
         const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
-        if (ggml_cuda_env_enabled("GGML_CUDA_RDNA3_GRAPH_LOG") || entry_report_id < 16) {
+        if (entry_report_id < 64) {
             fprintf(stderr,
                     "rdna3_qwen36_superlayer: compute-entry device=%d cc_raw=0x%x cc_visible=0x%x"
                     " rdna3=%d nodes=%d uid=%" PRIu64 "\n",
@@ -7733,7 +7739,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (qwen36_superlayer_enabled) {
         static std::atomic<int64_t> superlayer_probe_reports{0};
         const int64_t probe_report_id = superlayer_probe_reports.fetch_add(1, std::memory_order_relaxed);
-        if (rdna3_graph_log || probe_report_id < 16 || !qwen36_superlayer_runtime || !superlayer_decode_candidate) {
+        if (ggml_cuda_rdna3_qwen36_superlayer_trace_enabled() ||
+                probe_report_id < 4 || !qwen36_superlayer_runtime) {
             fprintf(stderr,
                     "rdna3_qwen36_superlayer: graph-probe enabled=%d runtime=%d required=%d"
                     " decode_candidate=%d has_decode_out=%d decode_out=%s l0_tokens=%" PRId64
@@ -7773,7 +7780,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                         GGML_ABORT("%s: Qwen3.6 RDNA3 physical superlayer L0 replacement failed: %s",
                                 __func__, qwen36_superlayer_l0_plan.blocker.c_str());
                     }
-                    if (rdna3_graph_log) {
+                    if (ggml_cuda_rdna3_qwen36_superlayer_trace_enabled()) {
                         fprintf(stderr, "%s: RDNA3 Qwen3.6 physical superlayer L0 replacement %s%s%s\n",
                                 __func__,
                                 qwen36_superlayer_l0_replace_ready ? "ready" : "blocked",
@@ -7790,12 +7797,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                                 __func__, contract_blocker.c_str());
                     }
                 }
-            } else if (rdna3_graph_log) {
+            } else if (ggml_cuda_rdna3_qwen36_superlayer_trace_enabled()) {
                 fprintf(stderr, "%s: RDNA3 Qwen3.6 physical superlayer blocked: %s\n",
                         __func__, superlayer_blocker.c_str());
                 fflush(stderr);
             }
-        } else if (rdna3_graph_log && superlayer_has_decode_out) {
+        } else if (ggml_cuda_rdna3_qwen36_superlayer_trace_enabled() && superlayer_has_decode_out) {
             fprintf(stderr, "%s: RDNA3 Qwen3.6 physical superlayer skipped non-decode graph:"
                     " attn_norm-0 tokens=%" PRId64 "\n", __func__, superlayer_l0_tokens);
             fflush(stderr);
@@ -7885,7 +7892,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 #endif // USE_CUDA_GRAPH
 
     if (qwen36_superlayer_l0_replace_ready) {
-        if (rdna3_graph_log && use_cuda_graph) {
+        if (ggml_cuda_rdna3_qwen36_superlayer_trace_enabled() && use_cuda_graph) {
             fprintf(stderr, "%s: RDNA3 graph disabled for this evaluation: physical superlayer L0"
                     " replacement launches at the RMS node\n", __func__);
             fflush(stderr);

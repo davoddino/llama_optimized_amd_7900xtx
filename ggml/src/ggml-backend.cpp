@@ -20,31 +20,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
-#include <atomic>
 #include <vector>
 
 #ifdef __APPLE__
 #include <sys/types.h>
 #include <sys/sysctl.h>
 #endif
-
-static bool ggml_backend_rdna3_superlayer_env_enabled(const char * name) {
-    const char * value = getenv(name);
-    return value != nullptr && value[0] != '\0' && value[0] != '0';
-}
-
-static bool ggml_backend_rdna3_superlayer_env_present() {
-    return ggml_backend_rdna3_superlayer_env_enabled("GGML_CUDA_RDNA3_GRAPH_LOG") ||
-        ggml_backend_rdna3_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER") ||
-        ggml_backend_rdna3_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REQUIRED") ||
-        ggml_backend_rdna3_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DISPATCH") ||
-        ggml_backend_rdna3_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_CONTRACT") ||
-        ggml_backend_rdna3_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_RUN_L0") ||
-        ggml_backend_rdna3_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0") ||
-        ggml_backend_rdna3_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_RMS") ||
-        ggml_backend_rdna3_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_QKV") ||
-        ggml_backend_rdna3_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ");
-}
 
 // backend buffer type
 
@@ -467,19 +448,6 @@ enum ggml_status ggml_backend_graph_compute(ggml_backend_t backend, struct ggml_
 
 enum ggml_status ggml_backend_graph_compute_async(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     GGML_ASSERT(backend);
-    if (ggml_backend_rdna3_superlayer_env_present()) {
-        static std::atomic<int64_t> backend_compute_reports{0};
-        const int64_t report_id = backend_compute_reports.fetch_add(1, std::memory_order_relaxed);
-        if (ggml_backend_rdna3_superlayer_env_enabled("GGML_CUDA_RDNA3_GRAPH_LOG") || report_id < 64) {
-            fprintf(stderr,
-                    "rdna3_qwen36_superlayer: backend-compute backend=%s nodes=%d uid=%llu report=%lld\n",
-                    ggml_backend_name(backend),
-                    cgraph == nullptr ? -1 : cgraph->n_nodes,
-                    cgraph == nullptr ? 0ull : (unsigned long long) cgraph->uid,
-                    (long long) report_id);
-            fflush(stderr);
-        }
-    }
     return backend->iface.graph_compute(backend, cgraph);
 }
 

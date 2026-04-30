@@ -32,6 +32,10 @@ static bool qwen36_superlayer_env_enabled(const char * name) {
     return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
+static bool qwen36_superlayer_trace_enabled() {
+    return qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_TRACE");
+}
+
 static int64_t qwen36_superlayer_env_i64(const char * name, const int64_t default_value) {
     const char * value = getenv(name);
     if (value == nullptr || value[0] == '\0') {
@@ -2960,10 +2964,10 @@ bool ggml_cuda_rdna3_qwen36_superlayer_enabled(const int device) {
     const bool requested = qwen36_superlayer_requested();
     const bool rdna3 = GGML_CUDA_CC_IS_RDNA3(cc);
     const bool enabled = requested && rdna3;
-    if (requested || qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_GRAPH_LOG")) {
+    if (qwen36_superlayer_trace_enabled()) {
         static std::atomic<int64_t> enabled_reports{0};
         const int64_t report_id = enabled_reports.fetch_add(1, std::memory_order_relaxed);
-        if (qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_GRAPH_LOG") || report_id < 16) {
+        if (report_id < 64) {
             fprintf(stderr,
                     "rdna3_qwen36_superlayer: enabled-check device=%d requested=%d rdna3=%d"
                     " enabled=%d cc_raw=0x%x cc_visible=0x%x dispatch=%d contract=%d"
