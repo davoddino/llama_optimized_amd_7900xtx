@@ -1798,11 +1798,20 @@ static qwen36_superlayer_plan qwen36_superlayer_make_plan(const ggml_cgraph * cg
     for (int layer = 0; layer < 40; ++layer) {
         layer_count += plan.layer_start[layer] >= 0 ? 1 : 0;
     }
+    int64_t l0_tokens = -1;
+    if (plan.layer_start[0] >= 0) {
+        const ggml_tensor * l0 = cgraph->nodes[plan.layer_start[0]];
+        if (l0 != nullptr && l0->ne[0] > 0) {
+            l0_tokens = ggml_nelements(l0) / l0->ne[0];
+        }
+    }
 
     if (!plan.has_decode_out || !plan.is_decode_token) {
         plan.blocker = "not a one-token decoder graph ending in result_output";
     } else if (layer_count != 40) {
         plan.blocker = "Qwen3.6 superlayer requires exactly 40 named layer spans";
+    } else if (l0_tokens != 1) {
+        plan.blocker = "not a one-token decoder graph internally; attn_norm-0 tokens=" + std::to_string(l0_tokens);
     } else if (plan.n_fattn != 10) {
         plan.blocker = "Qwen3.6 signature mismatch: expected 10 full-attention layers";
     } else if (plan.n_gdn != 30) {

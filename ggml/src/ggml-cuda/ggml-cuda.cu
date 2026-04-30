@@ -7569,14 +7569,19 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     if (qwen36_superlayer) {
+        bool superlayer_has_decode_out = false;
         bool superlayer_decode_candidate = false;
+        int64_t superlayer_l0_tokens = -1;
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             const ggml_tensor * node = cgraph->nodes[i];
             if (ggml_cuda_rdna3_tensor_name_starts_with(node, "result_output") && node->ne[1] == 1) {
-                superlayer_decode_candidate = true;
-                break;
+                superlayer_has_decode_out = true;
+            }
+            if (ggml_cuda_rdna3_tensor_name_matches_layer(node, "attn_norm", 0) && node->ne[0] > 0) {
+                superlayer_l0_tokens = ggml_nelements(node) / node->ne[0];
             }
         }
+        superlayer_decode_candidate = superlayer_has_decode_out && superlayer_l0_tokens == 1;
 
         if (superlayer_decode_candidate) {
             std::string superlayer_blocker;
@@ -7599,6 +7604,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 GGML_LOG_INFO("%s: RDNA3 Qwen3.6 physical superlayer blocked: %s\n",
                         __func__, superlayer_blocker.c_str());
             }
+        } else if (rdna3_graph_log && superlayer_has_decode_out) {
+            GGML_LOG_INFO("%s: RDNA3 Qwen3.6 physical superlayer skipped non-decode graph:"
+                    " attn_norm-0 tokens=%" PRId64 "\n", __func__, superlayer_l0_tokens);
         }
     }
 
