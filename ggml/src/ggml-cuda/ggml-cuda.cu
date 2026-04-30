@@ -55,6 +55,7 @@
 #include "ggml-cuda/wkv.cuh"
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
+#include "ggml-cuda/rdna3-qwen36-superlayer.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
@@ -3134,6 +3135,16 @@ struct ggml_cuda_rdna3_qwen36_one_layer_mega_plan {
     int qkv_out          = -1;
     int qkv_math         = -1;
     int qkv_skip_end     = -1;
+    int z                = -1;
+    int z_math           = -1;
+    int beta             = -1;
+    int beta_math        = -1;
+    int beta_sigmoid     = -1;
+    int alpha            = -1;
+    int alpha_math       = -1;
+    int alpha_biased     = -1;
+    int alpha_softplus   = -1;
+    int alpha_gate       = -1;
     int start            = -1;
     int end              = -1;
     int n_nodes          = 0;
@@ -3146,6 +3157,7 @@ struct ggml_cuda_rdna3_qwen36_one_layer_mega_plan {
     int n_mmid           = 0;
     int n_mmid_host_sync = 0;
     bool is_recurrent    = false;
+    bool projection_bundle = false;
     std::string blocker;
 };
 
@@ -3324,6 +3336,123 @@ static ggml_cuda_rdna3_qwen36_one_layer_mega_plan ggml_cuda_rdna3_qwen36_one_lay
     }
     plan.qkv_skip_end = std::max(plan.qkv, std::max(plan.qkv_out, plan.qkv_math));
 
+    auto strip_view_ops = [](ggml_tensor * t) {
+        for (int depth = 0; t != nullptr && depth < 8; ++depth) {
+            switch (t->op) {
+                case GGML_OP_RESHAPE:
+                case GGML_OP_VIEW:
+                case GGML_OP_PERMUTE:
+                case GGML_OP_TRANSPOSE:
+                case GGML_OP_CONT:
+                    t = t->src[0];
+                    break;
+                default:
+                    return t;
+            }
+        }
+        return t;
+    };
+
+    auto find_node_index = [&](const ggml_tensor * target, const int first, const int last) {
+        if (target == nullptr) {
+            return -1;
+        }
+        for (int i = std::max(0, first); i <= last && i < cgraph->n_nodes; ++i) {
+            if (cgraph->nodes[i] == target) {
+                return i;
+            }
+        }
+        return -1;
+    };
+
+    auto find_named_node = [&](const char * name) {
+        for (int i = plan.attn_norm + 1; i <= plan.end; ++i) {
+            if (ggml_cuda_rdna3_tensor_name_matches_layer(cgraph->nodes[i], name, layer)) {
+                return i;
+            }
+        }
+        return -1;
+    };
+
+    auto resolve_mul_mat = [&](const int node_idx) {
+        if (node_idx < 0) {
+            return -1;
+        }
+        ggml_tensor * out = strip_view_ops(cgraph->nodes[node_idx]);
+        ggml_tensor * mm  = out;
+        if (out != nullptr && out->op == GGML_OP_MUL) {
+            if (out->src[0] != nullptr && out->src[0]->op == GGML_OP_MUL_MAT) {
+                mm = out->src[0];
+            } else if (out->src[1] != nullptr && out->src[1]->op == GGML_OP_MUL_MAT) {
+                mm = out->src[1];
+            }
+        }
+        return (mm != nullptr && mm->op == GGML_OP_MUL_MAT) ?
+            find_node_index(mm, plan.attn_norm, node_idx) : -1;
+    };
+
+    plan.z            = find_named_node("z");
+    plan.beta         = find_named_node("beta");
+    plan.beta_sigmoid = find_named_node("beta_sigmoid");
+    plan.alpha        = find_named_node("alpha");
+    plan.alpha_softplus = find_named_node("a_softplus");
+    plan.alpha_gate     = find_named_node("gate");
+
+    plan.z_math     = resolve_mul_mat(plan.z);
+    plan.beta_math  = resolve_mul_mat(plan.beta);
+    plan.alpha_math = resolve_mul_mat(plan.alpha);
+
+    // The alpha "biased" node is the ADD directly consuming the alpha projection. The named alpha node is a reshape.
+    if (plan.alpha >= 0 && cgraph->nodes[plan.alpha] != nullptr) {
+        ggml_tensor * alpha_base = strip_view_ops(cgraph->nodes[plan.alpha]);
+        for (int i = plan.alpha + 1; i <= plan.end; ++i) {
+            ggml_tensor * node = cgraph->nodes[i];
+            if (node != nullptr && node->op == GGML_OP_ADD &&
+                    (node->src[0] == alpha_base || node->src[1] == alpha_base)) {
+                plan.alpha_biased = i;
+                break;
+            }
+        }
+    }
+
+    if (plan.z < 0 || plan.z_math < 0 ||
+            plan.beta < 0 || plan.beta_math < 0 || plan.beta_sigmoid < 0 ||
+            plan.alpha < 0 || plan.alpha_math < 0 || plan.alpha_biased < 0 ||
+            plan.alpha_softplus < 0 || plan.alpha_gate < 0) {
+        plan.blocker = "first projection bundle nodes not found";
+        return plan;
+    }
+    ggml_tensor * z_base_for_bundle     = strip_view_ops(cgraph->nodes[plan.z]);
+    ggml_tensor * beta_base_for_bundle  = strip_view_ops(cgraph->nodes[plan.beta]);
+    ggml_tensor * alpha_base_for_bundle = strip_view_ops(cgraph->nodes[plan.alpha]);
+    auto supported_bundle_weight = [](const ggml_tensor * w) {
+        if (w == nullptr) {
+            return false;
+        }
+        switch (w->type) {
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q6_K:
+            case GGML_TYPE_Q8_0:
+            case GGML_TYPE_F16:
+            case GGML_TYPE_F32:
+                return true;
+            default:
+                return false;
+        }
+    };
+    plan.projection_bundle =
+        cgraph->nodes[plan.qkv_math] != nullptr && cgraph->nodes[plan.qkv_math]->src[0] != nullptr &&
+        cgraph->nodes[plan.z_math] != nullptr && cgraph->nodes[plan.z_math]->src[0] != nullptr &&
+        cgraph->nodes[plan.beta_math] != nullptr && cgraph->nodes[plan.beta_math]->src[0] != nullptr &&
+        cgraph->nodes[plan.alpha_math] != nullptr && cgraph->nodes[plan.alpha_math]->src[0] != nullptr &&
+        z_base_for_bundle == cgraph->nodes[plan.z_math] &&
+        beta_base_for_bundle == cgraph->nodes[plan.beta_math] &&
+        alpha_base_for_bundle == cgraph->nodes[plan.alpha_math] &&
+        cgraph->nodes[plan.qkv_math]->src[0]->type == GGML_TYPE_Q8_0 &&
+        supported_bundle_weight(cgraph->nodes[plan.z_math]->src[0]) &&
+        supported_bundle_weight(cgraph->nodes[plan.beta_math]->src[0]) &&
+        supported_bundle_weight(cgraph->nodes[plan.alpha_math]->src[0]);
+
     for (int i = plan.start; i <= plan.end; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
         if (node == nullptr) {
@@ -3388,16 +3517,51 @@ static bool ggml_cuda_rdna3_qwen36_one_layer_mega_plan_ok(
     return plan.blocker.empty();
 }
 
+static int ggml_cuda_rdna3_qwen36_one_layer_qkv_replaced_nodes(
+        const ggml_cuda_rdna3_qwen36_one_layer_mega_plan & plan,
+        const bool include_projection_bundle) {
+    int replaced = 0;
+    const std::array<int, 15> indices = {
+        plan.rms, plan.attn_norm, plan.qkv_math, plan.qkv_out, plan.qkv,
+        include_projection_bundle ? plan.z : -1,
+        include_projection_bundle ? plan.z_math : -1,
+        include_projection_bundle ? plan.beta : -1,
+        include_projection_bundle ? plan.beta_math : -1,
+        include_projection_bundle ? plan.beta_sigmoid : -1,
+        include_projection_bundle ? plan.alpha : -1,
+        include_projection_bundle ? plan.alpha_math : -1,
+        include_projection_bundle ? plan.alpha_biased : -1,
+        include_projection_bundle ? plan.alpha_softplus : -1,
+        include_projection_bundle ? plan.alpha_gate : -1,
+    };
+
+    for (size_t i = 0; i < indices.size(); ++i) {
+        if (indices[i] < 0) {
+            continue;
+        }
+        bool seen = false;
+        for (size_t j = 0; j < i; ++j) {
+            seen = seen || indices[j] == indices[i];
+        }
+        if (!seen) {
+            ++replaced;
+        }
+    }
+
+    return replaced;
+}
+
 static void ggml_cuda_rdna3_qwen36_one_layer_mega_report(
         const ggml_cuda_rdna3_qwen36_one_layer_mega_plan & plan, const uint64_t uid, const bool ok) {
+    const int replaced = ok ? ggml_cuda_rdna3_qwen36_one_layer_qkv_replaced_nodes(plan, plan.projection_bundle) : 0;
     GGML_LOG_INFO(
             "rdna3_qwen36_one_layer_mega: uid=%" PRIu64 " layer=%d status=%s span=[%d,%d]"
             " qkv_stage=[rms=%d attn_norm=%d qkv_math=%d qkv_out=%d qkv=%d skip_end=%d]"
-            " nodes=%d kind=%s fattn=%d gdn=%d ssm_conv=%d topk=%d moe_gate_up=%d"
+            " replaced=%d/%d bundle=%d kind=%s fattn=%d gdn=%d ssm_conv=%d topk=%d moe_gate_up=%d"
             " moe_down=%d mmid=%d mmid_host_sync=%d blocker=%s\n",
-            uid, plan.layer, ok ? "qkv-ready" : "blocked", plan.start, plan.end,
+            uid, plan.layer, ok ? (plan.projection_bundle ? "projection-stage" : "qkv-stage") : "blocked", plan.start, plan.end,
             plan.rms, plan.attn_norm, plan.qkv_math, plan.qkv_out, plan.qkv, plan.qkv_skip_end,
-            plan.n_nodes, plan.is_recurrent ? "recurrent" : "attention",
+            replaced, plan.n_nodes, plan.projection_bundle ? 1 : 0, plan.is_recurrent ? "recurrent" : "attention",
             plan.n_fattn, plan.n_gdn, plan.n_ssm_conv, plan.n_topk_moe,
             plan.n_moe_gate_up, plan.n_moe_down, plan.n_mmid, plan.n_mmid_host_sync,
             plan.blocker.empty() ? "none" : plan.blocker.c_str());
@@ -3521,12 +3685,48 @@ struct ggml_cuda_rdna3_qwen36_one_layer_mega_kernel_params {
     int64_t qkv_ne2;
     int n_embd;
     int n_out;
+    int z_out;
+    int beta_out;
+    int alpha_out;
     float eps;
     float * partial_sums;
     float * inv_rms;
     block_q8_1 * x_q8_1;
     int n_q8_1;
+    const char * wz;
+    const char * wbeta;
+    const char * walpha;
+    ggml_type wz_type;
+    ggml_type wbeta_type;
+    ggml_type walpha_type;
+    int64_t wz_nb1;
+    int64_t wbeta_nb1;
+    int64_t walpha_nb1;
+    char * z_base;
+    char * beta_base;
+    char * alpha_gate_base;
+    const float * alpha_dt;
+    const float * alpha_a;
+    bool projection_bundle;
 };
+
+static __device__ __forceinline__ float ggml_cuda_rdna3_qwen36_dot_q8_0_q8_1_row(
+        const char * __restrict__ wrow,
+        const block_q8_1 * __restrict__ x_q8_1,
+        const int n_q8_1,
+        const int lane) {
+    constexpr int vdr = VDR_Q8_0_Q8_1_MMVQ;
+    constexpr int qi = QI8_0;
+    constexpr int blocks_per_iter = vdr*32/qi;
+
+    float acc = 0.0f;
+    for (int kbx = lane / (qi/vdr); kbx < n_q8_1; kbx += blocks_per_iter) {
+        const int kqs = vdr * (lane % (qi/vdr));
+        acc += vec_dot_q8_0_q8_1(wrow, x_q8_1 + kbx, kbx, kqs);
+    }
+
+    return warp_reduce_sum<32>(acc);
+}
 
 static __global__ void ggml_cuda_rdna3_qwen36_one_layer_mega_kernel(
         const char * __restrict__ x_base,
@@ -3712,23 +3912,72 @@ static __global__ void ggml_cuda_rdna3_qwen36_one_layer_mega_coop_kernel(
     grid.sync();
 
     if (q8_0_dot) {
-        constexpr int vdr = VDR_Q8_0_Q8_1_MMVQ;
-        constexpr int qi = QI8_0;
-        constexpr int blocks_per_iter = vdr*32/qi;
-
         for (int row = bid*nwarps + warp; row < p.n_out; row += n_blocks*nwarps) {
             const char * wrow = p.wqkv + (int64_t) row*p.wqkv_nb1;
-            float acc = 0.0f;
-            for (int kbx = lane / (qi/vdr); kbx < p.n_q8_1; kbx += blocks_per_iter) {
-                const int kqs = vdr * (lane % (qi/vdr));
-                acc += vec_dot_q8_0_q8_1(wrow, p.x_q8_1 + kbx, kbx, kqs);
-            }
-
-            acc = warp_reduce_sum<32>(acc);
+            const float acc = ggml_cuda_rdna3_qwen36_dot_q8_0_q8_1_row(
+                    wrow, p.x_q8_1, p.n_q8_1, lane);
             if (lane == 0) {
                 const float scale = p.qkv_scale == nullptr ? 1.0f :
                     p.qkv_scale[p.qkv_scale_n == 1 ? 0 : row];
                 qkv[row] = acc * scale;
+            }
+        }
+
+        if (p.projection_bundle) {
+            const int bundle_out = p.z_out + p.beta_out + p.alpha_out;
+            for (int row = bid*nwarps + warp; row < bundle_out; row += n_blocks*nwarps) {
+                const char * wrow = nullptr;
+                ggml_type wtype = GGML_TYPE_COUNT;
+                int64_t wnb1 = 0;
+                int local_row = row;
+                if (local_row < p.z_out) {
+                    wrow = p.wz;
+                    wtype = p.wz_type;
+                    wnb1 = p.wz_nb1;
+                } else {
+                    local_row -= p.z_out;
+                    if (local_row < p.beta_out) {
+                        wrow = p.wbeta;
+                        wtype = p.wbeta_type;
+                        wnb1 = p.wbeta_nb1;
+                    } else {
+                        local_row -= p.beta_out;
+                        wrow = p.walpha;
+                        wtype = p.walpha_type;
+                        wnb1 = p.walpha_nb1;
+                    }
+                }
+
+                float acc = 0.0f;
+                if (wtype == GGML_TYPE_Q8_0) {
+                    acc = ggml_cuda_rdna3_qwen36_dot_q8_0_q8_1_row(
+                            wrow + (int64_t) local_row*wnb1, p.x_q8_1, p.n_q8_1, lane);
+                } else {
+                    for (int k = lane; k < p.n_embd; k += 32) {
+                        const float w = ggml_cuda_rdna3_qwen36_one_layer_dequant_weight(
+                                wrow, wtype, wnb1, local_row, k);
+                        acc += norm[k] * w;
+                    }
+                    acc = warp_reduce_sum<32>(acc);
+                }
+                if (lane != 0) {
+                    continue;
+                }
+
+                local_row = row;
+                if (local_row < p.z_out) {
+                    ((float *) p.z_base)[local_row] = acc;
+                } else {
+                    local_row -= p.z_out;
+                    if (local_row < p.beta_out) {
+                        ((float *) p.beta_base)[local_row] = 1.0f / (1.0f + expf(-acc));
+                    } else {
+                        local_row -= p.beta_out;
+                        const float biased = acc + p.alpha_dt[local_row];
+                        const float softplus = biased > 20.0f ? biased : log1pf(expf(biased));
+                        ((float *) p.alpha_gate_base)[local_row] = softplus * p.alpha_a[local_row];
+                    }
+                }
             }
         }
     } else {
@@ -3764,7 +4013,11 @@ static bool ggml_cuda_rdna3_qwen36_one_layer_mega_launch(
         ggml_backend_cuda_context * cuda_ctx,
         const ggml_cgraph * cgraph,
         const ggml_cuda_rdna3_qwen36_one_layer_mega_plan & plan,
-        std::string * blocker) {
+        std::string * blocker,
+        bool * projection_bundle_used) {
+    if (projection_bundle_used != nullptr) {
+        *projection_bundle_used = false;
+    }
     if (cgraph == nullptr || plan.rms < 0 || plan.attn_norm < 0 || plan.qkv_out < 0 || plan.qkv_math < 0 ||
             plan.qkv_skip_end < plan.qkv_math || plan.qkv_skip_end >= cgraph->n_nodes) {
         if (blocker) {
@@ -3777,11 +4030,37 @@ static bool ggml_cuda_rdna3_qwen36_one_layer_mega_launch(
     ggml_tensor * attn_norm = cgraph->nodes[plan.attn_norm];
     ggml_tensor * qkv_out   = cgraph->nodes[plan.qkv_out];
     ggml_tensor * qkv_math  = cgraph->nodes[plan.qkv_math];
+    ggml_tensor * z_out     = plan.z >= 0 ? cgraph->nodes[plan.z] : nullptr;
+    ggml_tensor * z_math    = plan.z_math >= 0 ? cgraph->nodes[plan.z_math] : nullptr;
+    ggml_tensor * beta_out  = plan.beta_sigmoid >= 0 ? cgraph->nodes[plan.beta_sigmoid] : nullptr;
+    ggml_tensor * beta_math = plan.beta_math >= 0 ? cgraph->nodes[plan.beta_math] : nullptr;
+    ggml_tensor * alpha_gate = plan.alpha_gate >= 0 ? cgraph->nodes[plan.alpha_gate] : nullptr;
+    ggml_tensor * alpha_math = plan.alpha_math >= 0 ? cgraph->nodes[plan.alpha_math] : nullptr;
+    ggml_tensor * alpha_biased = plan.alpha_biased >= 0 ? cgraph->nodes[plan.alpha_biased] : nullptr;
+    ggml_tensor * alpha_softplus = plan.alpha_softplus >= 0 ? cgraph->nodes[plan.alpha_softplus] : nullptr;
     if (rms == nullptr || attn_norm == nullptr || qkv_out == nullptr || qkv_math == nullptr ||
             rms->op != GGML_OP_RMS_NORM || qkv_math->op != GGML_OP_MUL_MAT ||
             rms->src[0] == nullptr || qkv_math->src[0] == nullptr || qkv_math->src[1] == nullptr) {
         if (blocker) {
             *blocker = "missing RMS_NORM or QKV MUL_MAT operands";
+        }
+        return false;
+    }
+    if (z_out == nullptr || z_math == nullptr || beta_out == nullptr || beta_math == nullptr ||
+            alpha_gate == nullptr || alpha_math == nullptr || alpha_biased == nullptr || alpha_softplus == nullptr ||
+            z_math->op != GGML_OP_MUL_MAT || beta_math->op != GGML_OP_MUL_MAT ||
+            alpha_math->op != GGML_OP_MUL_MAT || beta_out->op != GGML_OP_UNARY ||
+            alpha_biased->op != GGML_OP_ADD || alpha_softplus->op != GGML_OP_UNARY ||
+            alpha_gate->op != GGML_OP_MUL) {
+        if (blocker) {
+            *blocker = "missing first projection bundle operands";
+        }
+        return false;
+    }
+    if (ggml_get_unary_op(beta_out) != GGML_UNARY_OP_SIGMOID ||
+            ggml_get_unary_op(alpha_softplus) != GGML_UNARY_OP_SOFTPLUS) {
+        if (blocker) {
+            *blocker = "projection bundle unary ops are not beta sigmoid and alpha softplus";
         }
         return false;
     }
@@ -3807,6 +4086,51 @@ static bool ggml_cuda_rdna3_qwen36_one_layer_mega_launch(
     }
 
     const ggml_tensor * wqkv = qkv_math->src[0];
+    const ggml_tensor * wz = z_math->src[0];
+    const ggml_tensor * wbeta = beta_math->src[0];
+    const ggml_tensor * walpha = alpha_math->src[0];
+    if (z_math->src[1] != attn_norm || beta_math->src[1] != attn_norm || alpha_math->src[1] != attn_norm) {
+        if (blocker) {
+            *blocker = "projection bundle MUL_MAT inputs are not the selected attn_norm";
+        }
+        return false;
+    }
+
+    ggml_tensor * alpha_base = plan.alpha >= 0 ? cgraph->nodes[plan.alpha] : nullptr;
+    for (int depth = 0; alpha_base != nullptr && depth < 8; ++depth) {
+        switch (alpha_base->op) {
+            case GGML_OP_RESHAPE:
+            case GGML_OP_VIEW:
+            case GGML_OP_PERMUTE:
+            case GGML_OP_TRANSPOSE:
+            case GGML_OP_CONT:
+                alpha_base = alpha_base->src[0];
+                break;
+            default:
+                depth = 8;
+                break;
+        }
+    }
+
+    const ggml_tensor * alpha_dt = nullptr;
+    if (alpha_biased->src[0] == alpha_base) {
+        alpha_dt = alpha_biased->src[1];
+    } else if (alpha_biased->src[1] == alpha_base) {
+        alpha_dt = alpha_biased->src[0];
+    }
+    const ggml_tensor * alpha_a = nullptr;
+    if (alpha_gate->src[0] == alpha_softplus) {
+        alpha_a = alpha_gate->src[1];
+    } else if (alpha_gate->src[1] == alpha_softplus) {
+        alpha_a = alpha_gate->src[0];
+    }
+    if (alpha_dt == nullptr || alpha_a == nullptr || alpha_dt->type != GGML_TYPE_F32 || alpha_a->type != GGML_TYPE_F32) {
+        if (blocker) {
+            *blocker = "alpha gate constants are not f32 tensors";
+        }
+        return false;
+    }
+
     const ggml_tensor * qkv_scale = nullptr;
     if (qkv_out->op == GGML_OP_MUL) {
         if (qkv_out->src[0] == qkv_math) {
@@ -3833,33 +4157,47 @@ static bool ggml_cuda_rdna3_qwen36_one_layer_mega_launch(
     }
     if (x->type != GGML_TYPE_F32 || rms->type != GGML_TYPE_F32 || attn_norm->type != GGML_TYPE_F32 ||
             qkv_math->type != GGML_TYPE_F32 || qkv_out->type != GGML_TYPE_F32 ||
+            z_math->type != GGML_TYPE_F32 || z_out->type != GGML_TYPE_F32 ||
+            beta_math->type != GGML_TYPE_F32 || beta_out->type != GGML_TYPE_F32 ||
+            alpha_math->type != GGML_TYPE_F32 || alpha_gate->type != GGML_TYPE_F32 ||
+            alpha_biased->type != GGML_TYPE_F32 || alpha_softplus->type != GGML_TYPE_F32 ||
             (norm_w != nullptr && norm_w->type != GGML_TYPE_F32) ||
             (qkv_scale != nullptr && qkv_scale->type != GGML_TYPE_F32)) {
         if (blocker) {
-            *blocker = "QKV mega stage only supports f32 activations and scales";
+            *blocker = "projection bundle only supports f32 activations and scales";
         }
         return false;
     }
     if (!ggml_is_contiguous_1(x) || !ggml_is_contiguous_1(attn_norm) || !ggml_is_contiguous_1(qkv_out) ||
+            !ggml_is_contiguous(z_out) || !ggml_is_contiguous(beta_out) || !ggml_is_contiguous(alpha_gate) ||
             (norm_w != nullptr && !ggml_is_contiguous(norm_w)) ||
-            (qkv_scale != nullptr && !ggml_is_contiguous(qkv_scale))) {
+            (qkv_scale != nullptr && !ggml_is_contiguous(qkv_scale)) ||
+            !ggml_is_contiguous(alpha_dt) || !ggml_is_contiguous(alpha_a)) {
         if (blocker) {
-            *blocker = "QKV mega stage requires row-contiguous tensors";
+            *blocker = "projection bundle requires contiguous tensors";
         }
         return false;
     }
     if (x->ne[0] != attn_norm->ne[0] || x->ne[0] != wqkv->ne[0] ||
-            qkv_math->ne[0] != wqkv->ne[1] || qkv_out->ne[0] != qkv_math->ne[0]) {
+            x->ne[0] != wz->ne[0] || x->ne[0] != wbeta->ne[0] || x->ne[0] != walpha->ne[0] ||
+            qkv_math->ne[0] != wqkv->ne[1] || qkv_out->ne[0] != qkv_math->ne[0] ||
+            z_math->ne[0] != wz->ne[1] || beta_math->ne[0] != wbeta->ne[1] ||
+            alpha_math->ne[0] != walpha->ne[1]) {
         if (blocker) {
-            *blocker = "QKV mega stage tensor dimensions do not match";
+            *blocker = "projection bundle tensor dimensions do not match";
         }
         return false;
     }
     if (ggml_nelements(attn_norm) != ggml_nelements(x) ||
             ggml_nelements(qkv_math) != ggml_nelements(qkv_out) ||
+            ggml_nelements(z_math) != ggml_nelements(z_out) ||
+            ggml_nelements(beta_math) != ggml_nelements(beta_out) ||
+            ggml_nelements(alpha_math) != ggml_nelements(alpha_gate) ||
+            ggml_nelements(alpha_dt) != ggml_nelements(alpha_gate) ||
+            ggml_nelements(alpha_a) != ggml_nelements(alpha_gate) ||
             ggml_nelements(qkv_out) / qkv_out->ne[0] != ggml_nelements(x) / x->ne[0]) {
         if (blocker) {
-            *blocker = "QKV mega stage token dimensions do not match";
+            *blocker = "projection bundle token dimensions do not match";
         }
         return false;
     }
@@ -3876,18 +4214,27 @@ static bool ggml_cuda_rdna3_qwen36_one_layer_mega_launch(
         return false;
     }
 
-    switch (wqkv->type) {
-        case GGML_TYPE_Q4_K:
-        case GGML_TYPE_Q6_K:
-        case GGML_TYPE_Q8_0:
-        case GGML_TYPE_F16:
-        case GGML_TYPE_F32:
-            break;
-        default:
-            if (blocker) {
-                *blocker = "QKV weight type is not implemented in the one-layer mega kernel";
-            }
+    auto supported_projection_weight = [](const ggml_tensor * w) {
+        if (w == nullptr) {
             return false;
+        }
+        switch (w->type) {
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q6_K:
+            case GGML_TYPE_Q8_0:
+            case GGML_TYPE_F16:
+            case GGML_TYPE_F32:
+                return true;
+            default:
+                return false;
+        }
+    };
+    if (!supported_projection_weight(wqkv) || !supported_projection_weight(wz) ||
+            !supported_projection_weight(wbeta) || !supported_projection_weight(walpha)) {
+        if (blocker) {
+            *blocker = "projection weight type is not implemented in the one-layer mega kernel";
+        }
+        return false;
     }
 
     float eps;
@@ -3899,6 +4246,7 @@ static bool ggml_cuda_rdna3_qwen36_one_layer_mega_launch(
     dim3 block(256, 1, 1);
     bool used_coop_kernel = false;
     bool used_q8_dp4a = false;
+    bool used_projection_bundle = false;
     if (n_tokens == 1 && ggml_cuda_info().devices[cuda_ctx->device].supports_cooperative_launch) {
         const int coop_blocks = std::max(1, std::min(ggml_cuda_info().devices[cuda_ctx->device].nsm, n_out));
         ggml_cuda_pool_alloc<float> coop_scratch(cuda_ctx->pool(), coop_blocks + 1);
@@ -3928,17 +4276,41 @@ static bool ggml_cuda_rdna3_qwen36_one_layer_mega_launch(
         params.qkv_ne2      = qkv_out->ne[2];
         params.n_embd       = n_embd;
         params.n_out        = n_out;
+        params.z_out        = (int) ggml_nelements(z_out);
+        params.beta_out     = (int) ggml_nelements(beta_out);
+        params.alpha_out    = (int) ggml_nelements(alpha_gate);
         params.eps          = eps;
         params.partial_sums = coop_scratch.ptr;
         params.inv_rms      = coop_scratch.ptr + coop_blocks;
         params.x_q8_1       = nullptr;
         params.n_q8_1       = 0;
+        params.wz           = (const char *) wz->data;
+        params.wbeta        = (const char *) wbeta->data;
+        params.walpha       = (const char *) walpha->data;
+        params.wz_type      = wz->type;
+        params.wbeta_type   = wbeta->type;
+        params.walpha_type  = walpha->type;
+        params.wz_nb1       = wz->nb[1];
+        params.wbeta_nb1    = wbeta->nb[1];
+        params.walpha_nb1   = walpha->nb[1];
+        params.z_base       = (char *) z_out->data;
+        params.beta_base    = (char *) beta_out->data;
+        params.alpha_gate_base = (char *) alpha_gate->data;
+        params.alpha_dt     = (const float *) alpha_dt->data;
+        params.alpha_a      = (const float *) alpha_a->data;
+        params.projection_bundle = false;
 
         ggml_cuda_pool_alloc<block_q8_1> x_q8_1(cuda_ctx->pool());
         if (wqkv->type == GGML_TYPE_Q8_0 && n_embd % QK8_1 == 0) {
             params.n_q8_1 = n_embd / QK8_1;
             params.x_q8_1 = x_q8_1.alloc(params.n_q8_1);
             used_q8_dp4a = true;
+            params.projection_bundle =
+                plan.projection_bundle && n_tokens == 1;
+            used_projection_bundle = params.projection_bundle;
+            if (projection_bundle_used != nullptr) {
+                *projection_bundle_used = used_projection_bundle;
+            }
         }
 
         void * kernel_args[] = { (void *) &params };
@@ -3964,22 +4336,24 @@ static bool ggml_cuda_rdna3_qwen36_one_layer_mega_launch(
     static std::atomic<int64_t> qkv_report_count{0};
     const int64_t report_id = qkv_report_count.fetch_add(1, std::memory_order_relaxed);
     if (report_id < 16 || ggml_cuda_rdna3_graph_log_enabled(cuda_ctx->device)) {
-        const int skipped_nodes =
-            1 + (plan.attn_norm != plan.rms ? 1 : 0) +
-            (plan.qkv_math != plan.rms && plan.qkv_math != plan.attn_norm ? 1 : 0) +
-            (plan.qkv_out != plan.rms && plan.qkv_out != plan.attn_norm && plan.qkv_out != plan.qkv_math ? 1 : 0) +
-            (plan.qkv != plan.rms && plan.qkv != plan.attn_norm &&
-             plan.qkv != plan.qkv_math && plan.qkv != plan.qkv_out ? 1 : 0);
+        const int replaced_nodes = ggml_cuda_rdna3_qwen36_one_layer_qkv_replaced_nodes(plan, used_projection_bundle);
         GGML_LOG_INFO(
-                "rdna3_qwen36_one_layer_mega: executed-qkv layer=%d skipped_nodes=%d"
-                " skip_indices=[%d,%d,%d,%d,%d] rms=%s attn_norm=%s wqkv=%s qkv=%s qkv_scale=%s"
+                "rdna3_qwen36_one_layer_mega: executed-stage1 layer=%d replaced=%d/%d bundle=%d"
+                " qkv_indices=[%d,%d,%d,%d,%d]"
+                " proj_indices=[z=%d z_mm=%d beta=%d beta_mm=%d beta_sig=%d alpha=%d alpha_mm=%d alpha_add=%d alpha_sp=%d gate=%d]"
+                " rms=%s attn_norm=%s wqkv=%s qkv=%s qkv_scale=%s"
+                " wz_type=%s wbeta_type=%s walpha_type=%s"
                 " tokens=%" PRId64 " n_embd=%d n_out=%d type=%s mode=%s\n",
-                plan.layer, skipped_nodes,
+                plan.layer, replaced_nodes, plan.n_nodes, used_projection_bundle ? 1 : 0,
                 plan.rms, plan.attn_norm, plan.qkv_math, plan.qkv_out, plan.qkv,
+                plan.z, plan.z_math, plan.beta, plan.beta_math, plan.beta_sigmoid,
+                plan.alpha, plan.alpha_math, plan.alpha_biased, plan.alpha_softplus, plan.alpha_gate,
                 rms->name, attn_norm->name, wqkv->name, qkv_out->name,
                 qkv_scale == nullptr ? "none" : qkv_scale->name,
+                ggml_type_name(wz->type), ggml_type_name(wbeta->type), ggml_type_name(walpha->type),
                 n_tokens, n_embd, n_out, ggml_type_name(wqkv->type),
-                used_q8_dp4a ? "coop-q8dp4a" : (used_coop_kernel ? "coop-float" : "row-block"));
+                used_projection_bundle ? "coop-proj-q8dp4a" :
+                    (used_q8_dp4a ? "coop-q8dp4a" : (used_coop_kernel ? "coop-float" : "row-block")));
     }
 
     return true;
@@ -6288,6 +6662,7 @@ static void ggml_cuda_graph_evaluate_and_capture(
             }
 
             bool qwen36_one_layer_qkv_launched = false;
+            bool qwen36_one_layer_projection_bundle_launched = false;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 const bool qwen36_one_layer_qkv_hit =
@@ -6299,12 +6674,24 @@ static void ggml_cuda_graph_evaluate_and_capture(
                     (i == one_layer_plan->attn_norm ||
                      i == one_layer_plan->qkv_math ||
                      i == one_layer_plan->qkv_out ||
-                     i == one_layer_plan->qkv);
+                     i == one_layer_plan->qkv ||
+                     (qwen36_one_layer_projection_bundle_launched &&
+                      (i == one_layer_plan->z ||
+                       i == one_layer_plan->z_math ||
+                       i == one_layer_plan->beta ||
+                       i == one_layer_plan->beta_math ||
+                       i == one_layer_plan->beta_sigmoid ||
+                       i == one_layer_plan->alpha ||
+                       i == one_layer_plan->alpha_math ||
+                       i == one_layer_plan->alpha_biased ||
+                       i == one_layer_plan->alpha_softplus ||
+                       i == one_layer_plan->alpha_gate)));
 
                 if (qwen36_one_layer_qkv_hit) {
                     std::string qkv_blocker;
                     const bool qkv_ok = ggml_cuda_rdna3_qwen36_one_layer_mega_launch(
-                            cuda_ctx, cgraph, *one_layer_plan, &qkv_blocker);
+                            cuda_ctx, cgraph, *one_layer_plan, &qkv_blocker,
+                            &qwen36_one_layer_projection_bundle_launched);
                     if (!qkv_ok) {
                         GGML_ABORT("%s: Qwen3.6 RDNA3 one-layer QKV mega failed: %s",
                                 __func__, qkv_blocker.c_str());
@@ -7123,6 +7510,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     const bool qwen36_mega_decode = ggml_cuda_rdna3_qwen36_mega_decode_enabled(cuda_ctx->device);
     const bool qwen36_mega_required = ggml_cuda_rdna3_qwen36_mega_decode_required(cuda_ctx->device);
     const bool qwen36_mega_require_graph = ggml_cuda_rdna3_qwen36_mega_graph_required(cuda_ctx->device);
+    const bool qwen36_superlayer = ggml_cuda_rdna3_qwen36_superlayer_enabled(cuda_ctx->device);
     const bool qwen36_one_layer_mega = ggml_cuda_rdna3_qwen36_one_layer_mega_enabled(cuda_ctx->device);
     const bool qwen36_one_layer_mega_required =
         ggml_cuda_rdna3_qwen36_one_layer_mega_required(cuda_ctx->device);
@@ -7176,6 +7564,40 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 GGML_ABORT("%s: Qwen3.6 RDNA3 one-layer mega is required but layer %d cannot enter"
                         " the one-layer contract: %s",
                         __func__, one_layer, qwen36_one_layer_plan.blocker.c_str());
+            }
+        }
+    }
+
+    if (qwen36_superlayer) {
+        bool superlayer_decode_candidate = false;
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const ggml_tensor * node = cgraph->nodes[i];
+            if (ggml_cuda_rdna3_tensor_name_starts_with(node, "result_output") && node->ne[1] == 1) {
+                superlayer_decode_candidate = true;
+                break;
+            }
+        }
+
+        if (superlayer_decode_candidate) {
+            std::string superlayer_blocker;
+            const bool superlayer_ok =
+                ggml_cuda_rdna3_qwen36_superlayer_prepare(cuda_ctx, cgraph, &superlayer_blocker);
+            if (!superlayer_ok && ggml_cuda_rdna3_qwen36_superlayer_required(cuda_ctx->device)) {
+                GGML_ABORT("%s: Qwen3.6 RDNA3 physical superlayer is required but the decode graph"
+                        " cannot be materialized: %s", __func__, superlayer_blocker.c_str());
+            }
+
+            if (superlayer_ok) {
+                std::string smoke_blocker;
+                const bool smoke_ok =
+                    ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_smoke(cuda_ctx, cgraph, &smoke_blocker);
+                if (!smoke_ok && ggml_cuda_rdna3_qwen36_superlayer_required(cuda_ctx->device)) {
+                    GGML_ABORT("%s: Qwen3.6 RDNA3 physical superlayer smoke dispatch failed: %s",
+                            __func__, smoke_blocker.c_str());
+                }
+            } else if (rdna3_graph_log) {
+                GGML_LOG_INFO("%s: RDNA3 Qwen3.6 physical superlayer blocked: %s\n",
+                        __func__, superlayer_blocker.c_str());
             }
         }
     }

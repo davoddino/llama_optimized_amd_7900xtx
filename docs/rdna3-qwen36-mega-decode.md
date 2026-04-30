@@ -8,6 +8,38 @@ The target path is not the generic ggml executor. The target hot loop is:
 2. run the fixed Qwen3.6 layer topology as one persistent mega-decode runtime or as a small fixed sequence of cooperative launches;
 3. return tokens to the CPU only as final output for streaming, never as an input dependency for the next decode token.
 
+## Physical superlayer path
+
+The stricter target is a load-time generated physical superlayer for the exact Qwen3.6/gfx1100 topology. This is separate from the older one-layer QKV/projection experiment.
+
+```bash
+GGML_CUDA_RDNA3_QWEN36_SUPERLAYER=1
+```
+
+When enabled on a matching one-token Qwen3.6 decode graph, the backend computes a topology fingerprint and materializes a cache artifact:
+
+```text
+$XDG_CACHE_HOME/llama.cpp/rdna3-qwen36-superlayer/<fingerprint>/
+  manifest.json
+  layout.generated.h
+  fused_model.hip
+  weightpack.plan
+```
+
+This artifact is intentionally not a generic layer manifest. The generated source has 40 static fused blocks in the exact graph order, with no runtime layer loop. The current state is a scaffold: it proves the load-time artifact/cache boundary and can optionally launch a single physical smoke dispatch, but it does not replace the decode math yet.
+
+Optional strict/scaffold controls:
+
+```bash
+GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REQUIRED=1
+GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_SMOKE=1
+GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_CACHE=/path/to/cache
+GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_BLOCKS=96
+GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_THREADS=256
+```
+
+The next implementation step is replacing `weightpack.plan` with the real gfx1100 weight pack and filling `fused_model.hip` with generated dataflow blocks instead of the placeholders.
+
 The current `GGML_CUDA_RDNA3_QWEN36_MEGA_DECODE=1` implementation is a hard contract gate. It validates that the one-token graph has the Qwen3.6-35B-A3B signature:
 
 - 10 full-attention layers;
