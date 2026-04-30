@@ -3003,6 +3003,10 @@ __global__ void qwen36_rdna3_superlayer_contract_kernel(
     }
 }
 
+static bool qwen36_superlayer_final_requested() {
+    return qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_FINAL");
+}
+
 static bool qwen36_superlayer_l0_env_requested() {
     return qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_RUN_L0") ||
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0") ||
@@ -3013,12 +3017,14 @@ static bool qwen36_superlayer_l0_env_requested() {
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_Z_MATH_ONLY") ||
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_BETA") ||
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_ALPHA") ||
-        qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_SINGLE_L0_DISPATCH");
+        qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_SINGLE_L0_DISPATCH") ||
+        qwen36_superlayer_final_requested();
 }
 
 static bool qwen36_superlayer_replace_l0_all_requested() {
     return qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0", 0) != 0 ||
-        qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_SINGLE_L0_DISPATCH", 0) != 0;
+        qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_SINGLE_L0_DISPATCH", 0) != 0 ||
+        qwen36_superlayer_final_requested();
 }
 
 static bool qwen36_superlayer_replace_l0_rms_requested() {
@@ -3072,7 +3078,8 @@ static bool qwen36_superlayer_replace_l0_any_requested() {
 }
 
 static uint32_t qwen36_superlayer_l0_stage_mask() {
-    if (qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_RUN_L0")) {
+    if (qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_RUN_L0") ||
+            qwen36_superlayer_final_requested()) {
         return 0x1fu;
     }
 
@@ -3104,7 +3111,8 @@ static bool qwen36_superlayer_run_l0_math_enabled() {
 
 static bool qwen36_superlayer_contract_kernel_enabled() {
     return qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_CONTRACT") ||
-        qwen36_superlayer_run_l0_math_enabled();
+        qwen36_superlayer_run_l0_math_enabled() ||
+        qwen36_superlayer_final_requested();
 }
 
 static bool qwen36_superlayer_contract_dispatch_enabled() {
@@ -3113,6 +3121,7 @@ static bool qwen36_superlayer_contract_dispatch_enabled() {
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER") ||
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REQUIRED") ||
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_CONTRACT") ||
+        qwen36_superlayer_final_requested() ||
         qwen36_superlayer_l0_env_requested();
 }
 
@@ -3120,6 +3129,7 @@ static bool qwen36_superlayer_requested() {
     return qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER") ||
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REQUIRED") ||
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_CONTRACT") ||
+        qwen36_superlayer_final_requested() ||
         qwen36_superlayer_l0_env_requested();
 }
 
@@ -3156,13 +3166,20 @@ bool ggml_cuda_rdna3_qwen36_superlayer_enabled(const int device) {
 
 bool ggml_cuda_rdna3_qwen36_superlayer_required(const int device) {
     return ggml_cuda_rdna3_qwen36_superlayer_enabled(device) &&
-        qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REQUIRED");
+        (qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REQUIRED") ||
+         qwen36_superlayer_final_requested());
 }
 
 bool ggml_cuda_rdna3_qwen36_superlayer_runtime_enabled(const int device) {
     return ggml_cuda_rdna3_qwen36_superlayer_enabled(device) &&
         qwen36_superlayer_contract_dispatch_enabled() &&
         qwen36_superlayer_contract_kernel_enabled();
+}
+
+bool ggml_cuda_rdna3_qwen36_superlayer_final_enabled(const int device) {
+    return ggml_cuda_rdna3_qwen36_superlayer_enabled(device) &&
+        qwen36_superlayer_contract_dispatch_enabled() &&
+        qwen36_superlayer_final_requested();
 }
 
 bool ggml_cuda_rdna3_qwen36_superlayer_replace_l0_enabled(const int device) {
@@ -3407,12 +3424,15 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
     const int64_t report_id = contract_reports.fetch_add(1, std::memory_order_relaxed);
     (void) report_id;
     if (qwen36_superlayer_trace_enabled()) {
+        const bool final_requested = qwen36_superlayer_final_requested();
         fprintf(stderr,
-                "rdna3_qwen36_superlayer: contract-kernel-launched fingerprint=%s blocks=%d threads=%d"
+                "rdna3_qwen36_superlayer: %s fingerprint=%s blocks=%d threads=%d"
                 " weightpack_tensors=%zu runtime_bindings=%zu weightpack_bytes=%zu scratch_bytes=%zu"
                 " l0_stage_mask=0x%x l0_rms_norm=%s l0_qkv=%s l0_projection=%s replace_l0=%d"
                 " l0_proj_z=%s l0_proj_z_math_only=%s l0_proj_beta=%s l0_proj_alpha=%s"
-                " direct_l0_proj_weights=%d note=single physical cooperative 40-layer dispatch scaffold\n",
+                " direct_l0_proj_weights=%d final_requested=%d numeric_layers=%d/40"
+                " note=%s\n",
+                final_requested ? "final-kernel-launched" : "contract-kernel-launched",
                 hex_u64(plan.fingerprint).c_str(), blocks, threads,
                 device_pack.tensors, device_pack.io_count, device_pack.bytes, device_pack.runtime.scratch_bytes,
                 l0_stage_mask_arg,
@@ -3424,7 +3444,12 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
                 (l0_stage_mask_arg & 0x20u) != 0 ? "on" : "off",
                 (l0_stage_mask_arg & 0x8u) != 0 ? "on" : "off",
                 (l0_stage_mask_arg & 0x10u) != 0 ? "on" : "off",
-                qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DIRECT_L0_PROJ_WEIGHTS") ? 1 : 0);
+                qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DIRECT_L0_PROJ_WEIGHTS") ? 1 : 0,
+                final_requested ? 1 : 0,
+                l0_stage_mask_arg == 0x1fu ? 1 : 0,
+                final_requested ?
+                    "final mode currently covers full L0 in one cooperative launch; 40-layer dataflow must replace scaffold" :
+                    "single physical cooperative 40-layer dispatch scaffold");
         fflush(stderr);
     }
 

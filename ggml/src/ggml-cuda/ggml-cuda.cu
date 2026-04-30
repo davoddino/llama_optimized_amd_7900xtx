@@ -118,6 +118,7 @@ static int64_t ggml_cuda_env_i64(const char * name, const int64_t default_value)
 static bool ggml_cuda_rdna3_qwen36_superlayer_env_present() {
     return ggml_cuda_env_enabled("GGML_CUDA_RDNA3_GRAPH_LOG") ||
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_TRACE") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_FINAL") ||
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER") ||
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REQUIRED") ||
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DISPATCH") ||
@@ -139,6 +140,10 @@ static bool ggml_cuda_rdna3_qwen36_superlayer_trace_enabled() {
     return ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_TRACE");
 }
 
+static bool ggml_cuda_rdna3_qwen36_superlayer_final_requested() {
+    return ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_FINAL");
+}
+
 static bool ggml_cuda_rdna3_qwen36_superlayer_l0_env_requested() {
     return ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_RUN_L0") ||
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0") ||
@@ -149,13 +154,15 @@ static bool ggml_cuda_rdna3_qwen36_superlayer_l0_env_requested() {
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_Z_MATH_ONLY") ||
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_BETA") ||
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_ALPHA") ||
-        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_SINGLE_L0_DISPATCH");
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_SINGLE_L0_DISPATCH") ||
+        ggml_cuda_rdna3_qwen36_superlayer_final_requested();
 }
 
 static bool ggml_cuda_rdna3_qwen36_superlayer_requested_effective() {
     return ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER") ||
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REQUIRED") ||
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_CONTRACT") ||
+        ggml_cuda_rdna3_qwen36_superlayer_final_requested() ||
         ggml_cuda_rdna3_qwen36_superlayer_l0_env_requested();
 }
 
@@ -734,13 +741,14 @@ static ggml_cuda_device_info ggml_cuda_init() {
 
     if (ggml_cuda_rdna3_qwen36_superlayer_env_present()) {
         GGML_LOG_INFO(
-                "rdna3_qwen36_superlayer: init-env graph_log=%d trace=%d superlayer=%d required=%d"
+                "rdna3_qwen36_superlayer: init-env graph_log=%d trace=%d final=%d superlayer=%d required=%d"
                 " dispatch=%d requested_effective=%d dispatch_effective=%d"
                 " contract=%d run_l0=%d replace_l0=%d rms=%d qkv=%d proj=%d"
                 " proj_z=%d proj_z_math_only=%d proj_beta=%d proj_alpha=%d single_l0=%d"
                 " direct_l0_proj_weights=%d\n",
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_GRAPH_LOG") ? 1 : 0,
                 ggml_cuda_rdna3_qwen36_superlayer_trace_enabled() ? 1 : 0,
+                ggml_cuda_rdna3_qwen36_superlayer_final_requested() ? 1 : 0,
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER") ? 1 : 0,
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REQUIRED") ? 1 : 0,
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DISPATCH") ? 1 : 0,
@@ -6828,6 +6836,7 @@ static void ggml_cuda_graph_evaluate_and_capture(
                 qwen36_superlayer_l0_replace_qkv &&
                 qwen36_superlayer_l0_projection_mask != 0 &&
                 (qwen36_superlayer_l0_full_projection ||
+                 ggml_cuda_rdna3_qwen36_superlayer_final_enabled(cuda_ctx->device) ||
                  ggml_cuda_rdna3_qwen36_superlayer_single_l0_dispatch_requested());
             const uint32_t qwen36_superlayer_l0_entry_mask =
                 qwen36_superlayer_l0_single_dispatch ?
@@ -6872,7 +6881,9 @@ static void ggml_cuda_graph_evaluate_and_capture(
                         qwen36_superlayer_l0_entry_mask != 0) {
                     qwen36_superlayer_l0_launch_mask(
                             i,
-                            qwen36_superlayer_l0_single_dispatch ? "single-l0" : "rms-qkv",
+                            ggml_cuda_rdna3_qwen36_superlayer_final_enabled(cuda_ctx->device) ?
+                                "final-single-l0" :
+                                (qwen36_superlayer_l0_single_dispatch ? "single-l0" : "rms-qkv"),
                             qwen36_superlayer_l0_entry_mask);
                     qwen36_superlayer_l0_rms_qkv_launched = true;
                     qwen36_superlayer_l0_projection_launched = qwen36_superlayer_l0_single_dispatch;
@@ -7787,6 +7798,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         ggml_cuda_rdna3_qwen36_superlayer_enabled(cuda_ctx->device);
     const bool qwen36_superlayer_runtime =
         ggml_cuda_rdna3_qwen36_superlayer_runtime_enabled(cuda_ctx->device);
+    const bool qwen36_superlayer_final =
+        ggml_cuda_rdna3_qwen36_superlayer_final_enabled(cuda_ctx->device);
     const bool qwen36_one_layer_mega = ggml_cuda_rdna3_qwen36_one_layer_mega_enabled(cuda_ctx->device);
     const bool qwen36_one_layer_mega_required =
         ggml_cuda_rdna3_qwen36_one_layer_mega_required(cuda_ctx->device);
@@ -7871,11 +7884,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         (void) probe_report_id;
         if (ggml_cuda_rdna3_qwen36_superlayer_trace_enabled() || !qwen36_superlayer_runtime) {
             fprintf(stderr,
-                    "rdna3_qwen36_superlayer: graph-probe enabled=%d runtime=%d required=%d"
+                    "rdna3_qwen36_superlayer: graph-probe enabled=%d runtime=%d final=%d required=%d"
                     " decode_candidate=%d has_decode_out=%d decode_out=%s l0_tokens=%" PRId64
                     " attn_norm=%s nodes=%d uid=%" PRIu64 "\n",
                     qwen36_superlayer_enabled ? 1 : 0,
                     qwen36_superlayer_runtime ? 1 : 0,
+                    qwen36_superlayer_final ? 1 : 0,
                     ggml_cuda_rdna3_qwen36_superlayer_required(cuda_ctx->device) ? 1 : 0,
                     superlayer_decode_candidate ? 1 : 0,
                     superlayer_has_decode_out ? 1 : 0,
