@@ -219,6 +219,27 @@ static bool ggml_cuda_rdna3_tensor_name_matches_layer(
     return ggml_cuda_rdna3_tensor_name_equals(tensor, name);
 }
 
+static const ggml_tensor * ggml_cuda_rdna3_strip_view_ops(const ggml_tensor * t) {
+    for (int depth = 0; t != nullptr && depth < 8; ++depth) {
+        switch (t->op) {
+            case GGML_OP_RESHAPE:
+            case GGML_OP_VIEW:
+            case GGML_OP_PERMUTE:
+            case GGML_OP_TRANSPOSE:
+            case GGML_OP_CONT:
+                t = t->src[0];
+                break;
+            default:
+                return t;
+        }
+    }
+    return t;
+}
+
+static bool ggml_cuda_rdna3_same_tensor_or_view(const ggml_tensor * a, const ggml_tensor * b) {
+    return a == b || ggml_cuda_rdna3_strip_view_ops(a) == ggml_cuda_rdna3_strip_view_ops(b);
+}
+
 static bool ggml_cuda_rdna3_qwen36_output_decode_shape(
         const int device, const ggml_tensor * src0, const ggml_tensor * dst) {
     if (!ggml_cuda_rdna3_qwen36_fastpath_enabled(device) || src0 == nullptr || dst == nullptr ||
@@ -3353,6 +3374,10 @@ static ggml_cuda_rdna3_qwen36_one_layer_mega_plan ggml_cuda_rdna3_qwen36_one_lay
         return t;
     };
 
+    auto same_tensor_or_view = [&](ggml_tensor * a, ggml_tensor * b) {
+        return a == b || strip_view_ops(a) == strip_view_ops(b);
+    };
+
     auto find_node_index = [&](const ggml_tensor * target, const int first, const int last) {
         if (target == nullptr) {
             return -1;
@@ -3408,7 +3433,8 @@ static ggml_cuda_rdna3_qwen36_one_layer_mega_plan ggml_cuda_rdna3_qwen36_one_lay
         for (int i = plan.alpha + 1; i <= plan.end; ++i) {
             ggml_tensor * node = cgraph->nodes[i];
             if (node != nullptr && node->op == GGML_OP_ADD &&
-                    (node->src[0] == alpha_base || node->src[1] == alpha_base)) {
+                    (same_tensor_or_view(node->src[0], alpha_base) ||
+                     same_tensor_or_view(node->src[1], alpha_base))) {
                 plan.alpha_biased = i;
                 break;
             }
@@ -3549,6 +3575,16 @@ static int ggml_cuda_rdna3_qwen36_one_layer_qkv_replaced_nodes(
     }
 
     return replaced;
+}
+
+static bool ggml_cuda_rdna3_qwen36_l0_replacement_plan_ok(
+        const ggml_cuda_rdna3_qwen36_one_layer_mega_plan & plan) {
+    return plan.rms >= 0 && plan.attn_norm >= 0 &&
+        plan.qkv >= 0 && plan.qkv_out >= 0 && plan.qkv_math >= 0 &&
+        plan.z >= 0 && plan.z_math >= 0 &&
+        plan.beta >= 0 && plan.beta_math >= 0 && plan.beta_sigmoid >= 0 &&
+        plan.alpha >= 0 && plan.alpha_math >= 0 && plan.alpha_biased >= 0 &&
+        plan.alpha_softplus >= 0 && plan.alpha_gate >= 0;
 }
 
 static void ggml_cuda_rdna3_qwen36_one_layer_mega_report(
@@ -4038,6 +4074,7 @@ static bool ggml_cuda_rdna3_qwen36_one_layer_mega_launch(
     ggml_tensor * alpha_math = plan.alpha_math >= 0 ? cgraph->nodes[plan.alpha_math] : nullptr;
     ggml_tensor * alpha_biased = plan.alpha_biased >= 0 ? cgraph->nodes[plan.alpha_biased] : nullptr;
     ggml_tensor * alpha_softplus = plan.alpha_softplus >= 0 ? cgraph->nodes[plan.alpha_softplus] : nullptr;
+    const ggml_tensor * alpha_gate_math = ggml_cuda_rdna3_strip_view_ops(alpha_gate);
     if (rms == nullptr || attn_norm == nullptr || qkv_out == nullptr || qkv_math == nullptr ||
             rms->op != GGML_OP_RMS_NORM || qkv_math->op != GGML_OP_MUL_MAT ||
             rms->src[0] == nullptr || qkv_math->src[0] == nullptr || qkv_math->src[1] == nullptr) {
@@ -4051,7 +4088,7 @@ static bool ggml_cuda_rdna3_qwen36_one_layer_mega_launch(
             z_math->op != GGML_OP_MUL_MAT || beta_math->op != GGML_OP_MUL_MAT ||
             alpha_math->op != GGML_OP_MUL_MAT || beta_out->op != GGML_OP_UNARY ||
             alpha_biased->op != GGML_OP_ADD || alpha_softplus->op != GGML_OP_UNARY ||
-            alpha_gate->op != GGML_OP_MUL) {
+            alpha_gate_math == nullptr || alpha_gate_math->op != GGML_OP_MUL) {
         if (blocker) {
             *blocker = "missing first projection bundle operands";
         }
@@ -4096,33 +4133,20 @@ static bool ggml_cuda_rdna3_qwen36_one_layer_mega_launch(
         return false;
     }
 
-    ggml_tensor * alpha_base = plan.alpha >= 0 ? cgraph->nodes[plan.alpha] : nullptr;
-    for (int depth = 0; alpha_base != nullptr && depth < 8; ++depth) {
-        switch (alpha_base->op) {
-            case GGML_OP_RESHAPE:
-            case GGML_OP_VIEW:
-            case GGML_OP_PERMUTE:
-            case GGML_OP_TRANSPOSE:
-            case GGML_OP_CONT:
-                alpha_base = alpha_base->src[0];
-                break;
-            default:
-                depth = 8;
-                break;
-        }
-    }
+    const ggml_tensor * alpha_base =
+        ggml_cuda_rdna3_strip_view_ops(plan.alpha >= 0 ? cgraph->nodes[plan.alpha] : nullptr);
 
     const ggml_tensor * alpha_dt = nullptr;
-    if (alpha_biased->src[0] == alpha_base) {
+    if (ggml_cuda_rdna3_same_tensor_or_view(alpha_biased->src[0], alpha_base)) {
         alpha_dt = alpha_biased->src[1];
-    } else if (alpha_biased->src[1] == alpha_base) {
+    } else if (ggml_cuda_rdna3_same_tensor_or_view(alpha_biased->src[1], alpha_base)) {
         alpha_dt = alpha_biased->src[0];
     }
     const ggml_tensor * alpha_a = nullptr;
-    if (alpha_gate->src[0] == alpha_softplus) {
-        alpha_a = alpha_gate->src[1];
-    } else if (alpha_gate->src[1] == alpha_softplus) {
-        alpha_a = alpha_gate->src[0];
+    if (ggml_cuda_rdna3_same_tensor_or_view(alpha_gate_math->src[0], alpha_softplus)) {
+        alpha_a = alpha_gate_math->src[1];
+    } else if (ggml_cuda_rdna3_same_tensor_or_view(alpha_gate_math->src[1], alpha_softplus)) {
+        alpha_a = alpha_gate_math->src[0];
     }
     if (alpha_dt == nullptr || alpha_a == nullptr || alpha_dt->type != GGML_TYPE_F32 || alpha_a->type != GGML_TYPE_F32) {
         if (blocker) {
@@ -6562,7 +6586,8 @@ static void ggml_cuda_graph_evaluate_and_capture(
         const bool use_cuda_graph,
         const bool cuda_graph_update_required,
         const void * graph_key,
-        const ggml_cuda_rdna3_qwen36_one_layer_mega_plan * one_layer_plan) {
+        const ggml_cuda_rdna3_qwen36_one_layer_mega_plan * one_layer_plan,
+        const ggml_cuda_rdna3_qwen36_one_layer_mega_plan * superlayer_l0_plan) {
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu
@@ -6665,6 +6690,23 @@ static void ggml_cuda_graph_evaluate_and_capture(
             bool qwen36_one_layer_projection_bundle_launched = false;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+                const bool qwen36_superlayer_l0_skip =
+                    superlayer_l0_plan != nullptr &&
+                    (i == superlayer_l0_plan->rms ||
+                     i == superlayer_l0_plan->attn_norm ||
+                     i == superlayer_l0_plan->qkv_math ||
+                     i == superlayer_l0_plan->qkv_out ||
+                     i == superlayer_l0_plan->qkv ||
+                     i == superlayer_l0_plan->z ||
+                     i == superlayer_l0_plan->z_math ||
+                     i == superlayer_l0_plan->beta ||
+                     i == superlayer_l0_plan->beta_math ||
+                     i == superlayer_l0_plan->beta_sigmoid ||
+                     i == superlayer_l0_plan->alpha ||
+                     i == superlayer_l0_plan->alpha_math ||
+                     i == superlayer_l0_plan->alpha_biased ||
+                     i == superlayer_l0_plan->alpha_softplus ||
+                     i == superlayer_l0_plan->alpha_gate);
                 const bool qwen36_one_layer_qkv_hit =
                     one_layer_plan != nullptr &&
                     i == one_layer_plan->rms;
@@ -6686,6 +6728,11 @@ static void ggml_cuda_graph_evaluate_and_capture(
                        i == one_layer_plan->alpha_biased ||
                        i == one_layer_plan->alpha_softplus ||
                        i == one_layer_plan->alpha_gate)));
+
+                if (qwen36_superlayer_l0_skip) {
+                    prev_i = i;
+                    continue;
+                }
 
                 if (qwen36_one_layer_qkv_hit) {
                     std::string qkv_blocker;
@@ -7516,6 +7563,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         ggml_cuda_rdna3_qwen36_one_layer_mega_required(cuda_ctx->device);
     ggml_cuda_rdna3_qwen36_one_layer_mega_plan qwen36_one_layer_plan;
     bool qwen36_one_layer_mega_ready = false;
+    ggml_cuda_rdna3_qwen36_one_layer_mega_plan qwen36_superlayer_l0_plan;
+    bool qwen36_superlayer_l0_replace_ready = false;
     bool qwen36_mega_contract_this_eval = false;
 
     if (qwen36_mega_decode) {
@@ -7599,6 +7648,24 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 if (!contract_ok && ggml_cuda_rdna3_qwen36_superlayer_required(cuda_ctx->device)) {
                     GGML_ABORT("%s: Qwen3.6 RDNA3 physical superlayer contract dispatch failed: %s",
                             __func__, contract_blocker.c_str());
+                }
+                if (contract_ok && ggml_cuda_rdna3_qwen36_superlayer_replace_l0_enabled(cuda_ctx->device)) {
+                    qwen36_superlayer_l0_plan =
+                        ggml_cuda_rdna3_qwen36_one_layer_mega_make_plan(cgraph, cuda_ctx->device, 0);
+                    qwen36_superlayer_l0_replace_ready =
+                        ggml_cuda_rdna3_qwen36_l0_replacement_plan_ok(qwen36_superlayer_l0_plan);
+                    if (!qwen36_superlayer_l0_replace_ready &&
+                            ggml_cuda_rdna3_qwen36_superlayer_required(cuda_ctx->device)) {
+                        GGML_ABORT("%s: Qwen3.6 RDNA3 physical superlayer L0 replacement failed: %s",
+                                __func__, qwen36_superlayer_l0_plan.blocker.c_str());
+                    }
+                    if (rdna3_graph_log) {
+                        GGML_LOG_INFO("%s: RDNA3 Qwen3.6 physical superlayer L0 replacement %s%s%s\n",
+                                __func__,
+                                qwen36_superlayer_l0_replace_ready ? "ready" : "blocked",
+                                qwen36_superlayer_l0_replace_ready ? "" : ": ",
+                                qwen36_superlayer_l0_replace_ready ? "" : qwen36_superlayer_l0_plan.blocker.c_str());
+                    }
                 }
             } else if (rdna3_graph_log) {
                 GGML_LOG_INFO("%s: RDNA3 Qwen3.6 physical superlayer blocked: %s\n",
@@ -7737,7 +7804,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         qwen36_mega_required && qwen36_mega_contract_this_eval;
     ggml_cuda_graph_evaluate_and_capture(
             cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key,
-            qwen36_one_layer_mega_ready ? &qwen36_one_layer_plan : nullptr);
+            qwen36_one_layer_mega_ready ? &qwen36_one_layer_plan : nullptr,
+            qwen36_superlayer_l0_replace_ready ? &qwen36_superlayer_l0_plan : nullptr);
     ggml_cuda_rdna3_qwen36_mega_decode_contract_current = false;
 
     if (ggml_cuda_rdna3_mmvq_q8_cache_log_enabled() &&

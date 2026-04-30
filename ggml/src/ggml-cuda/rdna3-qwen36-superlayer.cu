@@ -153,6 +153,7 @@ struct qwen36_superlayer_runtime_tensor_desc {
 
 struct qwen36_superlayer_l0_norm_desc {
     const float * x = nullptr;
+    float * norm_out = nullptr;
     uint64_t norm_w_offset = 0;
     uint32_t n_embd = 0;
     float eps = 0.0f;
@@ -161,6 +162,7 @@ struct qwen36_superlayer_l0_norm_desc {
 };
 
 struct qwen36_superlayer_l0_qkv_desc {
+    float * qkv_out = nullptr;
     uint64_t wqkv_offset = 0;
     uint64_t qkv_scale_offset = 0;
     uint64_t qkv_scratch_offset = 0;
@@ -174,6 +176,9 @@ struct qwen36_superlayer_l0_qkv_desc {
 };
 
 struct qwen36_superlayer_l0_proj_desc {
+    float * z_dst = nullptr;
+    float * beta_dst = nullptr;
+    float * alpha_dst = nullptr;
     uint64_t wz_offset = 0;
     uint64_t wbeta_offset = 0;
     uint64_t walpha_offset = 0;
@@ -783,13 +788,19 @@ static bool qwen36_superlayer_make_l0_norm_desc(
         }
         return false;
     }
-    if (x->ne[0] <= 0 || x->nb[0] != (int64_t) sizeof(float)) {
+    if (x->ne[0] <= 0 || x->nb[0] != (int64_t) sizeof(float) ||
+            attn_norm->nb[0] != (int64_t) sizeof(float) ||
+            ggml_nelements(x) / x->ne[0] != 1 ||
+            ggml_nelements(attn_norm) != x->ne[0]) {
         if (blocker != nullptr) {
-            *blocker = "L0 RMSNorm fusion requires a dense F32 hidden dimension";
+            *blocker = "L0 RMSNorm fusion requires dense one-token F32 hidden tensors";
         }
         return false;
     }
     if (!qwen36_superlayer_tensor_data_on_device(x, device, "L0 RMSNorm input", blocker)) {
+        return false;
+    }
+    if (!qwen36_superlayer_tensor_data_on_device(attn_norm, device, "L0 RMSNorm output", blocker)) {
         return false;
     }
 
@@ -820,6 +831,7 @@ static bool qwen36_superlayer_make_l0_norm_desc(
     }
 
     desc->x = (const float *) x->data;
+    desc->norm_out = (float *) attn_norm->data;
     desc->norm_w_offset = norm_w_offset;
     desc->n_embd = (uint32_t) x->ne[0];
     desc->eps = eps;
@@ -845,6 +857,10 @@ static const ggml_tensor * qwen36_superlayer_strip_view_ops(const ggml_tensor * 
     return t;
 }
 
+static bool qwen36_superlayer_same_tensor_or_view(const ggml_tensor * a, const ggml_tensor * b) {
+    return a == b || qwen36_superlayer_strip_view_ops(a) == qwen36_superlayer_strip_view_ops(b);
+}
+
 static bool qwen36_superlayer_projection_weight_supported(const ggml_tensor * w) {
     if (w == nullptr) {
         return false;
@@ -866,6 +882,7 @@ static bool qwen36_superlayer_make_l0_qkv_desc(
         const qwen36_superlayer_plan & plan,
         const qwen36_superlayer_pack_plan & pack,
         const qwen36_superlayer_runtime_layout & runtime,
+        const int device,
         qwen36_superlayer_l0_qkv_desc * desc,
         std::string * blocker) {
     if (desc == nullptr) {
@@ -954,6 +971,15 @@ static bool qwen36_superlayer_make_l0_qkv_desc(
         }
         return false;
     }
+    if (qkv_out->nb[0] != (int64_t) sizeof(float) || ggml_nelements(qkv_out) != qkv_math->ne[0]) {
+        if (blocker != nullptr) {
+            *blocker = "L0 QKV fusion requires dense one-token QKV output";
+        }
+        return false;
+    }
+    if (!qwen36_superlayer_tensor_data_on_device(qkv_out, device, "L0 QKV output", blocker)) {
+        return false;
+    }
 
     uint64_t wqkv_offset = 0;
     if (!qwen36_superlayer_find_pack_offset(pack, wqkv, &wqkv_offset)) {
@@ -999,6 +1025,7 @@ static bool qwen36_superlayer_make_l0_qkv_desc(
         return false;
     }
 
+    desc->qkv_out = (float *) qkv_out->data;
     desc->wqkv_offset = wqkv_offset;
     desc->qkv_scale_offset = qkv_scale_offset;
     desc->qkv_scratch_offset = qkv_scratch_offset;
@@ -1046,6 +1073,7 @@ static bool qwen36_superlayer_make_l0_proj_desc(
         const qwen36_superlayer_plan & plan,
         const qwen36_superlayer_pack_plan & pack,
         const qwen36_superlayer_runtime_layout & runtime,
+        const int device,
         qwen36_superlayer_l0_proj_desc * desc,
         std::string * blocker) {
     if (desc == nullptr) {
@@ -1062,6 +1090,7 @@ static bool qwen36_superlayer_make_l0_proj_desc(
     const ggml_tensor * z = nullptr;
     const ggml_tensor * beta_sigmoid = nullptr;
     const ggml_tensor * alpha = nullptr;
+    const ggml_tensor * alpha_softplus = nullptr;
     const ggml_tensor * alpha_gate = nullptr;
     for (int i = begin; i <= end; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
@@ -1073,15 +1102,17 @@ static bool qwen36_superlayer_make_l0_proj_desc(
             beta_sigmoid = node;
         } else if (alpha == nullptr && tensor_name_matches_layer(node, "alpha", 0)) {
             alpha = node;
+        } else if (alpha_softplus == nullptr && tensor_name_matches_layer(node, "a_softplus", 0)) {
+            alpha_softplus = node;
         } else if (alpha_gate == nullptr && tensor_name_matches_layer(node, "gate", 0)) {
             alpha_gate = node;
         }
     }
 
     if (attn_norm == nullptr || z == nullptr || beta_sigmoid == nullptr ||
-            alpha == nullptr || alpha_gate == nullptr) {
+            alpha == nullptr || alpha_softplus == nullptr || alpha_gate == nullptr) {
         if (blocker != nullptr) {
-            *blocker = "L0 projection fusion requires z-0, beta_sigmoid-0, alpha-0, and gate-0";
+            *blocker = "L0 projection fusion requires z-0, beta_sigmoid-0, alpha-0, a_softplus-0, and gate-0";
         }
         return false;
     }
@@ -1107,44 +1138,56 @@ static bool qwen36_superlayer_make_l0_proj_desc(
     }
 
     const ggml_tensor * alpha_base = qwen36_superlayer_strip_view_ops(alpha);
-    const ggml_tensor * alpha_biased = nullptr;
-    for (int i = begin; i <= end; ++i) {
-        const ggml_tensor * node = cgraph->nodes[i];
-        if (node != nullptr && node->op == GGML_OP_ADD &&
-                (node->src[0] == alpha_base || node->src[1] == alpha_base)) {
-            alpha_biased = node;
-            break;
+    const ggml_tensor * alpha_gate_math = qwen36_superlayer_strip_view_ops(alpha_gate);
+    if (alpha_softplus->op != GGML_OP_UNARY ||
+            ggml_get_unary_op(alpha_softplus) != GGML_UNARY_OP_SOFTPLUS ||
+            alpha_softplus->src[0] == nullptr) {
+        if (blocker != nullptr) {
+            *blocker = "L0 projection fusion could not resolve a_softplus-0";
         }
+        return false;
     }
-    const ggml_tensor * alpha_softplus = nullptr;
-    if (alpha_gate->op == GGML_OP_MUL) {
-        for (int i = 0; i < 2; ++i) {
-            const ggml_tensor * src = alpha_gate->src[i];
-            if (src != nullptr && src->op == GGML_OP_UNARY &&
-                    ggml_get_unary_op(src) == GGML_UNARY_OP_SOFTPLUS) {
-                alpha_softplus = src;
+
+    const ggml_tensor * alpha_biased = qwen36_superlayer_strip_view_ops(alpha_softplus->src[0]);
+    if (alpha_biased == nullptr || alpha_biased->op != GGML_OP_ADD ||
+            (!qwen36_superlayer_same_tensor_or_view(alpha_biased->src[0], alpha_base) &&
+             !qwen36_superlayer_same_tensor_or_view(alpha_biased->src[1], alpha_base))) {
+        alpha_biased = nullptr;
+        for (int i = begin; i <= end; ++i) {
+            const ggml_tensor * node = cgraph->nodes[i];
+            if (node != nullptr && node->op == GGML_OP_ADD &&
+                    (qwen36_superlayer_same_tensor_or_view(node->src[0], alpha_base) ||
+                     qwen36_superlayer_same_tensor_or_view(node->src[1], alpha_base))) {
+                alpha_biased = node;
                 break;
             }
         }
     }
-    if (alpha_biased == nullptr || alpha_softplus == nullptr || alpha_softplus->src[0] != alpha_biased) {
+    if (alpha_biased == nullptr ||
+            !qwen36_superlayer_same_tensor_or_view(alpha_softplus->src[0], alpha_biased)) {
         if (blocker != nullptr) {
-            *blocker = "L0 projection fusion could not resolve alpha bias/softplus/gate";
+            *blocker = "L0 projection fusion could not resolve alpha bias feeding a_softplus-0";
+        }
+        return false;
+    }
+    if (alpha_gate_math == nullptr || alpha_gate_math->op != GGML_OP_MUL) {
+        if (blocker != nullptr) {
+            *blocker = "L0 projection fusion could not resolve gate-0 to MUL";
         }
         return false;
     }
 
     const ggml_tensor * alpha_dt = nullptr;
-    if (alpha_biased->src[0] == alpha_base) {
+    if (qwen36_superlayer_same_tensor_or_view(alpha_biased->src[0], alpha_base)) {
         alpha_dt = alpha_biased->src[1];
-    } else if (alpha_biased->src[1] == alpha_base) {
+    } else if (qwen36_superlayer_same_tensor_or_view(alpha_biased->src[1], alpha_base)) {
         alpha_dt = alpha_biased->src[0];
     }
     const ggml_tensor * alpha_a = nullptr;
-    if (alpha_gate->src[0] == alpha_softplus) {
-        alpha_a = alpha_gate->src[1];
-    } else if (alpha_gate->src[1] == alpha_softplus) {
-        alpha_a = alpha_gate->src[0];
+    if (qwen36_superlayer_same_tensor_or_view(alpha_gate_math->src[0], alpha_softplus)) {
+        alpha_a = alpha_gate_math->src[1];
+    } else if (qwen36_superlayer_same_tensor_or_view(alpha_gate_math->src[1], alpha_softplus)) {
+        alpha_a = alpha_gate_math->src[0];
     }
 
     const ggml_tensor * wz = z_math->src[0];
@@ -1161,10 +1204,13 @@ static bool qwen36_superlayer_make_l0_proj_desc(
     if (z->type != GGML_TYPE_F32 || beta_sigmoid->type != GGML_TYPE_F32 ||
             alpha_gate->type != GGML_TYPE_F32 || alpha_dt == nullptr || alpha_a == nullptr ||
             alpha_dt->type != GGML_TYPE_F32 || alpha_a->type != GGML_TYPE_F32 ||
+            z->nb[0] != (int64_t) sizeof(float) ||
+            beta_sigmoid->nb[0] != (int64_t) sizeof(float) ||
+            alpha_gate->nb[0] != (int64_t) sizeof(float) ||
             alpha_dt->nb[0] != (int64_t) sizeof(float) ||
             alpha_a->nb[0] != (int64_t) sizeof(float)) {
         if (blocker != nullptr) {
-            *blocker = "L0 projection fusion requires F32 projection outputs and alpha constants";
+            *blocker = "L0 projection fusion requires dense F32 projection outputs and alpha constants";
         }
         return false;
     }
@@ -1186,6 +1232,11 @@ static bool qwen36_superlayer_make_l0_proj_desc(
         if (blocker != nullptr) {
             *blocker = "L0 projection output/token dimensions do not match";
         }
+        return false;
+    }
+    if (!qwen36_superlayer_tensor_data_on_device(z, device, "L0 z output", blocker) ||
+            !qwen36_superlayer_tensor_data_on_device(beta_sigmoid, device, "L0 beta output", blocker) ||
+            !qwen36_superlayer_tensor_data_on_device(alpha_gate, device, "L0 alpha gate output", blocker)) {
         return false;
     }
 
@@ -1217,6 +1268,9 @@ static bool qwen36_superlayer_make_l0_proj_desc(
         return false;
     }
 
+    desc->z_dst = (float *) z->data;
+    desc->beta_dst = (float *) beta_sigmoid->data;
+    desc->alpha_dst = (float *) alpha_gate->data;
     desc->wz_offset = wz_offset;
     desc->wbeta_offset = wbeta_offset;
     desc->walpha_offset = walpha_offset;
@@ -1268,11 +1322,13 @@ static bool qwen36_superlayer_materialize_device_pack(
         return false;
     }
     qwen36_superlayer_l0_qkv_desc l0_qkv_host;
-    if (!qwen36_superlayer_make_l0_qkv_desc(cgraph, plan, pack, runtime, &l0_qkv_host, blocker)) {
+    if (!qwen36_superlayer_make_l0_qkv_desc(
+                cgraph, plan, pack, runtime, cuda_ctx->device, &l0_qkv_host, blocker)) {
         return false;
     }
     qwen36_superlayer_l0_proj_desc l0_proj_host;
-    if (!qwen36_superlayer_make_l0_proj_desc(cgraph, plan, pack, runtime, &l0_proj_host, blocker)) {
+    if (!qwen36_superlayer_make_l0_proj_desc(
+                cgraph, plan, pack, runtime, cuda_ctx->device, &l0_proj_host, blocker)) {
         return false;
     }
 
@@ -2365,7 +2421,11 @@ __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_rms_norm(
 
     for (uint32_t i = tid; i < n_embd; i += blockDim.x) {
         const float w = norm_w != nullptr ? norm_w[i] : 1.0f;
-        dst[i] = desc->x[i]*inv_rms*w;
+        const float v = desc->x[i]*inv_rms*w;
+        dst[i] = v;
+        if (desc->norm_out != nullptr) {
+            desc->norm_out[i] = v;
+        }
     }
 }
 
@@ -2416,7 +2476,11 @@ __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_qkv(
         if (tid == 0) {
             const float scale = qkv_scale == nullptr ? 1.0f :
                 qkv_scale[desc->qkv_scale_n == 1 ? 0 : row];
-            qkv[row] = sums[0]*scale;
+            const float v = sums[0]*scale;
+            qkv[row] = v;
+            if (desc->qkv_out != nullptr) {
+                desc->qkv_out[row] = v;
+            }
         }
         __syncthreads();
     }
@@ -2492,16 +2556,28 @@ __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_projection_bundle(
         if (tid == 0) {
             local_row = row;
             if (local_row < desc->z_out) {
-                z[local_row] = sums[0];
+                const float v = sums[0];
+                z[local_row] = v;
+                if (desc->z_dst != nullptr) {
+                    desc->z_dst[local_row] = v;
+                }
             } else {
                 local_row -= desc->z_out;
                 if (local_row < desc->beta_out) {
-                    beta[local_row] = 1.0f / (1.0f + expf(-sums[0]));
+                    const float v = 1.0f / (1.0f + expf(-sums[0]));
+                    beta[local_row] = v;
+                    if (desc->beta_dst != nullptr) {
+                        desc->beta_dst[local_row] = v;
+                    }
                 } else {
                     local_row -= desc->beta_out;
                     const float biased = sums[0] + alpha_dt[local_row];
                     const float softplus = biased > 20.0f ? biased : log1pf(expf(biased));
-                    alpha[local_row] = softplus * alpha_a[local_row];
+                    const float v = softplus * alpha_a[local_row];
+                    alpha[local_row] = v;
+                    if (desc->alpha_dst != nullptr) {
+                        desc->alpha_dst[local_row] = v;
+                    }
                 }
             }
         }
@@ -2647,6 +2723,12 @@ bool ggml_cuda_rdna3_qwen36_superlayer_enabled(const int device) {
 bool ggml_cuda_rdna3_qwen36_superlayer_required(const int device) {
     return ggml_cuda_rdna3_qwen36_superlayer_enabled(device) &&
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REQUIRED");
+}
+
+bool ggml_cuda_rdna3_qwen36_superlayer_replace_l0_enabled(const int device) {
+    return ggml_cuda_rdna3_qwen36_superlayer_enabled(device) &&
+        qwen36_superlayer_contract_dispatch_enabled() &&
+        qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0", 1) != 0;
 }
 
 bool ggml_cuda_rdna3_qwen36_superlayer_prepare(
@@ -2801,9 +2883,11 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
         GGML_LOG_INFO(
                 "rdna3_qwen36_superlayer: contract-kernel-launched fingerprint=%s blocks=%d threads=%d"
                 " weightpack_tensors=%zu runtime_bindings=%zu weightpack_bytes=%zu scratch_bytes=%zu"
-                " l0_rms_norm=on l0_qkv=on l0_projection=on note=single physical 40-layer dispatch scaffold\n",
+                " l0_rms_norm=on l0_qkv=on l0_projection=on l0_real_outputs=on replace_l0=%d"
+                " note=single physical 40-layer dispatch scaffold\n",
                 hex_u64(plan.fingerprint).c_str(), blocks, threads,
-                device_pack.tensors, device_pack.io_count, device_pack.bytes, device_pack.runtime.scratch_bytes);
+                device_pack.tensors, device_pack.io_count, device_pack.bytes, device_pack.runtime.scratch_bytes,
+                ggml_cuda_rdna3_qwen36_superlayer_replace_l0_enabled(cuda_ctx->device) ? 1 : 0);
     }
 
     return true;
