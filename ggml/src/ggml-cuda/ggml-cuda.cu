@@ -146,9 +146,7 @@ static bool ggml_cuda_rdna3_qwen36_superlayer_final_requested() {
 }
 
 static bool ggml_cuda_rdna3_qwen36_superlayer_final_physical_l0_requested() {
-    return ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_FINAL_PHYSICAL_L0") ||
-        (ggml_cuda_rdna3_qwen36_superlayer_final_requested() &&
-         !ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_FINAL_NO_PHYSICAL_L0"));
+    return ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_FINAL_PHYSICAL_L0");
 }
 
 static bool ggml_cuda_rdna3_qwen36_superlayer_l0_env_requested() {
@@ -7881,10 +7879,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         ggml_cuda_rdna3_qwen36_superlayer_final_requested() &&
         GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[cuda_ctx->device].cc);
     const bool qwen36_superlayer_enabled =
-        !qwen36_superlayer_final &&
         ggml_cuda_rdna3_qwen36_superlayer_enabled(cuda_ctx->device);
     const bool qwen36_superlayer_runtime =
-        !qwen36_superlayer_final &&
         ggml_cuda_rdna3_qwen36_superlayer_runtime_enabled(cuda_ctx->device);
     const bool qwen36_one_layer_mega = ggml_cuda_rdna3_qwen36_one_layer_mega_enabled(cuda_ctx->device);
     const bool qwen36_one_layer_mega_required =
@@ -8067,12 +8063,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
     }
 
-    if (qwen36_superlayer_runtime && !qwen36_superlayer_final) {
+    if (qwen36_superlayer_runtime) {
         if (superlayer_decode_candidate) {
             std::string superlayer_blocker;
             const bool superlayer_ok =
                 ggml_cuda_rdna3_qwen36_superlayer_prepare(cuda_ctx, cgraph, &superlayer_blocker);
-            if (!superlayer_ok && ggml_cuda_rdna3_qwen36_superlayer_required(cuda_ctx->device)) {
+            if (!superlayer_ok &&
+                    (qwen36_superlayer_final || ggml_cuda_rdna3_qwen36_superlayer_required(cuda_ctx->device))) {
                 GGML_ABORT("%s: Qwen3.6 RDNA3 physical superlayer is required but the decode graph"
                         " cannot be materialized: %s", __func__, superlayer_blocker.c_str());
             }
@@ -8102,7 +8099,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     const bool contract_ok =
                         ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
                                 cuda_ctx, cgraph, &contract_blocker, UINT32_MAX);
-                    if (!contract_ok && ggml_cuda_rdna3_qwen36_superlayer_required(cuda_ctx->device)) {
+                    if (!contract_ok &&
+                            (qwen36_superlayer_final || ggml_cuda_rdna3_qwen36_superlayer_required(cuda_ctx->device))) {
                         GGML_ABORT("%s: Qwen3.6 RDNA3 physical superlayer contract dispatch failed: %s",
                                 __func__, contract_blocker.c_str());
                     }
