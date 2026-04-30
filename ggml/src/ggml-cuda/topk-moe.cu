@@ -36,7 +36,10 @@ static int topk_moe_env_i32(const char * name, const int default_value) {
 }
 
 static bool topk_moe_qwen36_fastpath_enabled() {
-    static const bool enabled = topk_moe_env_enabled("GGML_CUDA_RDNA3_QWEN36_FASTPATH");
+    static const bool enabled =
+        topk_moe_env_enabled("GGML_CUDA_RDNA3_QWEN36_FASTPATH") ||
+        topk_moe_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_DECODE") ||
+        topk_moe_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_FINAL");
     return enabled;
 }
 

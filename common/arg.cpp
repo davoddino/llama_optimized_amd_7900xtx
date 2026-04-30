@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <climits>
+#include <cstdlib>
 #include <cstdarg>
 #include <fstream>
 #include <list>
@@ -70,6 +71,15 @@ static std::string read_file(const std::string & fname) {
     std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
     file.close();
     return content;
+}
+
+static bool common_env_enabled(const char * name) {
+    const char * value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+static bool common_qwen36_superlayer_final_enabled() {
+    return common_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_FINAL");
 }
 
 static const std::vector<common_arg> & get_common_arg_defs() {
@@ -620,6 +630,21 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     // TODO @ngxson : maybe show a list of available models in CLI in this case
     if (params.model.path.empty() && ctx_arg.ex != LLAMA_EXAMPLE_SERVER && !skip_model_download && !params.usage && !params.completion) {
         throw std::invalid_argument("error: --model is required\n");
+    }
+
+    if (common_qwen36_superlayer_final_enabled() && !params.sampling.backend_sampling) {
+        params.sampling.backend_sampling = true;
+        LOG_INF("rdna3_qwen36_final: enabling backend sampling by default for final mode\n");
+    }
+    if (common_qwen36_superlayer_final_enabled() &&
+            (params.sampling.user_sampling_config &
+             common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_SAMPLERS) == 0) {
+        params.sampling.samplers = {
+            COMMON_SAMPLER_TYPE_TOP_K,
+            COMMON_SAMPLER_TYPE_TEMPERATURE,
+        };
+        params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_SAMPLERS;
+        LOG_INF("rdna3_qwen36_final: using backend-compatible default sampler chain top_k;temperature\n");
     }
 
     if (params.escape) {

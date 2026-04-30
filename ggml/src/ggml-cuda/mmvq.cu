@@ -34,12 +34,18 @@ static int rdna3_mmvq_env_i32(const char * name, const int default_value) {
 }
 
 static bool rdna3_qwen36_fastpath_enabled() {
-    static const bool enabled = rdna3_mmvq_env_enabled("GGML_CUDA_RDNA3_QWEN36_FASTPATH");
+    static const bool enabled =
+        rdna3_mmvq_env_enabled("GGML_CUDA_RDNA3_QWEN36_FASTPATH") ||
+        rdna3_mmvq_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_DECODE") ||
+        rdna3_mmvq_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_FINAL");
     return enabled;
 }
 
 static bool rdna3_qwen36_linear_mmvq_fast_enabled() {
-    static const bool enabled = rdna3_mmvq_env_enabled("GGML_CUDA_RDNA3_QWEN36_LINEAR_MMVQ_FAST");
+    static const bool enabled =
+        rdna3_mmvq_env_enabled("GGML_CUDA_RDNA3_QWEN36_LINEAR_MMVQ_FAST") ||
+        rdna3_mmvq_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_DECODE") ||
+        rdna3_mmvq_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_FINAL");
     return enabled;
 }
 

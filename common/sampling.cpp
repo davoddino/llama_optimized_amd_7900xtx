@@ -11,7 +11,9 @@
 #include <cctype>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include <unordered_map>
 #include <vector>
 
@@ -107,6 +109,15 @@ struct ring_buffer {
     size_t pos = 0;
     std::vector<T> data;
 };
+
+static bool sampling_env_enabled(const char * name) {
+    const char * value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+static bool sampling_qwen36_superlayer_final_enabled() {
+    return sampling_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_FINAL");
+}
 
 struct common_sampler {
     common_params_sampling params;
@@ -380,12 +391,18 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
     }
 
     if (grmr && params.backend_sampling) {
+        if (sampling_qwen36_superlayer_final_enabled()) {
+            throw std::runtime_error("Qwen3.6 RDNA3 final mode requires backend sampling, but grammar sampling is not backend-compatible");
+        }
         LOG_WRN("%s: backend sampling is not compatible with grammar, disabling\n", __func__);
 
         params.backend_sampling = false;
     }
 
     if (rbudget && params.backend_sampling) {
+        if (sampling_qwen36_superlayer_final_enabled()) {
+            throw std::runtime_error("Qwen3.6 RDNA3 final mode requires backend sampling, but reasoning budget sampling is not backend-compatible");
+        }
         LOG_WRN("%s: backend sampling is not compatible with reasoning budget, disabling\n", __func__);
 
         params.backend_sampling = false;

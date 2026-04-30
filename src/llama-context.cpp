@@ -22,14 +22,23 @@
 // llama_context
 //
 
-static bool qwen36_mega_no_raw_logits_enabled() {
-    const char * value = std::getenv("GGML_CUDA_RDNA3_QWEN36_MEGA_NO_RAW_LOGITS");
+static bool qwen36_env_enabled(const char * name) {
+    const char * value = std::getenv(name);
     return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
+static bool qwen36_superlayer_final_enabled() {
+    return qwen36_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_FINAL");
+}
+
+static bool qwen36_mega_no_raw_logits_enabled() {
+    return qwen36_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_NO_RAW_LOGITS") ||
+        qwen36_superlayer_final_enabled();
+}
+
 static bool qwen36_mega_sample_token_only_enabled() {
-    const char * value = std::getenv("GGML_CUDA_RDNA3_QWEN36_MEGA_SAMPLE_TOKEN_ONLY");
-    return value != nullptr && value[0] != '\0' && value[0] != '0';
+    return qwen36_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_SAMPLE_TOKEN_ONLY") ||
+        qwen36_superlayer_final_enabled();
 }
 
 llama_context::llama_context(
@@ -1092,7 +1101,13 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (sampler && can_offload) {
         auto * buft = ggml_backend_dev_buffer_type(model.dev_output());
 
-        sampler->iface->backend_init(sampler, buft);
+        const bool backend_ready = sampler->iface->backend_init(sampler, buft);
+        if (!backend_ready && qwen36_superlayer_final_enabled()) {
+            throw std::runtime_error(format(
+                    "Qwen3.6 RDNA3 final mode requires a fully backend-offloadable sampler chain, "
+                    "but sampler '%s' for seq_id %d cannot run entirely on the backend",
+                    llama_sampler_name(sampler), seq_id));
+        }
 
         sampling.samplers[seq_id] = sampler;
 
