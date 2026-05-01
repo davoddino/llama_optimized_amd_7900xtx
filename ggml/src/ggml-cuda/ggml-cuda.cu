@@ -250,7 +250,8 @@ static bool ggml_cuda_rdna3_qwen36_mega_decode_required(const int device) {
 
 static bool ggml_cuda_rdna3_qwen36_mega_graph_required(const int device) {
     return ggml_cuda_rdna3_qwen36_mega_decode_enabled(device) &&
-        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_REQUIRE_GRAPH");
+        (ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_REQUIRE_GRAPH") ||
+         ggml_cuda_rdna3_qwen36_superlayer_final_requested());
 }
 
 static int64_t ggml_cuda_rdna3_qwen36_mega_graph_grace_evals() {
@@ -789,7 +790,8 @@ static ggml_cuda_device_info ggml_cuda_init() {
             (ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_REQUIRED") || qwen36_final_env);
         const bool qwen36_mega_graph_required_effective =
             qwen36_mega_decode_effective &&
-            ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_REQUIRE_GRAPH");
+            (ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_REQUIRE_GRAPH") ||
+             qwen36_final_env);
         const bool qwen36_fastpath_effective =
             ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_FASTPATH") ||
             qwen36_mega_decode_effective;
@@ -805,6 +807,12 @@ static ggml_cuda_device_info ggml_cuda_init() {
             !ggml_cuda_env_enabled("GGML_CUDA_RDNA3_DISABLE_MMVQ_Q8_CACHE") &&
             (ggml_cuda_env_enabled("GGML_CUDA_RDNA3_MMVQ_Q8_CACHE") ||
              ggml_cuda_env_enabled("GGML_CUDA_RDNA3_MMVQ_Q8_CACHE_UNSAFE"));
+        const bool qwen36_no_raw_logits_effective =
+            qwen36_final_env ||
+            ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_NO_RAW_LOGITS");
+        const bool qwen36_sample_token_only_effective =
+            qwen36_final_env ||
+            ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_SAMPLE_TOKEN_ONLY");
         const bool qwen36_one_layer_mega_unsafe =
             ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_MEGA_UNSAFE") ||
             ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_FINAL_PHYSICAL_L0_UNSAFE");
@@ -819,6 +827,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
                 " mega_decode_effective=%d mega_required_effective=%d mega_graph_required_effective=%d"
                 " fastpath_effective=%d linear_mmvq_effective=%d output_mmvq_effective=%d"
                 " moe_mmvq_effective=%d topk_fastpath_effective=%d mmvq_q8_cache_effective=%d"
+                " no_raw_logits_effective=%d sample_token_only_effective=%d"
                 " one_layer_mega_effective=%d one_layer_mega_unsafe=%d final_physical_l0=%d"
                 " contract=%d run_l0=%d replace_l0=%d rms=%d qkv=%d proj=%d"
                 " proj_z=%d proj_z_math_only=%d proj_beta=%d proj_alpha=%d single_l0=%d"
@@ -844,6 +853,8 @@ static ggml_cuda_device_info ggml_cuda_init() {
                 qwen36_moe_mmvq_effective ? 1 : 0,
                 qwen36_topk_fastpath_effective ? 1 : 0,
                 qwen36_mmvq_q8_cache_effective ? 1 : 0,
+                qwen36_no_raw_logits_effective ? 1 : 0,
+                qwen36_sample_token_only_effective ? 1 : 0,
                 qwen36_one_layer_mega_effective ? 1 : 0,
                 qwen36_one_layer_mega_unsafe ? 1 : 0,
                 ggml_cuda_rdna3_qwen36_superlayer_final_physical_l0_requested() ? 1 : 0,

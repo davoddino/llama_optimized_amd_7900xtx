@@ -219,6 +219,15 @@ struct cli_context {
         inputs.chat_template_kwargs  = chat_params.chat_template_kwargs;
         inputs.enable_thinking       = chat_params.enable_thinking ? common_chat_templates_support_enable_thinking(chat_params.tmpls.get()) : false;
 
+        auto enable_thinking_kwarg = inputs.chat_template_kwargs.find("enable_thinking");
+        if (enable_thinking_kwarg != inputs.chat_template_kwargs.end()) {
+            if (enable_thinking_kwarg->second == "false") {
+                inputs.enable_thinking = false;
+            } else if (enable_thinking_kwarg->second == "true") {
+                inputs.enable_thinking = common_chat_templates_support_enable_thinking(chat_params.tmpls.get());
+            }
+        }
+
         // Apply chat template to the list of messages
         return common_chat_templates_apply(chat_params.tmpls.get(), inputs);
     }
