@@ -163,8 +163,7 @@ static bool ggml_cuda_rdna3_qwen36_superlayer_l0_env_requested() {
 }
 
 static bool ggml_cuda_rdna3_qwen36_superlayer_requested_effective() {
-    return ggml_cuda_rdna3_qwen36_superlayer_final_requested() ||
-        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER") ||
+    return ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER") ||
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REQUIRED") ||
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_CONTRACT") ||
         ggml_cuda_rdna3_qwen36_superlayer_l0_env_requested();
@@ -251,9 +250,7 @@ static bool ggml_cuda_rdna3_qwen36_mega_decode_required(const int device) {
 
 static bool ggml_cuda_rdna3_qwen36_mega_graph_required(const int device) {
     return ggml_cuda_rdna3_qwen36_mega_decode_enabled(device) &&
-        (ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_REQUIRE_GRAPH") ||
-         (ggml_cuda_rdna3_qwen36_superlayer_final_requested() &&
-          !ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_ALLOW_DIRECT")));
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_REQUIRE_GRAPH");
 }
 
 static int64_t ggml_cuda_rdna3_qwen36_mega_graph_grace_evals() {
@@ -792,9 +789,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
             (ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_REQUIRED") || qwen36_final_env);
         const bool qwen36_mega_graph_required_effective =
             qwen36_mega_decode_effective &&
-            (ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_REQUIRE_GRAPH") ||
-             (qwen36_final_env &&
-              !ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_ALLOW_DIRECT")));
+            ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_REQUIRE_GRAPH");
         const bool qwen36_fastpath_effective =
             ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_FASTPATH") ||
             qwen36_mega_decode_effective;

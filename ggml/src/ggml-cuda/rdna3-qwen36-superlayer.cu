@@ -3128,14 +3128,12 @@ static bool qwen36_superlayer_run_l0_math_enabled() {
 
 static bool qwen36_superlayer_contract_kernel_enabled() {
     return qwen36_superlayer_final_physical_l0_requested() ||
-        qwen36_superlayer_final_requested() ||
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_CONTRACT") ||
         qwen36_superlayer_run_l0_math_enabled();
 }
 
 static bool qwen36_superlayer_contract_dispatch_enabled() {
     return qwen36_superlayer_final_physical_l0_requested() ||
-        qwen36_superlayer_final_requested() ||
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DISPATCH") ||
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_SMOKE") ||
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER") ||
@@ -3146,7 +3144,6 @@ static bool qwen36_superlayer_contract_dispatch_enabled() {
 
 static bool qwen36_superlayer_requested() {
     return qwen36_superlayer_final_physical_l0_requested() ||
-        qwen36_superlayer_final_requested() ||
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER") ||
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REQUIRED") ||
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_CONTRACT") ||
