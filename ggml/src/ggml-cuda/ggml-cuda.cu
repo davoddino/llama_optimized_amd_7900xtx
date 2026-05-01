@@ -265,19 +265,27 @@ static bool ggml_cuda_rdna3_qwen36_mega_no_host_output(const int device) {
 }
 
 static bool ggml_cuda_rdna3_qwen36_one_layer_mega_enabled(const int device) {
+    const bool final_auto =
+        ggml_cuda_rdna3_qwen36_superlayer_final_requested() &&
+        !ggml_cuda_rdna3_qwen36_superlayer_final_physical_l0_requested();
     const bool unsafe_opt_in =
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_MEGA_UNSAFE") ||
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_FINAL_PHYSICAL_L0_UNSAFE");
     return ggml_cuda_rdna3_qwen36_mega_decode_enabled(device) &&
-        unsafe_opt_in &&
-        (ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_MEGA") ||
-         ggml_cuda_rdna3_qwen36_superlayer_final_physical_l0_requested());
+        (final_auto ||
+         (unsafe_opt_in &&
+          (ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_MEGA") ||
+           ggml_cuda_rdna3_qwen36_superlayer_final_physical_l0_requested())));
 }
 
 static bool ggml_cuda_rdna3_qwen36_one_layer_mega_required(const int device) {
     return ggml_cuda_rdna3_qwen36_one_layer_mega_enabled(device) &&
         (ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_MEGA_REQUIRED") ||
          ggml_cuda_rdna3_qwen36_superlayer_final_physical_l0_requested());
+}
+
+static bool ggml_cuda_rdna3_qwen36_one_layer_proj_bundle_enabled() {
+    return ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_PROJ_BUNDLE_UNSAFE");
 }
 
 static int ggml_cuda_rdna3_qwen36_one_layer_mega_layer() {
@@ -814,10 +822,14 @@ static ggml_cuda_device_info ggml_cuda_init() {
         const bool qwen36_one_layer_mega_unsafe =
             ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_MEGA_UNSAFE") ||
             ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_FINAL_PHYSICAL_L0_UNSAFE");
+        const bool qwen36_one_layer_mega_final_auto =
+            qwen36_final_env &&
+            !ggml_cuda_rdna3_qwen36_superlayer_final_physical_l0_requested();
         const bool qwen36_one_layer_mega_effective =
-            qwen36_one_layer_mega_unsafe &&
-            (ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_MEGA") ||
-             ggml_cuda_rdna3_qwen36_superlayer_final_physical_l0_requested());
+            qwen36_one_layer_mega_final_auto ||
+            (qwen36_one_layer_mega_unsafe &&
+             (ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_MEGA") ||
+              ggml_cuda_rdna3_qwen36_superlayer_final_physical_l0_requested()));
         GGML_LOG_INFO(
                 "rdna3_qwen36_superlayer: init-env graph_log=%d trace=%d final=%d superlayer=%d required=%d"
                 " dispatch=%d requested_effective=%d dispatch_effective=%d"
@@ -826,7 +838,8 @@ static ggml_cuda_device_info ggml_cuda_init() {
                 " fastpath_effective=%d linear_mmvq_effective=%d output_mmvq_effective=%d"
                 " moe_mmvq_effective=%d topk_fastpath_effective=%d mmvq_q8_cache_effective=%d"
                 " no_raw_logits_effective=%d sample_token_only_effective=%d"
-                " one_layer_mega_effective=%d one_layer_mega_unsafe=%d final_physical_l0=%d"
+                " one_layer_mega_effective=%d one_layer_mega_final_auto=%d one_layer_mega_unsafe=%d"
+                " final_physical_l0=%d"
                 " contract=%d run_l0=%d replace_l0=%d rms=%d qkv=%d proj=%d"
                 " proj_z=%d proj_z_math_only=%d proj_beta=%d proj_alpha=%d single_l0=%d"
                 " direct_l0_proj_weights=%d\n",
@@ -854,6 +867,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
                 qwen36_no_raw_logits_effective ? 1 : 0,
                 qwen36_sample_token_only_effective ? 1 : 0,
                 qwen36_one_layer_mega_effective ? 1 : 0,
+                qwen36_one_layer_mega_final_auto ? 1 : 0,
                 qwen36_one_layer_mega_unsafe ? 1 : 0,
                 ggml_cuda_rdna3_qwen36_superlayer_final_physical_l0_requested() ? 1 : 0,
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_CONTRACT") ? 1 : 0,
@@ -3650,43 +3664,43 @@ static ggml_cuda_rdna3_qwen36_one_layer_mega_plan ggml_cuda_rdna3_qwen36_one_lay
         }
     }
 
-    if (plan.z < 0 || plan.z_math < 0 ||
-            plan.beta < 0 || plan.beta_math < 0 || plan.beta_sigmoid < 0 ||
-            plan.alpha < 0 || plan.alpha_math < 0 || plan.alpha_biased < 0 ||
-            plan.alpha_softplus < 0 || plan.alpha_gate < 0) {
-        plan.blocker = "first projection bundle nodes not found";
-        return plan;
-    }
-    ggml_tensor * z_base_for_bundle     = strip_view_ops(cgraph->nodes[plan.z]);
-    ggml_tensor * beta_base_for_bundle  = strip_view_ops(cgraph->nodes[plan.beta]);
-    ggml_tensor * alpha_base_for_bundle = strip_view_ops(cgraph->nodes[plan.alpha]);
-    auto supported_bundle_weight = [](const ggml_tensor * w) {
-        if (w == nullptr) {
-            return false;
-        }
-        switch (w->type) {
-            case GGML_TYPE_Q4_K:
-            case GGML_TYPE_Q6_K:
-            case GGML_TYPE_Q8_0:
-            case GGML_TYPE_F16:
-            case GGML_TYPE_F32:
-                return true;
-            default:
+    const bool projection_bundle_nodes_present =
+        plan.z >= 0 && plan.z_math >= 0 &&
+        plan.beta >= 0 && plan.beta_math >= 0 && plan.beta_sigmoid >= 0 &&
+        plan.alpha >= 0 && plan.alpha_math >= 0 && plan.alpha_biased >= 0 &&
+        plan.alpha_softplus >= 0 && plan.alpha_gate >= 0;
+    if (projection_bundle_nodes_present) {
+        ggml_tensor * z_base_for_bundle     = strip_view_ops(cgraph->nodes[plan.z]);
+        ggml_tensor * beta_base_for_bundle  = strip_view_ops(cgraph->nodes[plan.beta]);
+        ggml_tensor * alpha_base_for_bundle = strip_view_ops(cgraph->nodes[plan.alpha]);
+        auto supported_bundle_weight = [](const ggml_tensor * w) {
+            if (w == nullptr) {
                 return false;
-        }
-    };
-    plan.projection_bundle =
-        cgraph->nodes[plan.qkv_math] != nullptr && cgraph->nodes[plan.qkv_math]->src[0] != nullptr &&
-        cgraph->nodes[plan.z_math] != nullptr && cgraph->nodes[plan.z_math]->src[0] != nullptr &&
-        cgraph->nodes[plan.beta_math] != nullptr && cgraph->nodes[plan.beta_math]->src[0] != nullptr &&
-        cgraph->nodes[plan.alpha_math] != nullptr && cgraph->nodes[plan.alpha_math]->src[0] != nullptr &&
-        z_base_for_bundle == cgraph->nodes[plan.z_math] &&
-        beta_base_for_bundle == cgraph->nodes[plan.beta_math] &&
-        alpha_base_for_bundle == cgraph->nodes[plan.alpha_math] &&
-        cgraph->nodes[plan.qkv_math]->src[0]->type == GGML_TYPE_Q8_0 &&
-        supported_bundle_weight(cgraph->nodes[plan.z_math]->src[0]) &&
-        supported_bundle_weight(cgraph->nodes[plan.beta_math]->src[0]) &&
-        supported_bundle_weight(cgraph->nodes[plan.alpha_math]->src[0]);
+            }
+            switch (w->type) {
+                case GGML_TYPE_Q4_K:
+                case GGML_TYPE_Q6_K:
+                case GGML_TYPE_Q8_0:
+                case GGML_TYPE_F16:
+                case GGML_TYPE_F32:
+                    return true;
+                default:
+                    return false;
+            }
+        };
+        plan.projection_bundle =
+            cgraph->nodes[plan.qkv_math] != nullptr && cgraph->nodes[plan.qkv_math]->src[0] != nullptr &&
+            cgraph->nodes[plan.z_math] != nullptr && cgraph->nodes[plan.z_math]->src[0] != nullptr &&
+            cgraph->nodes[plan.beta_math] != nullptr && cgraph->nodes[plan.beta_math]->src[0] != nullptr &&
+            cgraph->nodes[plan.alpha_math] != nullptr && cgraph->nodes[plan.alpha_math]->src[0] != nullptr &&
+            z_base_for_bundle == cgraph->nodes[plan.z_math] &&
+            beta_base_for_bundle == cgraph->nodes[plan.beta_math] &&
+            alpha_base_for_bundle == cgraph->nodes[plan.alpha_math] &&
+            cgraph->nodes[plan.qkv_math]->src[0]->type == GGML_TYPE_Q8_0 &&
+            supported_bundle_weight(cgraph->nodes[plan.z_math]->src[0]) &&
+            supported_bundle_weight(cgraph->nodes[plan.beta_math]->src[0]) &&
+            supported_bundle_weight(cgraph->nodes[plan.alpha_math]->src[0]);
+    }
 
     for (int i = plan.start; i <= plan.end; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
@@ -4284,7 +4298,9 @@ static bool ggml_cuda_rdna3_qwen36_one_layer_mega_launch(
     ggml_tensor * alpha_biased = plan.alpha_biased >= 0 ? cgraph->nodes[plan.alpha_biased] : nullptr;
     ggml_tensor * alpha_softplus = plan.alpha_softplus >= 0 ? cgraph->nodes[plan.alpha_softplus] : nullptr;
     const ggml_tensor * alpha_gate_math = ggml_cuda_rdna3_strip_view_ops(alpha_gate);
-    bool projection_bundle_ok = plan.projection_bundle;
+    bool projection_bundle_ok =
+        plan.projection_bundle &&
+        ggml_cuda_rdna3_qwen36_one_layer_proj_bundle_enabled();
     if (rms == nullptr || attn_norm == nullptr || qkv_out == nullptr || qkv_math == nullptr ||
             rms->op != GGML_OP_RMS_NORM || qkv_math->op != GGML_OP_MUL_MAT ||
             rms->src[0] == nullptr || qkv_math->src[0] == nullptr || qkv_math->src[1] == nullptr) {
@@ -6913,6 +6929,8 @@ static void ggml_cuda_graph_evaluate_and_capture(
                     one_layer_plans != nullptr ? one_layer_plans->size() : 0, false);
             std::vector<bool> qwen36_one_layer_projection_bundle_launched(
                     one_layer_plans != nullptr ? one_layer_plans->size() : 0, false);
+            const bool qwen36_one_layer_mega_launch_required =
+                ggml_cuda_rdna3_qwen36_one_layer_mega_required(cuda_ctx->device);
             bool qwen36_superlayer_l0_rms_qkv_launched = false;
             bool qwen36_superlayer_l0_qkv_late_launched = false;
             bool qwen36_superlayer_l0_projection_launched = false;
@@ -7101,14 +7119,26 @@ static void ggml_cuda_graph_evaluate_and_capture(
                             cuda_ctx, cgraph, plan, &qkv_blocker,
                             &projection_bundle_launched);
                     if (!qkv_ok) {
-                        GGML_ABORT("%s: Qwen3.6 RDNA3 one-layer QKV mega failed: %s",
-                                __func__, qkv_blocker.c_str());
+                        if (qwen36_one_layer_mega_launch_required) {
+                            GGML_ABORT("%s: Qwen3.6 RDNA3 one-layer QKV mega failed: %s",
+                                    __func__, qkv_blocker.c_str());
+                        }
+                        static std::atomic<int64_t> qwen36_one_layer_fallback_report_count{0};
+                        const int64_t fallback_report_id =
+                            qwen36_one_layer_fallback_report_count.fetch_add(1, std::memory_order_relaxed);
+                        if (fallback_report_id < 16 || ggml_cuda_rdna3_graph_log_enabled(cuda_ctx->device)) {
+                            GGML_LOG_INFO(
+                                    "rdna3_qwen36_one_layer_mega: fallback-original layer=%d"
+                                    " node=%d reason=%s\n",
+                                    plan.layer, i, qkv_blocker.c_str());
+                        }
+                    } else {
+                        qwen36_one_layer_qkv_launched[qwen36_one_layer_qkv_hit_idx] = true;
+                        qwen36_one_layer_projection_bundle_launched[qwen36_one_layer_qkv_hit_idx] =
+                            projection_bundle_launched;
+                        prev_i = i;
+                        continue;
                     }
-                    qwen36_one_layer_qkv_launched[qwen36_one_layer_qkv_hit_idx] = true;
-                    qwen36_one_layer_projection_bundle_launched[qwen36_one_layer_qkv_hit_idx] =
-                        projection_bundle_launched;
-                    prev_i = i;
-                    continue;
                 }
 
                 if (qwen36_one_layer_qkv_skip) {
@@ -8096,7 +8126,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                         single_report_plan, cgraph->uid, single_report_plan_ok);
             }
 
-            if (final_auto_layers && ready_layers == 0) {
+            if (final_auto_layers && ready_layers == 0 && qwen36_one_layer_mega_required) {
                 GGML_ABORT("%s: Qwen3.6 RDNA3 final mega could not fuse any layer: %s",
                         __func__, first_blocker.c_str());
             }
