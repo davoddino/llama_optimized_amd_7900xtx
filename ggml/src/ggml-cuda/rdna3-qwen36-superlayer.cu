@@ -55,6 +55,11 @@ static bool qwen36_superlayer_direct_l0_proj_weights_requested() {
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DIRECT_L0_PROJ_WEIGHTS");
 }
 
+static bool qwen36_superlayer_direct_l0_ssm_weights_requested() {
+    return qwen36_superlayer_direct_l0_weights_requested() ||
+        qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DIRECT_L0_SSM_WEIGHTS");
+}
+
 static uint32_t qwen36_superlayer_direct_l0_stage_mask() {
     uint32_t mask = 0;
     if (qwen36_superlayer_direct_l0_norm_weights_requested()) {
@@ -65,6 +70,12 @@ static uint32_t qwen36_superlayer_direct_l0_stage_mask() {
     }
     if (qwen36_superlayer_direct_l0_proj_weights_requested()) {
         mask |= 0x3cu;
+    }
+    if (qwen36_superlayer_direct_l0_ssm_weights_requested()) {
+        mask |= 0x40u;
+    }
+    if (qwen36_superlayer_direct_l0_norm_weights_requested()) {
+        mask |= 0x200u;
     }
     return mask;
 }
@@ -275,6 +286,104 @@ struct qwen36_superlayer_l0_proj_desc {
     uint32_t ready = 0;
 };
 
+struct qwen36_superlayer_l0_ssm_desc {
+    const float * state = nullptr;
+    const float * token = nullptr;
+    const float * conv_w_data = nullptr;
+    float * raw_dst = nullptr;
+    float * silu_dst = nullptr;
+    float * state_out = nullptr;
+    uint64_t conv_w_offset = 0;
+    uint64_t state_nb1 = 0;
+    uint64_t state_nb2 = 0;
+    uint64_t token_nb1 = 0;
+    uint64_t token_nb2 = 0;
+    uint64_t conv_w_nb1 = 0;
+    uint64_t raw_nb0 = 0;
+    uint64_t raw_nb2 = 0;
+    uint64_t silu_nb0 = 0;
+    uint64_t silu_nb2 = 0;
+    uint64_t state_out_nb1 = 0;
+    uint32_t d_conv = 0;
+    uint32_t n_channels = 0;
+    uint32_t n_seqs = 0;
+    uint32_t use_direct_weights = 0;
+    uint32_t ready = 0;
+};
+
+struct qwen36_superlayer_l0_l2_desc {
+    const float * q_src = nullptr;
+    const float * k_src = nullptr;
+    float * q_dst = nullptr;
+    float * k_dst = nullptr;
+    uint64_t q_src_nb1 = 0;
+    uint64_t q_src_nb2 = 0;
+    uint64_t q_src_nb3 = 0;
+    uint64_t k_src_nb1 = 0;
+    uint64_t k_src_nb2 = 0;
+    uint64_t k_src_nb3 = 0;
+    uint64_t q_dst_nb1 = 0;
+    uint64_t q_dst_nb2 = 0;
+    uint64_t q_dst_nb3 = 0;
+    uint64_t k_dst_nb1 = 0;
+    uint64_t k_dst_nb2 = 0;
+    uint64_t k_dst_nb3 = 0;
+    uint32_t ncols = 0;
+    uint32_t nrows = 0;
+    uint32_t nchannels = 0;
+    uint32_t nsamples = 0;
+    float eps = 0.0f;
+    uint32_t ready = 0;
+};
+
+struct qwen36_superlayer_l0_gdn_desc {
+    const float * q = nullptr;
+    const float * k = nullptr;
+    const float * v = nullptr;
+    const float * g = nullptr;
+    const float * beta = nullptr;
+    const float * state = nullptr;
+    float * dst = nullptr;
+    float * state_out = nullptr;
+    uint64_t q_nb1 = 0;
+    uint64_t q_nb3 = 0;
+    uint64_t k_nb1 = 0;
+    uint64_t k_nb3 = 0;
+    uint64_t v_nb1 = 0;
+    uint64_t v_nb3 = 0;
+    uint64_t g_nb1 = 0;
+    uint64_t g_nb3 = 0;
+    uint64_t beta_nb1 = 0;
+    uint64_t beta_nb3 = 0;
+    uint64_t state_nb2 = 0;
+    uint64_t state_nb3 = 0;
+    uint64_t state_out_nb2 = 0;
+    uint64_t state_out_nb3 = 0;
+    uint32_t s_v = 0;
+    uint32_t h_v = 0;
+    uint32_t h_k = 0;
+    uint32_t n_seqs = 0;
+    uint32_t kda = 0;
+    uint32_t ready = 0;
+};
+
+struct qwen36_superlayer_l0_gated_norm_desc {
+    const float * x = nullptr;
+    const float * gate = nullptr;
+    const float * norm_w_data = nullptr;
+    float * rms_dst = nullptr;
+    float * norm_dst = nullptr;
+    float * silu_dst = nullptr;
+    float * out_dst = nullptr;
+    float * final_dst = nullptr;
+    uint64_t norm_w_offset = 0;
+    uint32_t ncols = 0;
+    uint32_t nrows = 0;
+    float eps = 0.0f;
+    uint32_t use_direct_weights = 0;
+    uint32_t ready = 0;
+};
+
 struct qwen36_superlayer_device_pack_entry {
     int device = -1;
     uint64_t fingerprint = 0;
@@ -286,6 +395,10 @@ struct qwen36_superlayer_device_pack_entry {
     qwen36_superlayer_l0_norm_desc * l0_norm = nullptr;
     qwen36_superlayer_l0_qkv_desc * l0_qkv = nullptr;
     qwen36_superlayer_l0_proj_desc * l0_proj = nullptr;
+    qwen36_superlayer_l0_ssm_desc * l0_ssm = nullptr;
+    qwen36_superlayer_l0_l2_desc * l0_l2 = nullptr;
+    qwen36_superlayer_l0_gdn_desc * l0_gdn = nullptr;
+    qwen36_superlayer_l0_gated_norm_desc * l0_gated_norm = nullptr;
     void * scratch = nullptr;
     size_t bytes = 0;
     size_t tensors = 0;
@@ -302,6 +415,10 @@ struct qwen36_superlayer_device_pack_view {
     qwen36_superlayer_l0_norm_desc * l0_norm = nullptr;
     qwen36_superlayer_l0_qkv_desc * l0_qkv = nullptr;
     qwen36_superlayer_l0_proj_desc * l0_proj = nullptr;
+    qwen36_superlayer_l0_ssm_desc * l0_ssm = nullptr;
+    qwen36_superlayer_l0_l2_desc * l0_l2 = nullptr;
+    qwen36_superlayer_l0_gdn_desc * l0_gdn = nullptr;
+    qwen36_superlayer_l0_gated_norm_desc * l0_gated_norm = nullptr;
     void * scratch = nullptr;
     size_t bytes = 0;
     size_t tensors = 0;
@@ -1569,6 +1686,408 @@ static bool qwen36_superlayer_make_l0_proj_desc(
     return true;
 }
 
+static bool qwen36_superlayer_l0_ssm_requested() {
+    return qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_SSM", 0) != 0;
+}
+
+static bool qwen36_superlayer_make_l0_ssm_desc(
+        const ggml_cgraph * cgraph,
+        const qwen36_superlayer_plan & plan,
+        const qwen36_superlayer_pack_plan & pack,
+        const int device,
+        qwen36_superlayer_l0_ssm_desc * desc,
+        std::string * blocker) {
+    if (desc == nullptr) {
+        if (blocker != nullptr) {
+            *blocker = "missing L0 SSM descriptor output";
+        }
+        return false;
+    }
+    *desc = qwen36_superlayer_l0_ssm_desc{};
+
+    const bool requested = qwen36_superlayer_l0_ssm_requested();
+    const int begin = plan.layer_start[0] >= 0 ? plan.layer_start[0] : 0;
+    const int end   = plan.layer_end[0]   >= begin ? plan.layer_end[0]   : cgraph->n_nodes - 1;
+    const ggml_tensor * conv_raw = nullptr;
+    const ggml_tensor * conv_silu = nullptr;
+    for (int i = begin; i <= end; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (conv_raw == nullptr && tensor_name_matches_layer(node, "conv_output_raw", 0)) {
+            conv_raw = node;
+        } else if (conv_silu == nullptr && tensor_name_matches_layer(node, "conv_output_silu", 0)) {
+            conv_silu = node;
+        }
+    }
+
+    if (conv_raw == nullptr || conv_silu == nullptr) {
+        if (requested && blocker != nullptr) {
+            *blocker = "L0 SSM fusion requires conv_output_raw-0 and conv_output_silu-0";
+        }
+        return !requested;
+    }
+    if (conv_raw->op != GGML_OP_SSM_CONV || conv_silu->op != GGML_OP_UNARY ||
+            ggml_get_unary_op(conv_silu) != GGML_UNARY_OP_SILU || conv_silu->src[0] != conv_raw) {
+        if (requested && blocker != nullptr) {
+            *blocker = "L0 SSM fusion requires SSM_CONV followed by SILU";
+        }
+        return !requested;
+    }
+
+    const ggml_tensor * conv_input = conv_raw->src[0];
+    const ggml_tensor * conv_w = conv_raw->src[1];
+    const ggml_tensor * state_out = conv_raw->src[2];
+    const ggml_tensor * state = conv_raw->src[3];
+    const ggml_tensor * token = conv_raw->src[4];
+    if (conv_input == nullptr || conv_w == nullptr || state_out == nullptr ||
+            state == nullptr || token == nullptr) {
+        if (requested && blocker != nullptr) {
+            *blocker = "L0 SSM fusion requires state-token concat and in-place state target";
+        }
+        return !requested;
+    }
+    if (conv_input->op != GGML_OP_CONCAT || ggml_get_op_params_i32(conv_input, 0) != 0 ||
+            conv_input->src[0] != state || conv_input->src[1] != token) {
+        if (requested && blocker != nullptr) {
+            *blocker = "L0 SSM fusion requires conv_input-0 to be concat(state, token)";
+        }
+        return !requested;
+    }
+    if (conv_w->type != GGML_TYPE_F32 || state->type != GGML_TYPE_F32 || token->type != GGML_TYPE_F32 ||
+            conv_raw->type != GGML_TYPE_F32 || conv_silu->type != GGML_TYPE_F32 ||
+            state_out->type != GGML_TYPE_F32) {
+        if (requested && blocker != nullptr) {
+            *blocker = "L0 SSM fusion currently requires F32 state, token, weight, output, and state target";
+        }
+        return !requested;
+    }
+
+    const int64_t d_conv = conv_w->ne[0];
+    const int64_t n_channels = conv_w->ne[1];
+    const int64_t n_seqs = conv_silu->ne[2];
+    if (d_conv <= 1 || d_conv > 16 || n_channels <= 0 || n_seqs != 1 ||
+            conv_raw->ne[0] != n_channels || conv_silu->ne[0] != n_channels ||
+            conv_raw->ne[1] != 1 || conv_silu->ne[1] != 1 ||
+            conv_raw->ne[2] != n_seqs ||
+            conv_input->ne[0] != d_conv || conv_input->ne[1] != n_channels || conv_input->ne[2] != n_seqs ||
+            state->ne[0] != d_conv - 1 || state->ne[1] != n_channels || state->ne[2] != n_seqs ||
+            token->ne[0] != 1 || token->ne[1] != n_channels || token->ne[2] != n_seqs ||
+            state_out->ne[0] != (d_conv - 1)*n_channels || state_out->ne[1] != n_seqs) {
+        if (requested && blocker != nullptr) {
+            *blocker = "L0 SSM fusion tensor dimensions do not match state-token decode";
+        }
+        return !requested;
+    }
+    if (state->nb[0] != (int64_t) sizeof(float) || token->nb[1] != (int64_t) sizeof(float) ||
+            conv_w->nb[0] != (int64_t) sizeof(float) ||
+            conv_raw->nb[0] != (int64_t) sizeof(float) || conv_silu->nb[0] != (int64_t) sizeof(float) ||
+            !ggml_is_contiguous(state_out)) {
+        if (requested && blocker != nullptr) {
+            *blocker = "L0 SSM fusion requires dense F32 channel/state layout";
+        }
+        return !requested;
+    }
+    if (!qwen36_superlayer_tensor_data_on_device(state, device, "L0 SSM conv state", blocker) ||
+            !qwen36_superlayer_tensor_data_on_device(token, device, "L0 SSM token", blocker) ||
+            !qwen36_superlayer_tensor_data_on_device(conv_raw, device, "L0 SSM raw output", blocker) ||
+            !qwen36_superlayer_tensor_data_on_device(conv_silu, device, "L0 SSM silu output", blocker) ||
+            !qwen36_superlayer_tensor_data_on_device(state_out, device, "L0 SSM state output", blocker)) {
+        return false;
+    }
+
+    const bool use_direct_weights = qwen36_superlayer_direct_l0_ssm_weights_requested();
+    if (use_direct_weights &&
+            !qwen36_superlayer_tensor_data_on_device(conv_w, device, "L0 SSM conv weight", blocker)) {
+        return false;
+    }
+
+    uint64_t conv_w_offset = 0;
+    if (!qwen36_superlayer_find_pack_offset_named(pack, conv_w, "L0 SSM conv weight", &conv_w_offset, blocker)) {
+        return false;
+    }
+
+    desc->state = (const float *) state->data;
+    desc->token = (const float *) token->data;
+    desc->conv_w_data = (const float *) conv_w->data;
+    desc->raw_dst = (float *) conv_raw->data;
+    desc->silu_dst = (float *) conv_silu->data;
+    desc->state_out = (float *) state_out->data;
+    desc->conv_w_offset = conv_w_offset;
+    desc->state_nb1 = (uint64_t) state->nb[1];
+    desc->state_nb2 = (uint64_t) state->nb[2];
+    desc->token_nb1 = (uint64_t) token->nb[1];
+    desc->token_nb2 = (uint64_t) token->nb[2];
+    desc->conv_w_nb1 = (uint64_t) conv_w->nb[1];
+    desc->raw_nb0 = (uint64_t) conv_raw->nb[0];
+    desc->raw_nb2 = (uint64_t) conv_raw->nb[2];
+    desc->silu_nb0 = (uint64_t) conv_silu->nb[0];
+    desc->silu_nb2 = (uint64_t) conv_silu->nb[2];
+    desc->state_out_nb1 = (uint64_t) state_out->nb[1];
+    desc->d_conv = (uint32_t) d_conv;
+    desc->n_channels = (uint32_t) n_channels;
+    desc->n_seqs = (uint32_t) n_seqs;
+    desc->use_direct_weights = use_direct_weights ? 1u : 0u;
+    desc->ready = 1u;
+    return true;
+}
+
+static bool qwen36_superlayer_l0_l2_requested() {
+    return qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_L2", 0) != 0;
+}
+
+static bool qwen36_superlayer_make_l0_l2_desc(
+        const ggml_cgraph * cgraph,
+        const qwen36_superlayer_plan & plan,
+        const int device,
+        qwen36_superlayer_l0_l2_desc * desc,
+        std::string * blocker) {
+    if (desc == nullptr) {
+        if (blocker != nullptr) {
+            *blocker = "missing L0 L2Norm descriptor output";
+        }
+        return false;
+    }
+    *desc = qwen36_superlayer_l0_l2_desc{};
+
+    const bool requested = qwen36_superlayer_l0_l2_requested();
+    if (!requested) {
+        return true;
+    }
+
+    const int begin = plan.layer_start[0] >= 0 ? plan.layer_start[0] : 0;
+    const int end   = plan.layer_end[0]   >= begin ? plan.layer_end[0]   : cgraph->n_nodes - 1;
+    const ggml_tensor * q_l2 = nullptr;
+    const ggml_tensor * k_l2 = nullptr;
+    for (int i = begin; i <= end; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (q_l2 == nullptr && tensor_name_matches_layer(node, "q_conv_predelta", 0)) {
+            q_l2 = node;
+        } else if (k_l2 == nullptr && tensor_name_matches_layer(node, "k_conv_predelta", 0)) {
+            k_l2 = node;
+        }
+    }
+
+    if (q_l2 == nullptr || k_l2 == nullptr ||
+            q_l2->op != GGML_OP_L2_NORM || k_l2->op != GGML_OP_L2_NORM ||
+            q_l2->src[0] == nullptr || k_l2->src[0] == nullptr) {
+        if (blocker != nullptr) {
+            *blocker = "L0 L2Norm fusion requires q_conv_predelta-0 and k_conv_predelta-0 L2_NORM nodes";
+        }
+        return false;
+    }
+
+    const ggml_tensor * q_src = q_l2->src[0];
+    const ggml_tensor * k_src = k_l2->src[0];
+    if (q_src->type != GGML_TYPE_F32 || k_src->type != GGML_TYPE_F32 ||
+            q_l2->type != GGML_TYPE_F32 || k_l2->type != GGML_TYPE_F32) {
+        if (blocker != nullptr) {
+            *blocker = "L0 L2Norm fusion currently requires F32 Q/K tensors";
+        }
+        return false;
+    }
+    if (!ggml_are_same_shape(q_src, k_src) ||
+            !ggml_are_same_shape(q_src, q_l2) ||
+            !ggml_are_same_shape(k_src, k_l2) ||
+            q_src->ne[0] <= 0 || q_src->ne[1] <= 0 ||
+            q_src->ne[2] != 1 || q_src->ne[3] != 1) {
+        if (blocker != nullptr) {
+            *blocker = "L0 L2Norm fusion requires matching one-token Q/K decode tensors";
+        }
+        return false;
+    }
+    if (ggml_get_op_params_f32(q_l2, 0) != ggml_get_op_params_f32(k_l2, 0)) {
+        if (blocker != nullptr) {
+            *blocker = "L0 L2Norm fusion requires identical Q/K epsilon";
+        }
+        return false;
+    }
+    if (ggml_get_op_params_f32(q_l2, 0) < 0.0f) {
+        if (blocker != nullptr) {
+            *blocker = "L0 L2Norm epsilon is negative";
+        }
+        return false;
+    }
+    if (q_src->nb[0] != (int64_t) sizeof(float) ||
+            k_src->nb[0] != (int64_t) sizeof(float) ||
+            q_l2->nb[0] != (int64_t) sizeof(float) ||
+            k_l2->nb[0] != (int64_t) sizeof(float) ||
+            !ggml_is_contiguous_rows(q_src) ||
+            !ggml_is_contiguous_rows(k_src) ||
+            !ggml_is_contiguous(q_l2) ||
+            !ggml_is_contiguous(k_l2)) {
+        if (blocker != nullptr) {
+            *blocker = "L0 L2Norm fusion requires dense row-contiguous Q/K layout";
+        }
+        return false;
+    }
+    if (!qwen36_superlayer_tensor_data_on_device(q_src, device, "L0 Q L2 input", blocker) ||
+            !qwen36_superlayer_tensor_data_on_device(k_src, device, "L0 K L2 input", blocker) ||
+            !qwen36_superlayer_tensor_data_on_device(q_l2, device, "L0 Q L2 output", blocker) ||
+            !qwen36_superlayer_tensor_data_on_device(k_l2, device, "L0 K L2 output", blocker)) {
+        return false;
+    }
+
+    desc->q_src = (const float *) q_src->data;
+    desc->k_src = (const float *) k_src->data;
+    desc->q_dst = (float *) q_l2->data;
+    desc->k_dst = (float *) k_l2->data;
+    desc->q_src_nb1 = (uint64_t) q_src->nb[1];
+    desc->q_src_nb2 = (uint64_t) q_src->nb[2];
+    desc->q_src_nb3 = (uint64_t) q_src->nb[3];
+    desc->k_src_nb1 = (uint64_t) k_src->nb[1];
+    desc->k_src_nb2 = (uint64_t) k_src->nb[2];
+    desc->k_src_nb3 = (uint64_t) k_src->nb[3];
+    desc->q_dst_nb1 = (uint64_t) q_l2->nb[1];
+    desc->q_dst_nb2 = (uint64_t) q_l2->nb[2];
+    desc->q_dst_nb3 = (uint64_t) q_l2->nb[3];
+    desc->k_dst_nb1 = (uint64_t) k_l2->nb[1];
+    desc->k_dst_nb2 = (uint64_t) k_l2->nb[2];
+    desc->k_dst_nb3 = (uint64_t) k_l2->nb[3];
+    desc->ncols = (uint32_t) q_src->ne[0];
+    desc->nrows = (uint32_t) q_src->ne[1];
+    desc->nchannels = (uint32_t) q_src->ne[2];
+    desc->nsamples = (uint32_t) q_src->ne[3];
+    desc->eps = ggml_get_op_params_f32(q_l2, 0);
+    desc->ready = 1u;
+    return true;
+}
+
+static bool qwen36_superlayer_l0_gdn_requested() {
+    return qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_GDN", 0) != 0;
+}
+
+static bool qwen36_superlayer_make_l0_gdn_desc(
+        const ggml_cgraph * cgraph,
+        const qwen36_superlayer_plan & plan,
+        const int device,
+        qwen36_superlayer_l0_gdn_desc * desc,
+        std::string * blocker) {
+    if (desc == nullptr) {
+        if (blocker != nullptr) {
+            *blocker = "missing L0 GDN descriptor output";
+        }
+        return false;
+    }
+    *desc = qwen36_superlayer_l0_gdn_desc{};
+
+    const bool requested = qwen36_superlayer_l0_gdn_requested();
+    if (!requested) {
+        return true;
+    }
+
+    const int begin = plan.layer_start[0] >= 0 ? plan.layer_start[0] : 0;
+    const int end   = plan.layer_end[0]   >= begin ? plan.layer_end[0]   : cgraph->n_nodes - 1;
+    const ggml_tensor * gdn = nullptr;
+    for (int i = begin; i <= end; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (tensor_name_matches_layer(node, "__fgdn_ar__", 0)) {
+            gdn = node;
+            break;
+        }
+    }
+
+    if (gdn == nullptr || gdn->op != GGML_OP_GATED_DELTA_NET) {
+        if (blocker != nullptr) {
+            *blocker = "L0 GDN fusion requires __fgdn_ar__-0 GATED_DELTA_NET";
+        }
+        return false;
+    }
+
+    const ggml_tensor * q = gdn->src[0];
+    const ggml_tensor * k = gdn->src[1];
+    const ggml_tensor * v = gdn->src[2];
+    const ggml_tensor * g = gdn->src[3];
+    const ggml_tensor * beta = gdn->src[4];
+    const ggml_tensor * state = gdn->src[5];
+    const ggml_tensor * state_out = gdn->src[6];
+    if (q == nullptr || k == nullptr || v == nullptr || g == nullptr || beta == nullptr ||
+            state == nullptr || state_out == nullptr || ggml_get_op_params_i32(gdn, 0) == 0) {
+        if (blocker != nullptr) {
+            *blocker = "L0 GDN fusion requires autoregressive in-place GDN state output";
+        }
+        return false;
+    }
+    if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F32 || v->type != GGML_TYPE_F32 ||
+            g->type != GGML_TYPE_F32 || beta->type != GGML_TYPE_F32 ||
+            state->type != GGML_TYPE_F32 || state_out->type != GGML_TYPE_F32 ||
+            gdn->type != GGML_TYPE_F32) {
+        if (blocker != nullptr) {
+            *blocker = "L0 GDN fusion currently requires F32 tensors";
+        }
+        return false;
+    }
+
+    const int64_t s_v = v->ne[0];
+    const int64_t h_v = v->ne[1];
+    const int64_t h_k = q->ne[1];
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs = v->ne[3];
+    const bool kda = g->ne[0] == s_v;
+    if (s_v <= 0 || h_v <= 0 || h_k <= 0 || n_tokens != 1 || n_seqs != 1 ||
+            q->ne[0] != s_v || k->ne[0] != s_v ||
+            k->ne[1] != h_k || q->ne[2] != 1 || k->ne[2] != 1 ||
+            q->ne[3] != n_seqs || k->ne[3] != n_seqs ||
+            h_v % h_k != 0 ||
+            g->ne[0] != (kda ? s_v : 1) || g->ne[1] != h_v || g->ne[2] != 1 || g->ne[3] != n_seqs ||
+            beta->ne[0] != 1 || beta->ne[1] != h_v || beta->ne[2] != 1 || beta->ne[3] != n_seqs ||
+            state->ne[0] != s_v || state->ne[1] != s_v || state->ne[2] != h_v || state->ne[3] != n_seqs ||
+            ggml_nelements(state_out) != s_v*s_v*h_v*n_seqs ||
+            ggml_nelements(gdn) != s_v*h_v*n_seqs) {
+        if (blocker != nullptr) {
+            *blocker = "L0 GDN fusion tensor dimensions do not match one-token decode";
+        }
+        return false;
+    }
+    if (!ggml_is_contiguous_rows(q) || !ggml_is_contiguous_rows(k) || !ggml_is_contiguous_rows(v) ||
+            !ggml_is_contiguous(g) || !ggml_is_contiguous(beta) ||
+            !ggml_is_contiguous(state) || !ggml_is_contiguous(state_out) ||
+            !ggml_is_contiguous(gdn)) {
+        if (blocker != nullptr) {
+            *blocker = "L0 GDN fusion requires contiguous F32 GDN layout";
+        }
+        return false;
+    }
+    if (!qwen36_superlayer_tensor_data_on_device(q, device, "L0 GDN Q", blocker) ||
+            !qwen36_superlayer_tensor_data_on_device(k, device, "L0 GDN K", blocker) ||
+            !qwen36_superlayer_tensor_data_on_device(v, device, "L0 GDN V", blocker) ||
+            !qwen36_superlayer_tensor_data_on_device(g, device, "L0 GDN gate", blocker) ||
+            !qwen36_superlayer_tensor_data_on_device(beta, device, "L0 GDN beta", blocker) ||
+            !qwen36_superlayer_tensor_data_on_device(state, device, "L0 GDN state", blocker) ||
+            !qwen36_superlayer_tensor_data_on_device(state_out, device, "L0 GDN state output", blocker) ||
+            !qwen36_superlayer_tensor_data_on_device(gdn, device, "L0 GDN output", blocker)) {
+        return false;
+    }
+
+    desc->q = (const float *) q->data;
+    desc->k = (const float *) k->data;
+    desc->v = (const float *) v->data;
+    desc->g = (const float *) g->data;
+    desc->beta = (const float *) beta->data;
+    desc->state = (const float *) state->data;
+    desc->dst = (float *) gdn->data;
+    desc->state_out = (float *) state_out->data;
+    desc->q_nb1 = (uint64_t) q->nb[1];
+    desc->q_nb3 = (uint64_t) q->nb[3];
+    desc->k_nb1 = (uint64_t) k->nb[1];
+    desc->k_nb3 = (uint64_t) k->nb[3];
+    desc->v_nb1 = (uint64_t) v->nb[1];
+    desc->v_nb3 = (uint64_t) v->nb[3];
+    desc->g_nb1 = (uint64_t) g->nb[1];
+    desc->g_nb3 = (uint64_t) g->nb[3];
+    desc->beta_nb1 = (uint64_t) beta->nb[1];
+    desc->beta_nb3 = (uint64_t) beta->nb[3];
+    desc->state_nb2 = (uint64_t) state->nb[2];
+    desc->state_nb3 = (uint64_t) state->nb[3];
+    desc->state_out_nb2 = (uint64_t) state_out->nb[2];
+    desc->state_out_nb3 = (uint64_t) state_out->nb[3];
+    desc->s_v = (uint32_t) s_v;
+    desc->h_v = (uint32_t) h_v;
+    desc->h_k = (uint32_t) h_k;
+    desc->n_seqs = (uint32_t) n_seqs;
+    desc->kda = kda ? 1u : 0u;
+    desc->ready = 1u;
+    return true;
+}
+
 static bool qwen36_superlayer_materialize_device_pack(
         ggml_backend_cuda_context * cuda_ctx,
         const ggml_cgraph * cgraph,
@@ -1607,6 +2126,21 @@ static bool qwen36_superlayer_materialize_device_pack(
     qwen36_superlayer_l0_proj_desc l0_proj_host;
     if (!qwen36_superlayer_make_l0_proj_desc(
                 cgraph, plan, pack, runtime, cuda_ctx->device, &l0_proj_host, blocker)) {
+        return false;
+    }
+    qwen36_superlayer_l0_ssm_desc l0_ssm_host;
+    if (!qwen36_superlayer_make_l0_ssm_desc(
+                cgraph, plan, pack, cuda_ctx->device, &l0_ssm_host, blocker)) {
+        return false;
+    }
+    qwen36_superlayer_l0_l2_desc l0_l2_host;
+    if (!qwen36_superlayer_make_l0_l2_desc(
+                cgraph, plan, cuda_ctx->device, &l0_l2_host, blocker)) {
+        return false;
+    }
+    qwen36_superlayer_l0_gdn_desc l0_gdn_host;
+    if (!qwen36_superlayer_make_l0_gdn_desc(
+                cgraph, plan, cuda_ctx->device, &l0_gdn_host, blocker)) {
         return false;
     }
 
@@ -1813,9 +2347,108 @@ static bool qwen36_superlayer_materialize_device_pack(
                 return false;
             }
 
+            qwen36_superlayer_l0_ssm_desc * l0_ssm = nullptr;
+            err = cudaMalloc((void **) &l0_ssm, sizeof(qwen36_superlayer_l0_ssm_desc));
+            if (err != cudaSuccess) {
+                (void) cudaFree(l0_proj);
+                (void) cudaFree(l0_qkv);
+                (void) cudaFree(l0_norm);
+                (void) cudaFree(io_descs);
+                (void) cudaFree(scratch);
+                (void) cudaFree(layer_descs);
+                (void) cudaFree(data);
+                (void) cudaGetLastError();
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to allocate L0 SSM descriptor", err);
+                return false;
+            }
+            err = cudaMemcpy(
+                    l0_ssm, &l0_ssm_host, sizeof(qwen36_superlayer_l0_ssm_desc),
+                    cudaMemcpyHostToDevice);
+            if (err != cudaSuccess) {
+                (void) cudaFree(l0_ssm);
+                (void) cudaFree(l0_proj);
+                (void) cudaFree(l0_qkv);
+                (void) cudaFree(l0_norm);
+                (void) cudaFree(io_descs);
+                (void) cudaFree(scratch);
+                (void) cudaFree(layer_descs);
+                (void) cudaFree(data);
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to upload L0 SSM descriptor", err);
+                return false;
+            }
+
+            qwen36_superlayer_l0_l2_desc * l0_l2 = nullptr;
+            err = cudaMalloc((void **) &l0_l2, sizeof(qwen36_superlayer_l0_l2_desc));
+            if (err != cudaSuccess) {
+                (void) cudaFree(l0_ssm);
+                (void) cudaFree(l0_proj);
+                (void) cudaFree(l0_qkv);
+                (void) cudaFree(l0_norm);
+                (void) cudaFree(io_descs);
+                (void) cudaFree(scratch);
+                (void) cudaFree(layer_descs);
+                (void) cudaFree(data);
+                (void) cudaGetLastError();
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to allocate L0 L2Norm descriptor", err);
+                return false;
+            }
+            err = cudaMemcpy(
+                    l0_l2, &l0_l2_host, sizeof(qwen36_superlayer_l0_l2_desc),
+                    cudaMemcpyHostToDevice);
+            if (err != cudaSuccess) {
+                (void) cudaFree(l0_l2);
+                (void) cudaFree(l0_ssm);
+                (void) cudaFree(l0_proj);
+                (void) cudaFree(l0_qkv);
+                (void) cudaFree(l0_norm);
+                (void) cudaFree(io_descs);
+                (void) cudaFree(scratch);
+                (void) cudaFree(layer_descs);
+                (void) cudaFree(data);
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to upload L0 L2Norm descriptor", err);
+                return false;
+            }
+
+            qwen36_superlayer_l0_gdn_desc * l0_gdn = nullptr;
+            err = cudaMalloc((void **) &l0_gdn, sizeof(qwen36_superlayer_l0_gdn_desc));
+            if (err != cudaSuccess) {
+                (void) cudaFree(l0_l2);
+                (void) cudaFree(l0_ssm);
+                (void) cudaFree(l0_proj);
+                (void) cudaFree(l0_qkv);
+                (void) cudaFree(l0_norm);
+                (void) cudaFree(io_descs);
+                (void) cudaFree(scratch);
+                (void) cudaFree(layer_descs);
+                (void) cudaFree(data);
+                (void) cudaGetLastError();
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to allocate L0 GDN descriptor", err);
+                return false;
+            }
+            err = cudaMemcpy(
+                    l0_gdn, &l0_gdn_host, sizeof(qwen36_superlayer_l0_gdn_desc),
+                    cudaMemcpyHostToDevice);
+            if (err != cudaSuccess) {
+                (void) cudaFree(l0_gdn);
+                (void) cudaFree(l0_l2);
+                (void) cudaFree(l0_ssm);
+                (void) cudaFree(l0_proj);
+                (void) cudaFree(l0_qkv);
+                (void) cudaFree(l0_norm);
+                (void) cudaFree(io_descs);
+                (void) cudaFree(scratch);
+                (void) cudaFree(layer_descs);
+                (void) cudaFree(data);
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to upload L0 GDN descriptor", err);
+                return false;
+            }
+
             cudaEvent_t ready_event = nullptr;
             err = cudaEventCreateWithFlags(&ready_event, cudaEventDisableTiming);
             if (err != cudaSuccess) {
+                (void) cudaFree(l0_gdn);
+                (void) cudaFree(l0_l2);
+                (void) cudaFree(l0_ssm);
                 (void) cudaFree(l0_proj);
                 (void) cudaFree(l0_qkv);
                 (void) cudaFree(l0_norm);
@@ -1830,6 +2463,9 @@ static bool qwen36_superlayer_materialize_device_pack(
             err = cudaEventRecord(ready_event, cuda_ctx->stream());
             if (err != cudaSuccess) {
                 (void) cudaEventDestroy(ready_event);
+                (void) cudaFree(l0_gdn);
+                (void) cudaFree(l0_l2);
+                (void) cudaFree(l0_ssm);
                 (void) cudaFree(l0_proj);
                 (void) cudaFree(l0_qkv);
                 (void) cudaFree(l0_norm);
@@ -1852,6 +2488,9 @@ static bool qwen36_superlayer_materialize_device_pack(
             entry.l0_norm = l0_norm;
             entry.l0_qkv = l0_qkv;
             entry.l0_proj = l0_proj;
+            entry.l0_ssm = l0_ssm;
+            entry.l0_l2 = l0_l2;
+            entry.l0_gdn = l0_gdn;
             entry.scratch = scratch;
             entry.bytes = device_weightpack_required ? pack.total_bytes : 0;
             entry.tensors = device_weightpack_required ? pack.refs.size() : 0;
@@ -1962,6 +2601,60 @@ static bool qwen36_superlayer_materialize_device_pack(
                 return false;
             }
 
+            if (it->second.l0_ssm == nullptr) {
+                qwen36_superlayer_l0_ssm_desc * l0_ssm = nullptr;
+                cudaError_t err = cudaMalloc((void **) &l0_ssm, sizeof(qwen36_superlayer_l0_ssm_desc));
+                if (err != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    qwen36_superlayer_set_cuda_blocker(blocker, "failed to allocate L0 SSM descriptor", err);
+                    return false;
+                }
+                it->second.l0_ssm = l0_ssm;
+            }
+            err = cudaMemcpy(
+                    it->second.l0_ssm, &l0_ssm_host, sizeof(qwen36_superlayer_l0_ssm_desc),
+                    cudaMemcpyHostToDevice);
+            if (err != cudaSuccess) {
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to refresh L0 SSM descriptor", err);
+                return false;
+            }
+
+            if (it->second.l0_l2 == nullptr) {
+                qwen36_superlayer_l0_l2_desc * l0_l2 = nullptr;
+                cudaError_t err = cudaMalloc((void **) &l0_l2, sizeof(qwen36_superlayer_l0_l2_desc));
+                if (err != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    qwen36_superlayer_set_cuda_blocker(blocker, "failed to allocate L0 L2Norm descriptor", err);
+                    return false;
+                }
+                it->second.l0_l2 = l0_l2;
+            }
+            err = cudaMemcpy(
+                    it->second.l0_l2, &l0_l2_host, sizeof(qwen36_superlayer_l0_l2_desc),
+                    cudaMemcpyHostToDevice);
+            if (err != cudaSuccess) {
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to refresh L0 L2Norm descriptor", err);
+                return false;
+            }
+
+            if (it->second.l0_gdn == nullptr) {
+                qwen36_superlayer_l0_gdn_desc * l0_gdn = nullptr;
+                cudaError_t err = cudaMalloc((void **) &l0_gdn, sizeof(qwen36_superlayer_l0_gdn_desc));
+                if (err != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    qwen36_superlayer_set_cuda_blocker(blocker, "failed to allocate L0 GDN descriptor", err);
+                    return false;
+                }
+                it->second.l0_gdn = l0_gdn;
+            }
+            err = cudaMemcpy(
+                    it->second.l0_gdn, &l0_gdn_host, sizeof(qwen36_superlayer_l0_gdn_desc),
+                    cudaMemcpyHostToDevice);
+            if (err != cudaSuccess) {
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to refresh L0 GDN descriptor", err);
+                return false;
+            }
+
             it->second.runtime_signature = runtime_signature;
             it->second.io_count = io_descs_host.size();
             it->second.runtime = runtime;
@@ -1973,6 +2666,9 @@ static bool qwen36_superlayer_materialize_device_pack(
         local_view.l0_norm = it->second.l0_norm;
         local_view.l0_qkv = it->second.l0_qkv;
         local_view.l0_proj = it->second.l0_proj;
+        local_view.l0_ssm = it->second.l0_ssm;
+        local_view.l0_l2 = it->second.l0_l2;
+        local_view.l0_gdn = it->second.l0_gdn;
         local_view.scratch = it->second.scratch;
         local_view.bytes = it->second.bytes;
         local_view.tensors = it->second.tensors;
@@ -1995,13 +2691,14 @@ static bool qwen36_superlayer_materialize_device_pack(
     if (should_report && qwen36_superlayer_trace_enabled()) {
         fprintf(stderr,
                 "rdna3_qwen36_superlayer: device-pack-ready fingerprint=%s source=%s runtime=%s"
-                " ptr=%p layer_descs=%p io_descs=%p l0_norm=%p l0_qkv=%p l0_proj=%p scratch=%p tensors=%zu io=%zu bytes=%zu"
+                " ptr=%p layer_descs=%p io_descs=%p l0_norm=%p l0_qkv=%p l0_proj=%p l0_ssm=%p l0_l2=%p l0_gdn=%p"
+                " scratch=%p tensors=%zu io=%zu bytes=%zu"
                 " scratch_bytes=%zu activation_slot=%zu projection_slot=%zu logits_bytes=%zu router_slot=%zu"
                 " n_embd=%" PRId64 " n_vocab=%" PRId64 "\n",
                 hex_u64(plan.fingerprint).c_str(), hex_u64(source_signature).c_str(),
                 hex_u64(runtime_signature).c_str(),
                 local_view.data, local_view.layers, local_view.io_descs, local_view.l0_norm, local_view.l0_qkv,
-                local_view.l0_proj, local_view.scratch,
+                local_view.l0_proj, local_view.l0_ssm, local_view.l0_l2, local_view.l0_gdn, local_view.scratch,
                 local_view.tensors, local_view.io_count, local_view.bytes,
                 local_view.runtime.scratch_bytes, local_view.runtime.activation_slot_bytes,
                 local_view.runtime.projection_slot_bytes, local_view.runtime.logits_bytes, local_view.runtime.router_slot_bytes,
@@ -2977,6 +3674,219 @@ __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_projection_bundle(
     }
 }
 
+__device__ __forceinline__ void qwen36_rdna3_superlayer_l0_ssm_conv(
+        const qwen36_superlayer_l0_ssm_desc * desc,
+        const uint8_t * weightpack,
+        const uint32_t write_outputs) {
+    if (desc == nullptr || desc->ready == 0 || write_outputs == 0 ||
+            desc->state == nullptr || desc->token == nullptr ||
+            desc->raw_dst == nullptr || desc->silu_dst == nullptr || desc->state_out == nullptr) {
+        return;
+    }
+
+    const bool use_direct_weights = desc->use_direct_weights != 0;
+    if (!use_direct_weights && weightpack == nullptr) {
+        return;
+    }
+
+    const float * conv_w = use_direct_weights ?
+        desc->conv_w_data : (const float *) (weightpack + desc->conv_w_offset);
+    if (conv_w == nullptr) {
+        return;
+    }
+
+    const uint32_t d_conv = desc->d_conv;
+    const uint32_t n_channels = desc->n_channels;
+    const uint32_t n_seqs = desc->n_seqs;
+    if (d_conv <= 1 || d_conv > 16 || n_channels == 0 || n_seqs == 0) {
+        return;
+    }
+
+    const uint64_t total = (uint64_t) n_channels*n_seqs;
+    const uint64_t stride = (uint64_t) gridDim.x*blockDim.x;
+    const uint64_t first = (uint64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    for (uint64_t idx = first; idx < total; idx += stride) {
+        const uint32_t seq = (uint32_t) (idx / n_channels);
+        const uint32_t ch = (uint32_t) (idx - (uint64_t) seq*n_channels);
+
+        const float * state_ch = (const float *) ((const char *) desc->state +
+                (uint64_t) seq*desc->state_nb2 + (uint64_t) ch*desc->state_nb1);
+        const float * token_ch = (const float *) ((const char *) desc->token +
+                (uint64_t) seq*desc->token_nb2 + (uint64_t) ch*desc->token_nb1);
+        const float * weight_ch = (const float *) ((const char *) conv_w + (uint64_t) ch*desc->conv_w_nb1);
+
+        float sum = 0.0f;
+        for (uint32_t j = 0; j + 1 < d_conv; ++j) {
+            sum += state_ch[j]*weight_ch[j];
+        }
+        const float token_v = token_ch[0];
+        sum += token_v*weight_ch[d_conv - 1];
+
+        float * raw_ch = (float *) ((char *) desc->raw_dst +
+                (uint64_t) seq*desc->raw_nb2 + (uint64_t) ch*desc->raw_nb0);
+        float * silu_ch = (float *) ((char *) desc->silu_dst +
+                (uint64_t) seq*desc->silu_nb2 + (uint64_t) ch*desc->silu_nb0);
+        raw_ch[0] = sum;
+        silu_ch[0] = sum / (1.0f + expf(-sum));
+
+        float * state_out_seq = (float *) ((char *) desc->state_out +
+                (uint64_t) seq*desc->state_out_nb1);
+        float * state_out_ch = state_out_seq + (uint64_t) ch*(d_conv - 1);
+        for (uint32_t j = 0; j + 2 < d_conv; ++j) {
+            state_out_ch[j] = state_ch[j + 1];
+        }
+        state_out_ch[d_conv - 2] = token_v;
+    }
+}
+
+__device__ __forceinline__ void qwen36_rdna3_superlayer_l0_l2_pair(
+        const qwen36_superlayer_l0_l2_desc * desc,
+        float * sums,
+        const uint32_t write_outputs) {
+    if (desc == nullptr || desc->ready == 0 || write_outputs == 0 ||
+            sums == nullptr || desc->q_src == nullptr || desc->k_src == nullptr ||
+            desc->q_dst == nullptr || desc->k_dst == nullptr) {
+        return;
+    }
+
+    const uint32_t ncols = desc->ncols;
+    const uint32_t nrows = desc->nrows;
+    const uint32_t nchannels = desc->nchannels;
+    const uint32_t nsamples = desc->nsamples;
+    if (ncols == 0 || nrows == 0 || nchannels == 0 || nsamples == 0) {
+        return;
+    }
+
+    const uint64_t rows_per_tensor = (uint64_t) nrows*nchannels*nsamples;
+    const uint64_t total_rows = rows_per_tensor*2;
+    for (uint64_t row2 = blockIdx.x; row2 < total_rows; row2 += gridDim.x) {
+        const bool is_k = row2 >= rows_per_tensor;
+        const uint64_t local = is_k ? row2 - rows_per_tensor : row2;
+        const uint32_t row = (uint32_t) (local % nrows);
+        const uint32_t channel = (uint32_t) ((local / nrows) % nchannels);
+        const uint32_t sample = (uint32_t) (local / ((uint64_t) nrows*nchannels));
+
+        const uint64_t src_off = is_k ?
+            (uint64_t) row*desc->k_src_nb1 + (uint64_t) channel*desc->k_src_nb2 +
+                (uint64_t) sample*desc->k_src_nb3 :
+            (uint64_t) row*desc->q_src_nb1 + (uint64_t) channel*desc->q_src_nb2 +
+                (uint64_t) sample*desc->q_src_nb3;
+        const uint64_t dst_off = is_k ?
+            (uint64_t) row*desc->k_dst_nb1 + (uint64_t) channel*desc->k_dst_nb2 +
+                (uint64_t) sample*desc->k_dst_nb3 :
+            (uint64_t) row*desc->q_dst_nb1 + (uint64_t) channel*desc->q_dst_nb2 +
+                (uint64_t) sample*desc->q_dst_nb3;
+        const float * src = (const float *) ((const char *) (is_k ? desc->k_src : desc->q_src) + src_off);
+        float * dst = (float *) ((char *) (is_k ? desc->k_dst : desc->q_dst) + dst_off);
+
+        float acc = 0.0f;
+        for (uint32_t col = threadIdx.x; col < ncols; col += blockDim.x) {
+            const float v = src[col];
+            acc += v*v;
+        }
+
+        sums[threadIdx.x] = acc;
+        __syncthreads();
+        for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                sums[threadIdx.x] += sums[threadIdx.x + stride];
+            }
+            __syncthreads();
+        }
+
+        const float scale = rsqrtf(fmaxf(sums[0], desc->eps*desc->eps));
+        for (uint32_t col = threadIdx.x; col < ncols; col += blockDim.x) {
+            dst[col] = src[col]*scale;
+        }
+        __syncthreads();
+    }
+}
+
+__device__ __forceinline__ void qwen36_rdna3_superlayer_l0_gdn(
+        const qwen36_superlayer_l0_gdn_desc * desc,
+        float * sums,
+        const uint32_t write_outputs) {
+    if (desc == nullptr || desc->ready == 0 || write_outputs == 0 || sums == nullptr ||
+            desc->q == nullptr || desc->k == nullptr || desc->v == nullptr ||
+            desc->g == nullptr || desc->beta == nullptr || desc->state == nullptr ||
+            desc->dst == nullptr || desc->state_out == nullptr) {
+        return;
+    }
+
+    const uint32_t s_v = desc->s_v;
+    const uint32_t h_v = desc->h_v;
+    const uint32_t h_k = desc->h_k;
+    const uint32_t n_seqs = desc->n_seqs;
+    if (s_v == 0 || h_v == 0 || h_k == 0 || n_seqs == 0 || h_v % h_k != 0) {
+        return;
+    }
+
+    const float scale = rsqrtf((float) s_v);
+    const uint64_t total_cols = (uint64_t) n_seqs*h_v*s_v;
+    for (uint64_t idx = blockIdx.x; idx < total_cols; idx += gridDim.x) {
+        const uint32_t col = (uint32_t) (idx % s_v);
+        const uint32_t h = (uint32_t) ((idx / s_v) % h_v);
+        const uint32_t seq = (uint32_t) (idx / ((uint64_t) s_v*h_v));
+        const uint32_t hq = h % h_k;
+
+        const float * q_h = (const float *) ((const char *) desc->q +
+                (uint64_t) hq*desc->q_nb1 + (uint64_t) seq*desc->q_nb3);
+        const float * k_h = (const float *) ((const char *) desc->k +
+                (uint64_t) hq*desc->k_nb1 + (uint64_t) seq*desc->k_nb3);
+        const float * v_h = (const float *) ((const char *) desc->v +
+                (uint64_t) h*desc->v_nb1 + (uint64_t) seq*desc->v_nb3);
+        const float * g_h = (const float *) ((const char *) desc->g +
+                (uint64_t) h*desc->g_nb1 + (uint64_t) seq*desc->g_nb3);
+        const float * beta_h = (const float *) ((const char *) desc->beta +
+                (uint64_t) h*desc->beta_nb1 + (uint64_t) seq*desc->beta_nb3);
+        const float * state_h = (const float *) ((const char *) desc->state +
+                (uint64_t) h*desc->state_nb2 + (uint64_t) seq*desc->state_nb3);
+        float * state_out_h = desc->state_out + ((uint64_t) seq*h_v + h)*(uint64_t) s_v*s_v;
+        const float * state_col = state_h + (uint64_t) col*s_v;
+        float * state_out_col = state_out_h + (uint64_t) col*s_v;
+
+        const bool kda = desc->kda != 0;
+        float kv_part = 0.0f;
+        for (uint32_t i = threadIdx.x; i < s_v; i += blockDim.x) {
+            const float g_val = kda ? expf(g_h[i]) : 1.0f;
+            kv_part += g_val*state_col[i]*k_h[i];
+        }
+        sums[threadIdx.x] = kv_part;
+        __syncthreads();
+        for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                sums[threadIdx.x] += sums[threadIdx.x + stride];
+            }
+            __syncthreads();
+        }
+
+        const float g_scalar = kda ? 1.0f : expf(g_h[0]);
+        const float kv = kda ? sums[0] : g_scalar*sums[0];
+        const float delta = (v_h[col] - kv)*beta_h[0];
+
+        float attn_part = 0.0f;
+        for (uint32_t i = threadIdx.x; i < s_v; i += blockDim.x) {
+            const float g_val = kda ? expf(g_h[i]) : g_scalar;
+            const float s_new = g_val*state_col[i] + k_h[i]*delta;
+            state_out_col[i] = s_new;
+            attn_part += s_new*q_h[i];
+        }
+        sums[threadIdx.x] = attn_part;
+        __syncthreads();
+        for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                sums[threadIdx.x] += sums[threadIdx.x + stride];
+            }
+            __syncthreads();
+        }
+
+        if (threadIdx.x == 0) {
+            desc->dst[((uint64_t) seq*h_v + h)*(uint64_t) s_v + col] = sums[0]*scale;
+        }
+        __syncthreads();
+    }
+}
+
 __global__ void qwen36_rdna3_superlayer_contract_kernel(
         qwen36_superlayer_contract_state * state,
         const uint8_t * weightpack,
@@ -2986,6 +3896,9 @@ __global__ void qwen36_rdna3_superlayer_contract_kernel(
         const qwen36_superlayer_l0_norm_desc * l0_norm,
         const qwen36_superlayer_l0_qkv_desc * l0_qkv,
         const qwen36_superlayer_l0_proj_desc * l0_proj,
+        const qwen36_superlayer_l0_ssm_desc * l0_ssm,
+        const qwen36_superlayer_l0_l2_desc * l0_l2,
+        const qwen36_superlayer_l0_gdn_desc * l0_gdn,
         uint8_t * scratch,
         const uint64_t scratch_bytes,
         const uint64_t weightpack_bytes,
@@ -3086,6 +3999,16 @@ __global__ void qwen36_rdna3_superlayer_contract_kernel(
         l0_proj->z_out != 0 && l0_proj->beta_out != 0 && l0_proj->alpha_out != 0 &&
         l0_proj_z_end <= scratch_bytes && l0_proj_beta_end <= scratch_bytes &&
         l0_proj_alpha_end <= scratch_bytes && l0_grid_scratch != nullptr;
+    const bool l0_ssm_ready =
+        (l0_stage_mask & 0x40u) != 0 &&
+        l0_ssm != nullptr && l0_ssm->ready != 0 &&
+        (l0_ssm->use_direct_weights != 0 || weightpack != nullptr);
+    const bool l0_l2_ready =
+        (l0_stage_mask & 0x80u) != 0 &&
+        l0_l2 != nullptr && l0_l2->ready != 0;
+    const bool l0_gdn_ready =
+        (l0_stage_mask & 0x100u) != 0 &&
+        l0_gdn != nullptr && l0_gdn->ready != 0;
 
     if (l0_norm_ready) {
         qwen36_rdna3_superlayer_l0_rms_norm(
@@ -3100,6 +4023,15 @@ __global__ void qwen36_rdna3_superlayer_contract_kernel(
         qwen36_rdna3_superlayer_l0_projection_bundle(
                 l0_proj, weightpack, scratch, scratch_bytes, l0_rms_sums, l0_proj_stage_mask);
     }
+    if (l0_ssm_ready) {
+        qwen36_rdna3_superlayer_l0_ssm_conv(l0_ssm, weightpack, l0_stage_mask & 0x40u);
+    }
+    if (l0_l2_ready) {
+        qwen36_rdna3_superlayer_l0_l2_pair(l0_l2, l0_rms_sums, l0_stage_mask & 0x80u);
+    }
+    if (l0_gdn_ready) {
+        qwen36_rdna3_superlayer_l0_gdn(l0_gdn, l0_rms_sums, l0_stage_mask & 0x100u);
+    }
 
     if (lane == 0) {
         state->fingerprint ^= 0x7900'0110'0036'0001ull;
@@ -3107,7 +4039,10 @@ __global__ void qwen36_rdna3_superlayer_contract_kernel(
         state->checksum = checksum ^
             (l0_norm_ready ? 0x10'0000'0000ull : 0ull) ^
             (l0_qkv_ready ? 0x20'0000'0000ull : 0ull) ^
-            (l0_proj_ready ? 0x40'0000'0000ull : 0ull);
+            (l0_proj_ready ? 0x40'0000'0000ull : 0ull) ^
+            (l0_ssm_ready ? 0x80'0000'0000ull : 0ull) ^
+            (l0_l2_ready ? 0x100'0000'0000ull : 0ull) ^
+            (l0_gdn_ready ? 0x200'0000'0000ull : 0ull);
         state->n_blocks = gridDim.x;
         state->touched_layers = 40;
         state->active_lanes = gridDim.x*blockDim.x;
@@ -3145,6 +4080,9 @@ static bool qwen36_superlayer_l0_env_requested() {
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_Z_MATH_ONLY") ||
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_BETA") ||
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_ALPHA") ||
+        qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_SSM") ||
+        qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_L2") ||
+        qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_GDN") ||
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_SINGLE_L0_DISPATCH");
 }
 
@@ -3198,10 +4136,25 @@ static bool qwen36_superlayer_replace_l0_proj_alpha_requested() {
         qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_PROJ_ALPHA", 0) != 0;
 }
 
+static bool qwen36_superlayer_replace_l0_ssm_requested() {
+    return qwen36_superlayer_l0_ssm_requested();
+}
+
+static bool qwen36_superlayer_replace_l0_l2_requested() {
+    return qwen36_superlayer_l0_l2_requested();
+}
+
+static bool qwen36_superlayer_replace_l0_gdn_requested() {
+    return qwen36_superlayer_l0_gdn_requested();
+}
+
 static bool qwen36_superlayer_replace_l0_any_requested() {
     return qwen36_superlayer_replace_l0_rms_requested() ||
         qwen36_superlayer_replace_l0_qkv_requested() ||
-        qwen36_superlayer_replace_l0_proj_requested();
+        qwen36_superlayer_replace_l0_proj_requested() ||
+        qwen36_superlayer_replace_l0_ssm_requested() ||
+        qwen36_superlayer_replace_l0_l2_requested() ||
+        qwen36_superlayer_replace_l0_gdn_requested();
 }
 
 static uint32_t qwen36_superlayer_l0_stage_mask() {
@@ -3228,6 +4181,15 @@ static uint32_t qwen36_superlayer_l0_stage_mask() {
     }
     if (qwen36_superlayer_replace_l0_proj_alpha_requested()) {
         mask |= 0x10u;
+    }
+    if (qwen36_superlayer_replace_l0_ssm_requested()) {
+        mask |= 0x40u;
+    }
+    if (qwen36_superlayer_replace_l0_l2_requested()) {
+        mask |= 0x80u;
+    }
+    if (qwen36_superlayer_replace_l0_gdn_requested()) {
+        mask |= 0x100u;
     }
     return mask;
 }
@@ -3355,6 +4317,24 @@ bool ggml_cuda_rdna3_qwen36_superlayer_replace_l0_proj_alpha_enabled(const int d
     return ggml_cuda_rdna3_qwen36_superlayer_enabled(device) &&
         qwen36_superlayer_contract_dispatch_enabled() &&
         qwen36_superlayer_replace_l0_proj_alpha_requested();
+}
+
+bool ggml_cuda_rdna3_qwen36_superlayer_replace_l0_ssm_enabled(const int device) {
+    return ggml_cuda_rdna3_qwen36_superlayer_enabled(device) &&
+        qwen36_superlayer_contract_dispatch_enabled() &&
+        qwen36_superlayer_replace_l0_ssm_requested();
+}
+
+bool ggml_cuda_rdna3_qwen36_superlayer_replace_l0_l2_enabled(const int device) {
+    return ggml_cuda_rdna3_qwen36_superlayer_enabled(device) &&
+        qwen36_superlayer_contract_dispatch_enabled() &&
+        qwen36_superlayer_replace_l0_l2_requested();
+}
+
+bool ggml_cuda_rdna3_qwen36_superlayer_replace_l0_gdn_enabled(const int device) {
+    return ggml_cuda_rdna3_qwen36_superlayer_enabled(device) &&
+        qwen36_superlayer_contract_dispatch_enabled() &&
+        qwen36_superlayer_replace_l0_gdn_requested();
 }
 
 bool ggml_cuda_rdna3_qwen36_superlayer_prepare(
@@ -3500,7 +4480,8 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
     const uint32_t l0_stage_mask_arg =
         forced_l0_stage_mask == UINT32_MAX ? qwen36_superlayer_l0_stage_mask() : forced_l0_stage_mask;
     const uint32_t direct_l0_stage_mask = qwen36_superlayer_direct_l0_stage_mask();
-    const bool l0_weightpack_required = (l0_stage_mask_arg & ~direct_l0_stage_mask) != 0;
+    const uint32_t l0_weighted_stage_mask = l0_stage_mask_arg & ~0x180u;
+    const bool l0_weightpack_required = (l0_weighted_stage_mask & ~direct_l0_stage_mask) != 0;
     const bool device_weightpack_required =
         qwen36_superlayer_contract_weightpack_requested() ||
         l0_weightpack_required ||
@@ -3544,6 +4525,9 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
     qwen36_superlayer_l0_norm_desc * l0_norm_arg = device_pack.l0_norm;
     qwen36_superlayer_l0_qkv_desc * l0_qkv_arg = device_pack.l0_qkv;
     qwen36_superlayer_l0_proj_desc * l0_proj_arg = device_pack.l0_proj;
+    qwen36_superlayer_l0_ssm_desc * l0_ssm_arg = device_pack.l0_ssm;
+    qwen36_superlayer_l0_l2_desc * l0_l2_arg = device_pack.l0_l2;
+    qwen36_superlayer_l0_gdn_desc * l0_gdn_arg = device_pack.l0_gdn;
     uint8_t * scratch_arg = (uint8_t *) device_pack.scratch;
     const uint64_t scratch_bytes_arg = (uint64_t) device_pack.runtime.scratch_bytes;
     const uint64_t weightpack_bytes_arg = (uint64_t) device_pack.bytes;
@@ -3556,6 +4540,9 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
         (void *) &l0_norm_arg,
         (void *) &l0_qkv_arg,
         (void *) &l0_proj_arg,
+        (void *) &l0_ssm_arg,
+        (void *) &l0_l2_arg,
+        (void *) &l0_gdn_arg,
         (void *) &scratch_arg,
         (void *) &scratch_bytes_arg,
         (void *) &weightpack_bytes_arg,
@@ -3576,9 +4563,10 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
                 "rdna3_qwen36_superlayer: %s fingerprint=%s blocks=%d threads=%d"
                 " weightpack_tensors=%zu runtime_bindings=%zu weightpack_bytes=%zu scratch_bytes=%zu"
                 " l0_stage_mask=0x%x l0_rms_norm=%s l0_qkv=%s l0_projection=%s replace_l0=%d"
-                " l0_proj_z=%s l0_proj_z_math_only=%s l0_proj_beta=%s l0_proj_alpha=%s"
+                " l0_proj_z=%s l0_proj_z_math_only=%s l0_proj_beta=%s l0_proj_alpha=%s l0_ssm=%s l0_l2=%s l0_gdn=%s"
                 " direct_l0_weights=%d direct_l0_norm_weights=%d direct_l0_qkv_weights=%d"
-                " direct_l0_proj_weights=%d weightpack_required=%d final_requested=%d numeric_layers=%d/40"
+                " direct_l0_proj_weights=%d direct_l0_ssm_weights=%d"
+                " weightpack_required=%d final_requested=%d numeric_layers=%d/40"
                 " note=%s\n",
                 final_requested ? "final-kernel-launched" : "contract-kernel-launched",
                 hex_u64(plan.fingerprint).c_str(), blocks, threads,
@@ -3592,10 +4580,14 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
                 (l0_stage_mask_arg & 0x20u) != 0 ? "on" : "off",
                 (l0_stage_mask_arg & 0x8u) != 0 ? "on" : "off",
                 (l0_stage_mask_arg & 0x10u) != 0 ? "on" : "off",
+                (l0_stage_mask_arg & 0x40u) != 0 ? "on" : "off",
+                (l0_stage_mask_arg & 0x80u) != 0 ? "on" : "off",
+                (l0_stage_mask_arg & 0x100u) != 0 ? "on" : "off",
                 qwen36_superlayer_direct_l0_weights_requested() ? 1 : 0,
                 qwen36_superlayer_direct_l0_norm_weights_requested() ? 1 : 0,
                 qwen36_superlayer_direct_l0_qkv_weights_requested() ? 1 : 0,
                 qwen36_superlayer_direct_l0_proj_weights_requested() ? 1 : 0,
+                qwen36_superlayer_direct_l0_ssm_weights_requested() ? 1 : 0,
                 device_weightpack_required ? 1 : 0,
                 final_requested ? 1 : 0,
                 l0_stage_mask_arg == 0x1fu ? 1 : 0,
