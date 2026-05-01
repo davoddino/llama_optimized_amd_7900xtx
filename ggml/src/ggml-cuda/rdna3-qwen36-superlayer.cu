@@ -1501,6 +1501,7 @@ static bool qwen36_superlayer_materialize_device_pack(
         const ggml_cgraph * cgraph,
         const qwen36_superlayer_plan & plan,
         const qwen36_superlayer_pack_plan & pack,
+        const bool device_weightpack_required,
         qwen36_superlayer_device_pack_view * view,
         std::string * blocker) {
     const uint64_t source_signature = qwen36_superlayer_source_signature(pack);
@@ -1516,7 +1517,8 @@ static bool qwen36_superlayer_materialize_device_pack(
     }
     const uint64_t runtime_signature = qwen36_superlayer_runtime_signature(bindings);
     const std::string key =
-        qwen36_superlayer_device_pack_key(cuda_ctx->device, plan.fingerprint, source_signature);
+        qwen36_superlayer_device_pack_key(cuda_ctx->device, plan.fingerprint, source_signature) +
+        (device_weightpack_required ? "-wp" : "-meta");
     const std::vector<qwen36_superlayer_runtime_tensor_desc> io_descs_host =
         qwen36_superlayer_make_runtime_descs(bindings);
     qwen36_superlayer_l0_norm_desc l0_norm_host;
@@ -1546,20 +1548,25 @@ static bool qwen36_superlayer_materialize_device_pack(
         std::lock_guard<std::mutex> lock(device_pack_mutex);
         auto it = device_packs.find(key);
         if (it == device_packs.end()) {
-            for (const qwen36_superlayer_pack_ref & ref : pack.refs) {
-                if (!qwen36_superlayer_tensor_on_device(ref.tensor, cuda_ctx->device, blocker)) {
-                    return false;
+            if (device_weightpack_required) {
+                for (const qwen36_superlayer_pack_ref & ref : pack.refs) {
+                    if (!qwen36_superlayer_tensor_on_device(ref.tensor, cuda_ctx->device, blocker)) {
+                        return false;
+                    }
                 }
             }
 
             ggml_cuda_set_device(cuda_ctx->device);
 
             void * data = nullptr;
-            cudaError_t err = cudaMalloc(&data, pack.total_bytes);
-            if (err != cudaSuccess) {
-                (void) cudaGetLastError();
-                qwen36_superlayer_set_cuda_blocker(blocker, "failed to allocate superlayer device weightpack", err);
-                return false;
+            cudaError_t err = cudaSuccess;
+            if (device_weightpack_required) {
+                err = cudaMalloc(&data, pack.total_bytes);
+                if (err != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    qwen36_superlayer_set_cuda_blocker(blocker, "failed to allocate superlayer device weightpack", err);
+                    return false;
+                }
             }
 
             qwen36_superlayer_layer_pack_desc * layer_descs = nullptr;
@@ -1592,14 +1599,16 @@ static bool qwen36_superlayer_materialize_device_pack(
                 return false;
             }
 
-            err = cudaMemsetAsync(data, 0, pack.total_bytes, cuda_ctx->stream());
-            if (err != cudaSuccess) {
-                (void) cudaFree(io_descs);
-                (void) cudaFree(scratch);
-                (void) cudaFree(layer_descs);
-                (void) cudaFree(data);
-                qwen36_superlayer_set_cuda_blocker(blocker, "failed to clear superlayer device weightpack", err);
-                return false;
+            if (device_weightpack_required) {
+                err = cudaMemsetAsync(data, 0, pack.total_bytes, cuda_ctx->stream());
+                if (err != cudaSuccess) {
+                    (void) cudaFree(io_descs);
+                    (void) cudaFree(scratch);
+                    (void) cudaFree(layer_descs);
+                    (void) cudaFree(data);
+                    qwen36_superlayer_set_cuda_blocker(blocker, "failed to clear superlayer device weightpack", err);
+                    return false;
+                }
             }
             err = cudaMemsetAsync(scratch, 0, runtime.scratch_bytes, cuda_ctx->stream());
             if (err != cudaSuccess) {
@@ -1636,18 +1645,20 @@ static bool qwen36_superlayer_materialize_device_pack(
                 return false;
             }
 
-            for (const qwen36_superlayer_pack_ref & ref : pack.refs) {
-                err = cudaMemcpyAsync(
-                        (char *) data + ref.offset, ref.tensor->data, ref.nbytes,
-                        cudaMemcpyDeviceToDevice, cuda_ctx->stream());
-                if (err != cudaSuccess) {
-                    (void) cudaFree(io_descs);
-                    (void) cudaFree(scratch);
-                    (void) cudaFree(layer_descs);
-                    (void) cudaFree(data);
-                    qwen36_superlayer_set_cuda_blocker(
-                            blocker, "failed to copy tensor into superlayer device weightpack", err);
-                    return false;
+            if (device_weightpack_required) {
+                for (const qwen36_superlayer_pack_ref & ref : pack.refs) {
+                    err = cudaMemcpyAsync(
+                            (char *) data + ref.offset, ref.tensor->data, ref.nbytes,
+                            cudaMemcpyDeviceToDevice, cuda_ctx->stream());
+                    if (err != cudaSuccess) {
+                        (void) cudaFree(io_descs);
+                        (void) cudaFree(scratch);
+                        (void) cudaFree(layer_descs);
+                        (void) cudaFree(data);
+                        qwen36_superlayer_set_cuda_blocker(
+                                blocker, "failed to copy tensor into superlayer device weightpack", err);
+                        return false;
+                    }
                 }
             }
 
@@ -1769,8 +1780,8 @@ static bool qwen36_superlayer_materialize_device_pack(
             entry.l0_qkv = l0_qkv;
             entry.l0_proj = l0_proj;
             entry.scratch = scratch;
-            entry.bytes = pack.total_bytes;
-            entry.tensors = pack.refs.size();
+            entry.bytes = device_weightpack_required ? pack.total_bytes : 0;
+            entry.tensors = device_weightpack_required ? pack.refs.size() : 0;
             entry.io_count = io_descs_host.size();
             entry.io_capacity = io_descs_host.size();
             entry.runtime = runtime;
@@ -3117,12 +3128,14 @@ static bool qwen36_superlayer_run_l0_math_enabled() {
 
 static bool qwen36_superlayer_contract_kernel_enabled() {
     return qwen36_superlayer_final_physical_l0_requested() ||
+        qwen36_superlayer_final_requested() ||
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_CONTRACT") ||
         qwen36_superlayer_run_l0_math_enabled();
 }
 
 static bool qwen36_superlayer_contract_dispatch_enabled() {
     return qwen36_superlayer_final_physical_l0_requested() ||
+        qwen36_superlayer_final_requested() ||
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DISPATCH") ||
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_SMOKE") ||
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER") ||
@@ -3133,6 +3146,7 @@ static bool qwen36_superlayer_contract_dispatch_enabled() {
 
 static bool qwen36_superlayer_requested() {
     return qwen36_superlayer_final_physical_l0_requested() ||
+        qwen36_superlayer_final_requested() ||
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER") ||
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REQUIRED") ||
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_CONTRACT") ||
@@ -3362,8 +3376,13 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
         }
         return false;
     }
+    const uint32_t l0_stage_mask_arg =
+        forced_l0_stage_mask == UINT32_MAX ? qwen36_superlayer_l0_stage_mask() : forced_l0_stage_mask;
+    const bool device_weightpack_required =
+        l0_stage_mask_arg != 0 || !qwen36_superlayer_final_requested();
     qwen36_superlayer_device_pack_view device_pack;
-    if (!qwen36_superlayer_materialize_device_pack(cuda_ctx, cgraph, plan, pack, &device_pack, blocker)) {
+    if (!qwen36_superlayer_materialize_device_pack(
+                cuda_ctx, cgraph, plan, pack, device_weightpack_required, &device_pack, blocker)) {
         return false;
     }
 
@@ -3403,8 +3422,6 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
     uint8_t * scratch_arg = (uint8_t *) device_pack.scratch;
     const uint64_t scratch_bytes_arg = (uint64_t) device_pack.runtime.scratch_bytes;
     const uint64_t weightpack_bytes_arg = (uint64_t) device_pack.bytes;
-    const uint32_t l0_stage_mask_arg =
-        forced_l0_stage_mask == UINT32_MAX ? qwen36_superlayer_l0_stage_mask() : forced_l0_stage_mask;
     void * kernel_args[] = {
         (void *) &state_arg,
         (void *) &weightpack_arg,
@@ -3428,7 +3445,7 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
     static std::atomic<int64_t> contract_reports{0};
     const int64_t report_id = contract_reports.fetch_add(1, std::memory_order_relaxed);
     (void) report_id;
-    if (qwen36_superlayer_trace_enabled()) {
+    if (qwen36_superlayer_trace_enabled() || (qwen36_superlayer_final_requested() && report_id < 4)) {
         const bool final_requested = qwen36_superlayer_final_requested();
         fprintf(stderr,
                 "rdna3_qwen36_superlayer: %s fingerprint=%s blocks=%d threads=%d"
@@ -3453,7 +3470,9 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
                 final_requested ? 1 : 0,
                 l0_stage_mask_arg == 0x1fu ? 1 : 0,
                 final_requested ?
-                    "final mode currently covers full L0 in one cooperative launch; 40-layer dataflow must replace scaffold" :
+                    (l0_stage_mask_arg != 0 ?
+                        "final physical L0 cooperative dispatch; 40-layer dataflow must replace scaffold" :
+                        "final cooperative 40-layer contract scaffold; numeric dataflow still runs in graph") :
                     "single physical cooperative 40-layer dispatch scaffold");
         fflush(stderr);
     }
