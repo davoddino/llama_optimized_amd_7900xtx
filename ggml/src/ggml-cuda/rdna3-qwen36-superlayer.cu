@@ -3018,6 +3018,16 @@ static bool qwen36_superlayer_final_requested() {
     return qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_FINAL");
 }
 
+static bool qwen36_superlayer_final_numeric_ready() {
+    return false;
+}
+
+static const char * qwen36_superlayer_final_blocker() {
+    return "GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_FINAL requires a real numeric 40-layer "
+           "Qwen3.6 RDNA3 megakernel; the current physical superlayer only implements "
+           "L0 numeric replacement plus a 40-layer contract scaffold";
+}
+
 static bool qwen36_superlayer_final_physical_l0_requested() {
     return qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_FINAL_PHYSICAL_L0");
 }
@@ -3331,6 +3341,13 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
         const ggml_cgraph * cgraph,
         std::string * blocker,
         const uint32_t forced_l0_stage_mask) {
+    if (qwen36_superlayer_final_requested() && !qwen36_superlayer_final_numeric_ready()) {
+        if (blocker != nullptr) {
+            *blocker = qwen36_superlayer_final_blocker();
+        }
+        return false;
+    }
+
     if (!qwen36_superlayer_contract_dispatch_enabled()) {
         return true;
     }
