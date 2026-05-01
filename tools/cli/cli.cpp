@@ -12,6 +12,7 @@
 #include <array>
 #include <atomic>
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <thread>
@@ -38,6 +39,11 @@ const char * LLAMA_ASCII_LOGO = R"(
 static std::atomic<bool> g_is_interrupted = false;
 static bool should_stop() {
     return g_is_interrupted.load();
+}
+
+static bool qwen36_cli_final_mode_enabled() {
+    const char * value = std::getenv("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_FINAL");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__)) || defined (_WIN32)
@@ -425,6 +431,11 @@ int main(int argc, char ** argv) {
             ctx_cli.messages.push_back({
                 {"role",    "system"},
                 {"content", params.system_prompt}
+            });
+        } else if (qwen36_cli_final_mode_enabled()) {
+            ctx_cli.messages.push_back({
+                {"role",    "system"},
+                {"content", "Rispondi direttamente all'ultimo messaggio dell'utente. Non trattare saluti o domande brevi come testo confuso. Non ripetere risposte precedenti."}
             });
         }
     };

@@ -638,7 +638,6 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
             params.default_template_kwargs["enable_thinking"] = "false";
             LOG_INF("rdna3_qwen36_final: disabling reasoning by default for final low-latency mode\n");
         }
-        params.sampling.backend_sampling = true;
     }
 
     if (params.escape) {

@@ -808,10 +808,8 @@ static ggml_cuda_device_info ggml_cuda_init() {
             (ggml_cuda_env_enabled("GGML_CUDA_RDNA3_MMVQ_Q8_CACHE") ||
              ggml_cuda_env_enabled("GGML_CUDA_RDNA3_MMVQ_Q8_CACHE_UNSAFE"));
         const bool qwen36_no_raw_logits_effective =
-            qwen36_final_env ||
             ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_NO_RAW_LOGITS");
         const bool qwen36_sample_token_only_effective =
-            qwen36_final_env ||
             ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_SAMPLE_TOKEN_ONLY");
         const bool qwen36_one_layer_mega_unsafe =
             ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_MEGA_UNSAFE") ||
