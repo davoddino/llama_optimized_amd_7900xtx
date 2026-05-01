@@ -525,7 +525,8 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
         topk_moe_env_enabled("GGML_CUDA_RDNA3_DISABLE_QWEN35_TOPK");
     static const bool log_topk_path = getenv("GGML_CUDA_RDNA3_PROFILE_LOG") != nullptr;
 
-    if (!disable_qwen_top8 && GGML_CUDA_CC_IS_RDNA3(cc) && !bias &&
+    if (!disable_qwen_top8 && topk_moe_qwen36_fastpath_enabled() &&
+            GGML_CUDA_CC_IS_RDNA3(cc) && !bias &&
             n_experts == 256 && n_expert_used == 8 && with_norm &&
             !args.sigmoid && !args.delayed_softmax) {
         if (log_topk_path) {

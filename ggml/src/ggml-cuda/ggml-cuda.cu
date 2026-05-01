@@ -214,8 +214,19 @@ static bool ggml_cuda_rdna3_qwen36_fastpath_enabled(const int device) {
 
 static bool ggml_cuda_rdna3_qwen36_linear_mmvq_fast_enabled(const int device) {
     return (ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_LINEAR_MMVQ_FAST") ||
-            ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_DECODE") ||
-            ggml_cuda_rdna3_qwen36_superlayer_final_requested()) &&
+            ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_LINEAR_MMVQ_FAST_UNSAFE")) &&
+        GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[device].cc);
+}
+
+static bool ggml_cuda_rdna3_qwen36_output_mmvq_fast_enabled(const int device) {
+    return (ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_OUTPUT_MMVQ_FAST") ||
+            ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_OUTPUT_MMVQ_FAST_UNSAFE")) &&
+        GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[device].cc);
+}
+
+static bool ggml_cuda_rdna3_qwen36_moe_mmvq_fast_enabled(const int device) {
+    return (ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MOE_MMVQ_FAST") ||
+            ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_MOE_MMVQ_FAST_UNSAFE")) &&
         GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[device].cc);
 }
 
@@ -276,8 +287,10 @@ static bool ggml_cuda_rdna3_mmvq_q8_cache_log_enabled() {
     return ggml_cuda_env_enabled("GGML_CUDA_RDNA3_MMVQ_Q8_CACHE_LOG");
 }
 
-static bool ggml_cuda_rdna3_qwen36_moe_decode_shape(const ggml_tensor * src0, const ggml_tensor * ids, const int64_t n_tokens) {
-    if (src0 == nullptr || ids == nullptr || ids->type != GGML_TYPE_I32 || ids->ne[0] != 8 || n_tokens != 1) {
+static bool ggml_cuda_rdna3_qwen36_moe_decode_shape(
+        const int device, const ggml_tensor * src0, const ggml_tensor * ids, const int64_t n_tokens) {
+    if (src0 == nullptr || ids == nullptr || ids->type != GGML_TYPE_I32 || ids->ne[0] != 8 || n_tokens != 1 ||
+            !ggml_cuda_rdna3_qwen36_moe_mmvq_fast_enabled(device)) {
         return false;
     }
 
@@ -330,6 +343,7 @@ static bool ggml_cuda_rdna3_same_tensor_or_view(const ggml_tensor * a, const ggm
 static bool ggml_cuda_rdna3_qwen36_output_decode_shape(
         const int device, const ggml_tensor * src0, const ggml_tensor * dst) {
     if (!ggml_cuda_rdna3_qwen36_fastpath_enabled(device) || src0 == nullptr || dst == nullptr ||
+            !ggml_cuda_rdna3_qwen36_output_mmvq_fast_enabled(device) ||
             !ggml_cuda_rdna3_tensor_name_starts_with(dst, "result_output") || dst->ne[1] != 1 ||
             src0->ne[0] <= 0 || src0->ne[0] > 4096 || src0->ne[1] < 32768 || src0->ne[1] % 8 != 0) {
         return false;
@@ -780,10 +794,17 @@ static ggml_cuda_device_info ggml_cuda_init() {
             ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_FASTPATH") ||
             qwen36_mega_decode_effective;
         const bool qwen36_linear_mmvq_effective =
-            ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_LINEAR_MMVQ_FAST") ||
-            qwen36_mega_decode_effective;
+            ggml_cuda_rdna3_qwen36_linear_mmvq_fast_enabled(0);
+        const bool qwen36_output_mmvq_effective =
+            ggml_cuda_rdna3_qwen36_output_mmvq_fast_enabled(0);
+        const bool qwen36_moe_mmvq_effective =
+            ggml_cuda_rdna3_qwen36_moe_mmvq_fast_enabled(0);
         const bool qwen36_topk_fastpath_effective =
             ggml_cuda_rdna3_qwen36_topk_fastpath_enabled(0);
+        const bool qwen36_mmvq_q8_cache_effective =
+            !ggml_cuda_env_enabled("GGML_CUDA_RDNA3_DISABLE_MMVQ_Q8_CACHE") &&
+            (ggml_cuda_env_enabled("GGML_CUDA_RDNA3_MMVQ_Q8_CACHE") ||
+             ggml_cuda_env_enabled("GGML_CUDA_RDNA3_MMVQ_Q8_CACHE_UNSAFE"));
         const bool qwen36_one_layer_mega_unsafe =
             ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_MEGA_UNSAFE") ||
             ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_FINAL_PHYSICAL_L0_UNSAFE");
@@ -796,7 +817,8 @@ static ggml_cuda_device_info ggml_cuda_init() {
                 " dispatch=%d requested_effective=%d dispatch_effective=%d"
                 " mega_decode_env=%d mega_required_env=%d mega_graph_required_env=%d fastpath_env=%d"
                 " mega_decode_effective=%d mega_required_effective=%d mega_graph_required_effective=%d"
-                " fastpath_effective=%d linear_mmvq_effective=%d topk_fastpath_effective=%d"
+                " fastpath_effective=%d linear_mmvq_effective=%d output_mmvq_effective=%d"
+                " moe_mmvq_effective=%d topk_fastpath_effective=%d mmvq_q8_cache_effective=%d"
                 " one_layer_mega_effective=%d one_layer_mega_unsafe=%d final_physical_l0=%d"
                 " contract=%d run_l0=%d replace_l0=%d rms=%d qkv=%d proj=%d"
                 " proj_z=%d proj_z_math_only=%d proj_beta=%d proj_alpha=%d single_l0=%d"
@@ -818,7 +840,10 @@ static ggml_cuda_device_info ggml_cuda_init() {
                 qwen36_mega_graph_required_effective ? 1 : 0,
                 qwen36_fastpath_effective ? 1 : 0,
                 qwen36_linear_mmvq_effective ? 1 : 0,
+                qwen36_output_mmvq_effective ? 1 : 0,
+                qwen36_moe_mmvq_effective ? 1 : 0,
                 qwen36_topk_fastpath_effective ? 1 : 0,
+                qwen36_mmvq_q8_cache_effective ? 1 : 0,
                 qwen36_one_layer_mega_effective ? 1 : 0,
                 qwen36_one_layer_mega_unsafe ? 1 : 0,
                 ggml_cuda_rdna3_qwen36_superlayer_final_physical_l0_requested() ? 1 : 0,
@@ -7279,7 +7304,8 @@ static void ggml_cuda_graph_evaluate_and_capture(
                                         moe_gate_up.dst->ne[2], moe_gate_up.scale != nullptr ? 1 : 0);
                             }
                             const bool qwen36_fast = ggml_cuda_rdna3_qwen36_fastpath_enabled(cuda_ctx->device) &&
-                                ggml_cuda_rdna3_qwen36_moe_decode_shape(moe_gate_up.src0, moe_gate_up.ids, moe_gate_up.dst->ne[2]);
+                                ggml_cuda_rdna3_qwen36_moe_decode_shape(
+                                        cuda_ctx->device, moe_gate_up.src0, moe_gate_up.ids, moe_gate_up.dst->ne[2]);
                             op_timer.set_path(qwen36_fast ?
                                     "QWEN36_MOE_GATE_UP_MMVQ_SWIGLU_FUSED" : "MOE_GATE_UP_MMVQ_SWIGLU_FUSED");
                             ggml_cuda_mul_mat_vec_q_moe_gate_up(*cuda_ctx, moe_gate_up.src0, moe_gate_up.src1, moe_gate_up.ids,
@@ -7297,7 +7323,8 @@ static void ggml_cuda_graph_evaluate_and_capture(
                                         moe_down.dst->ne[1], moe_down.weights1 != nullptr ? 2 : 1);
                             }
                             const bool qwen36_fast = ggml_cuda_rdna3_qwen36_fastpath_enabled(cuda_ctx->device) &&
-                                ggml_cuda_rdna3_qwen36_moe_decode_shape(moe_down.src0, moe_down.ids, moe_down.src1->ne[2]);
+                                ggml_cuda_rdna3_qwen36_moe_decode_shape(
+                                        cuda_ctx->device, moe_down.src0, moe_down.ids, moe_down.src1->ne[2]);
                             op_timer.set_path(qwen36_fast ?
                                     "QWEN36_MOE_DOWN_WEIGHTED_MMVQ_FUSED" : "MOE_DOWN_WEIGHTED_MMVQ_FUSED");
                             ggml_cuda_mul_mat_vec_q_moe_weighted(*cuda_ctx, moe_down.src0, moe_down.src1, moe_down.ids,
@@ -7533,7 +7560,7 @@ static void ggml_cuda_graph_evaluate_and_capture(
                                             __func__, ggml_type_name(src0->type), glu->ne[0], ids->ne[0], glu->ne[2]);
                                 }
                                 const bool qwen36_fast = ggml_cuda_rdna3_qwen36_fastpath_enabled(cuda_ctx->device) &&
-                                    ggml_cuda_rdna3_qwen36_moe_decode_shape(src0, ids, glu->ne[2]);
+                                    ggml_cuda_rdna3_qwen36_moe_decode_shape(cuda_ctx->device, src0, ids, glu->ne[2]);
                                 op_timer.set_path(qwen36_fast ?
                                         "QWEN36_MOE_GATE_UP_SPLIT_MMVQ_SWIGLU_FUSED" : "MOE_GATE_UP_SPLIT_MMVQ_SWIGLU_FUSED");
                                 ggml_cuda_mul_mat_vec_q_moe_gate_up_split(*cuda_ctx, gate->src[0], up->src[0], src1, ids, glu);

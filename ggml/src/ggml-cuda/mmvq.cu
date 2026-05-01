@@ -44,15 +44,29 @@ static bool rdna3_qwen36_fastpath_enabled() {
 static bool rdna3_qwen36_linear_mmvq_fast_enabled() {
     static const bool enabled =
         rdna3_mmvq_env_enabled("GGML_CUDA_RDNA3_QWEN36_LINEAR_MMVQ_FAST") ||
-        rdna3_mmvq_env_enabled("GGML_CUDA_RDNA3_QWEN36_MEGA_DECODE") ||
-        rdna3_mmvq_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_FINAL");
+        rdna3_mmvq_env_enabled("GGML_CUDA_RDNA3_QWEN36_LINEAR_MMVQ_FAST_UNSAFE");
+    return enabled;
+}
+
+static bool rdna3_qwen36_output_mmvq_fast_enabled() {
+    static const bool enabled =
+        rdna3_mmvq_env_enabled("GGML_CUDA_RDNA3_QWEN36_OUTPUT_MMVQ_FAST") ||
+        rdna3_mmvq_env_enabled("GGML_CUDA_RDNA3_QWEN36_OUTPUT_MMVQ_FAST_UNSAFE");
+    return enabled;
+}
+
+static bool rdna3_qwen36_moe_mmvq_fast_enabled() {
+    static const bool enabled =
+        rdna3_mmvq_env_enabled("GGML_CUDA_RDNA3_QWEN36_MOE_MMVQ_FAST") ||
+        rdna3_mmvq_env_enabled("GGML_CUDA_RDNA3_QWEN36_MOE_MMVQ_FAST_UNSAFE");
     return enabled;
 }
 
 static bool rdna3_mmvq_q8_cache_enabled() {
     static const bool enabled =
         !rdna3_mmvq_env_enabled("GGML_CUDA_RDNA3_DISABLE_MMVQ_Q8_CACHE") &&
-        (rdna3_qwen36_fastpath_enabled() || rdna3_mmvq_env_enabled("GGML_CUDA_RDNA3_MMVQ_Q8_CACHE"));
+        (rdna3_mmvq_env_enabled("GGML_CUDA_RDNA3_MMVQ_Q8_CACHE") ||
+         rdna3_mmvq_env_enabled("GGML_CUDA_RDNA3_MMVQ_Q8_CACHE_UNSAFE"));
     return enabled;
 }
 
@@ -149,7 +163,8 @@ static char * ggml_cuda_mmvq_get_src1_q8_1(
 static bool rdna3_qwen36_moe_decode_shape(
         const ggml_type type, const int cc, const uint32_t ncols_x, const uint32_t nrows,
         const uint32_t n_expert_used, const uint32_t ncols_dst) {
-    if (!rdna3_qwen36_fastpath_enabled() || !GGML_CUDA_CC_IS_RDNA3(cc)) {
+    if (!rdna3_qwen36_fastpath_enabled() || !rdna3_qwen36_moe_mmvq_fast_enabled() ||
+            !GGML_CUDA_CC_IS_RDNA3(cc)) {
         return false;
     }
 
@@ -172,7 +187,8 @@ static bool rdna3_qwen36_moe_decode_shape(
 static bool rdna3_qwen36_output_decode_shape(
         const ggml_type type, const int cc, const uint32_t ncols_x, const uint32_t nrows_x,
         const uint32_t ncols_dst, const bool has_ids, const bool has_fusion) {
-    if (!rdna3_qwen36_fastpath_enabled() || !GGML_CUDA_CC_IS_RDNA3(cc) || has_ids || has_fusion) {
+    if (!rdna3_qwen36_fastpath_enabled() || !rdna3_qwen36_output_mmvq_fast_enabled() ||
+            !GGML_CUDA_CC_IS_RDNA3(cc) || has_ids || has_fusion) {
         return false;
     }
 
