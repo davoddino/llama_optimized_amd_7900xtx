@@ -78,6 +78,26 @@ static bool common_env_enabled(const char * name) {
     return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
+static void common_set_env(const char * name, const char * value) {
+#if defined(_WIN32)
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
+
+static void common_set_env_bool(const char * name, bool enabled) {
+    common_set_env(name, enabled ? "1" : "0");
+}
+
+static void common_apply_qwen36_fast_path(bool enabled) {
+    common_set_env_bool("GGML_CUDA_RDNA3_QWEN36_FASTPATH", enabled);
+    common_set_env_bool("GGML_CUDA_RDNA3_QWEN36_LINEAR_MMVQ_FAST", enabled);
+    common_set_env_bool("GGML_CUDA_RDNA3_QWEN36_TOPK_FASTPATH", enabled);
+    common_set_env_bool("GGML_CUDA_RDNA3_MMVQ_Q8_CACHE", enabled);
+    common_set_env_bool("GGML_CUDA_RDNA3_TQKV_FATTN_GQA_DECODE", enabled);
+}
+
 static bool common_qwen36_superlayer_final_enabled() {
     return common_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_FINAL");
 }
@@ -1921,6 +1941,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.sampling.backend_sampling = true;
         }
     ).set_sparam().set_env("LLAMA_ARG_BACKEND_SAMPLING"));
+    add_opt(common_arg(
+        {"--qwen36-fast-path"},
+        {"--no-qwen36-fast-path"},
+        "enable experimental RDNA3 Qwen3.6 HIP/CUDA decode fast path gates (MMVQ, TopK, Q8 cache, TQKV GQA decode); does not enable the fail-closed final superlayer path",
+        [](common_params &, bool value) {
+            common_apply_qwen36_fast_path(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_BENCH}).set_env("LLAMA_ARG_QWEN36_FAST_PATH"));
     add_opt(common_arg(
         {"--pooling"}, "{none,mean,cls,last,rank}",
         "pooling type for embeddings, use model default if unspecified",

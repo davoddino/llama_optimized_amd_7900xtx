@@ -136,12 +136,20 @@ static bool ggml_cuda_rdna3_qwen36_superlayer_env_present() {
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_SSM") ||
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_L2") ||
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_GDN") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_GATED_NORM") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_ATTN_OUT") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_POST_ATTN") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_MOE_ROUTER") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_MOE_GATE_UP") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_MOE_DOWN") ||
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_SINGLE_L0_DISPATCH") ||
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DIRECT_L0_WEIGHTS") ||
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DIRECT_L0_NORM_WEIGHTS") ||
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DIRECT_L0_QKV_WEIGHTS") ||
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DIRECT_L0_PROJ_WEIGHTS") ||
-        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DIRECT_L0_SSM_WEIGHTS");
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DIRECT_L0_SSM_WEIGHTS") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DIRECT_L0_OUT_WEIGHTS") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DIRECT_L0_MOE_WEIGHTS");
 }
 
 static bool ggml_cuda_rdna3_qwen36_superlayer_trace_enabled() {
@@ -157,7 +165,8 @@ static bool ggml_cuda_rdna3_qwen36_superlayer_final_physical_l0_requested() {
 }
 
 static bool ggml_cuda_rdna3_qwen36_superlayer_l0_env_requested() {
-    return ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_RUN_L0") ||
+    return ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_FINAL") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_RUN_L0") ||
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0") ||
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_RMS") ||
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_QKV") ||
@@ -169,11 +178,18 @@ static bool ggml_cuda_rdna3_qwen36_superlayer_l0_env_requested() {
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_SSM") ||
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_L2") ||
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_GDN") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_GATED_NORM") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_ATTN_OUT") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_POST_ATTN") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_MOE_ROUTER") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_MOE_GATE_UP") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_MOE_DOWN") ||
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_SINGLE_L0_DISPATCH");
 }
 
 static bool ggml_cuda_rdna3_qwen36_superlayer_requested_effective() {
-    return ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER") ||
+    return ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_FINAL") ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER") ||
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REQUIRED") ||
         ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_CONTRACT") ||
         ggml_cuda_rdna3_qwen36_superlayer_l0_env_requested();
@@ -295,7 +311,8 @@ static bool ggml_cuda_rdna3_qwen36_one_layer_mega_required(const int device) {
 }
 
 static bool ggml_cuda_rdna3_qwen36_one_layer_proj_bundle_enabled() {
-    return ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_PROJ_BUNDLE_UNSAFE");
+    return ggml_cuda_rdna3_qwen36_superlayer_final_requested() ||
+        ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_ONE_LAYER_PROJ_BUNDLE_UNSAFE");
 }
 
 static int ggml_cuda_rdna3_qwen36_one_layer_mega_layer() {
@@ -851,9 +868,10 @@ static ggml_cuda_device_info ggml_cuda_init() {
                 " one_layer_mega_effective=%d one_layer_mega_final_auto=%d one_layer_mega_unsafe=%d"
                 " final_physical_l0=%d"
                 " contract=%d run_l0=%d replace_l0=%d rms=%d qkv=%d proj=%d"
-                " proj_z=%d proj_z_math_only=%d proj_beta=%d proj_alpha=%d ssm=%d l2=%d gdn=%d single_l0=%d"
+                " proj_z=%d proj_z_math_only=%d proj_beta=%d proj_alpha=%d"
+                " ssm=%d l2=%d gdn=%d gated_norm=%d attn_out=%d post_attn=%d moe_router=%d moe_gate_up=%d moe_down=%d single_l0=%d"
                 " direct_l0_weights=%d direct_l0_norm_weights=%d direct_l0_qkv_weights=%d"
-                " direct_l0_proj_weights=%d direct_l0_ssm_weights=%d\n",
+                " direct_l0_proj_weights=%d direct_l0_ssm_weights=%d direct_l0_out_weights=%d direct_l0_moe_weights=%d\n",
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_GRAPH_LOG") ? 1 : 0,
                 ggml_cuda_rdna3_qwen36_superlayer_trace_enabled() ? 1 : 0,
                 qwen36_final_env ? 1 : 0,
@@ -894,12 +912,20 @@ static ggml_cuda_device_info ggml_cuda_init() {
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_SSM") ? 1 : 0,
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_L2") ? 1 : 0,
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_GDN") ? 1 : 0,
+                ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_GATED_NORM") ? 1 : 0,
+                ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_ATTN_OUT") ? 1 : 0,
+                ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_POST_ATTN") ? 1 : 0,
+                ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_MOE_ROUTER") ? 1 : 0,
+                ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_MOE_GATE_UP") ? 1 : 0,
+                ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_MOE_DOWN") ? 1 : 0,
                 ggml_cuda_rdna3_qwen36_superlayer_single_l0_dispatch_requested() ? 1 : 0,
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DIRECT_L0_WEIGHTS") ? 1 : 0,
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DIRECT_L0_NORM_WEIGHTS") ? 1 : 0,
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DIRECT_L0_QKV_WEIGHTS") ? 1 : 0,
                 ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DIRECT_L0_PROJ_WEIGHTS") ? 1 : 0,
-                ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DIRECT_L0_SSM_WEIGHTS") ? 1 : 0);
+                ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DIRECT_L0_SSM_WEIGHTS") ? 1 : 0,
+                ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DIRECT_L0_OUT_WEIGHTS") ? 1 : 0,
+                ggml_cuda_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DIRECT_L0_MOE_WEIGHTS") ? 1 : 0);
     }
 
     std::vector<std::pair<int, std::string>> turing_devices_without_mma;
@@ -3412,6 +3438,36 @@ struct ggml_cuda_rdna3_qwen36_one_layer_mega_plan {
     int q_l2             = -1;
     int k_l2             = -1;
     int gdn              = -1;
+    int gated_norm_rms   = -1;
+    int gated_norm_mul   = -1;
+    int gated_silu       = -1;
+    int gated_out        = -1;
+    int final_output     = -1;
+    int linear_attn_out  = -1;
+    int linear_attn_out_base = -1;
+    int linear_attn_out_math = -1;
+    int attn_residual   = -1;
+    int attn_post_norm  = -1;
+    int attn_post_norm_rms = -1;
+    int attn_post_norm_base = -1;
+    int moe_logits      = -1;
+    int moe_logits_base = -1;
+    int moe_logits_math = -1;
+    int moe_probs       = -1;
+    int moe_argsort     = -1;
+    int moe_topk        = -1;
+    int moe_weights     = -1;
+    int moe_weights_sum = -1;
+    int moe_weights_sum_clamped = -1;
+    int moe_weights_norm = -1;
+    int moe_weights_scaled = -1;
+    int moe_gate_up     = -1;
+    int moe_gate        = -1;
+    int moe_up          = -1;
+    int moe_swiglu      = -1;
+    int moe_down        = -1;
+    int moe_weighted    = -1;
+    int moe_out         = -1;
     int start            = -1;
     int end              = -1;
     int n_nodes          = 0;
@@ -3673,10 +3729,97 @@ static ggml_cuda_rdna3_qwen36_one_layer_mega_plan ggml_cuda_rdna3_qwen36_one_lay
     plan.q_l2           = find_named_node("q_conv_predelta");
     plan.k_l2           = find_named_node("k_conv_predelta");
     plan.gdn            = find_named_node("__fgdn_ar__");
+    plan.final_output   = find_named_node("final_output");
+    plan.linear_attn_out = find_named_node("linear_attn_out");
+    plan.attn_residual   = find_named_node("attn_residual");
+    plan.attn_post_norm  = find_named_node("attn_post_norm");
+    plan.moe_logits      = find_named_node("ffn_moe_logits");
+    plan.moe_probs       = find_named_node("ffn_moe_probs");
+    plan.moe_argsort     = find_named_node("ffn_moe_argsort");
+    plan.moe_topk        = find_named_node("ffn_moe_topk");
+    plan.moe_weights     = find_named_node("ffn_moe_weights");
+    plan.moe_weights_sum = find_named_node("ffn_moe_weights_sum");
+    plan.moe_weights_sum_clamped = find_named_node("ffn_moe_weights_sum_clamped");
+    plan.moe_weights_norm = find_named_node("ffn_moe_weights_norm");
+    plan.moe_weights_scaled = find_named_node("ffn_moe_weights_scaled");
+    plan.moe_gate_up     = find_named_node("ffn_moe_gate_up");
+    plan.moe_gate        = find_named_node("ffn_moe_gate");
+    plan.moe_up          = find_named_node("ffn_moe_up");
+    plan.moe_swiglu      = find_named_node("ffn_moe_swiglu");
+    plan.moe_down        = find_named_node("ffn_moe_down");
+    plan.moe_weighted    = find_named_node("ffn_moe_weighted");
+    plan.moe_out         = find_named_node("ffn_moe_out");
 
     plan.z_math     = resolve_mul_mat(plan.z);
     plan.beta_math  = resolve_mul_mat(plan.beta);
     plan.alpha_math = resolve_mul_mat(plan.alpha);
+    plan.moe_logits_math = resolve_mul_mat(plan.moe_logits);
+
+    if (plan.final_output >= 0 && cgraph->nodes[plan.final_output] != nullptr) {
+        ggml_tensor * gated_out = strip_view_ops(cgraph->nodes[plan.final_output]);
+        const int gated_first = plan.gdn >= 0 ? plan.gdn : plan.attn_norm;
+        plan.gated_out = find_node_index(gated_out, gated_first, plan.final_output);
+
+        ggml_tensor * norm_mul = nullptr;
+        ggml_tensor * silu = nullptr;
+        if (gated_out != nullptr && gated_out->op == GGML_OP_MUL) {
+            if (gated_out->src[0] != nullptr && gated_out->src[0]->op == GGML_OP_UNARY &&
+                    ggml_get_unary_op(gated_out->src[0]) == GGML_UNARY_OP_SILU) {
+                silu = gated_out->src[0];
+                norm_mul = gated_out->src[1];
+            } else if (gated_out->src[1] != nullptr && gated_out->src[1]->op == GGML_OP_UNARY &&
+                    ggml_get_unary_op(gated_out->src[1]) == GGML_UNARY_OP_SILU) {
+                silu = gated_out->src[1];
+                norm_mul = gated_out->src[0];
+            }
+        }
+
+        plan.gated_silu = find_node_index(silu, gated_first, plan.final_output);
+        plan.gated_norm_mul = find_node_index(norm_mul, gated_first, plan.final_output);
+
+        ggml_tensor * gated_rms = nullptr;
+        if (norm_mul != nullptr && norm_mul->op == GGML_OP_MUL) {
+            if (norm_mul->src[0] != nullptr && norm_mul->src[0]->op == GGML_OP_RMS_NORM) {
+                gated_rms = norm_mul->src[0];
+            } else if (norm_mul->src[1] != nullptr && norm_mul->src[1]->op == GGML_OP_RMS_NORM) {
+                gated_rms = norm_mul->src[1];
+            }
+        } else if (norm_mul != nullptr && norm_mul->op == GGML_OP_RMS_NORM) {
+            gated_rms = norm_mul;
+        }
+        plan.gated_norm_rms = find_node_index(gated_rms, gated_first, plan.final_output);
+    }
+
+    if (plan.linear_attn_out >= 0 && cgraph->nodes[plan.linear_attn_out] != nullptr) {
+        ggml_tensor * attn_out_base = strip_view_ops(cgraph->nodes[plan.linear_attn_out]);
+        const int attn_out_first = plan.final_output >= 0 ? plan.final_output : plan.attn_norm;
+        plan.linear_attn_out_base = find_node_index(attn_out_base, attn_out_first, plan.linear_attn_out);
+        plan.linear_attn_out_math = resolve_mul_mat(plan.linear_attn_out);
+    }
+
+    if (plan.attn_post_norm >= 0 && cgraph->nodes[plan.attn_post_norm] != nullptr) {
+        ggml_tensor * post_out = strip_view_ops(cgraph->nodes[plan.attn_post_norm]);
+        const int post_first = plan.attn_residual >= 0 ? plan.attn_residual : plan.attn_norm;
+        plan.attn_post_norm_base = find_node_index(post_out, post_first, plan.attn_post_norm);
+
+        ggml_tensor * post_rms = nullptr;
+        if (post_out != nullptr && post_out->op == GGML_OP_MUL) {
+            if (post_out->src[0] != nullptr && post_out->src[0]->op == GGML_OP_RMS_NORM) {
+                post_rms = post_out->src[0];
+            } else if (post_out->src[1] != nullptr && post_out->src[1]->op == GGML_OP_RMS_NORM) {
+                post_rms = post_out->src[1];
+            }
+        } else if (post_out != nullptr && post_out->op == GGML_OP_RMS_NORM) {
+            post_rms = post_out;
+        }
+        plan.attn_post_norm_rms = find_node_index(post_rms, post_first, plan.attn_post_norm);
+    }
+
+    if (plan.moe_logits >= 0 && cgraph->nodes[plan.moe_logits] != nullptr) {
+        ggml_tensor * moe_logits_base = strip_view_ops(cgraph->nodes[plan.moe_logits]);
+        const int moe_first = plan.attn_post_norm >= 0 ? plan.attn_post_norm : plan.attn_norm;
+        plan.moe_logits_base = find_node_index(moe_logits_base, moe_first, plan.moe_logits);
+    }
 
     // The alpha "biased" node is the ADD directly consuming the alpha projection. The named alpha node is a reshape.
     if (plan.alpha >= 0 && cgraph->nodes[plan.alpha] != nullptr) {
@@ -3845,11 +3988,25 @@ static void ggml_cuda_rdna3_qwen36_one_layer_mega_report(
             "rdna3_qwen36_one_layer_mega: uid=%" PRIu64 " layer=%d status=%s span=[%d,%d]"
             " qkv_stage=[rms=%d attn_norm=%d qkv_math=%d qkv_out=%d qkv=%d skip_end=%d]"
             " ssm_stage=[raw=%d silu=%d] l2_stage=[q=%d k=%d] gdn_stage=%d"
+            " gated_norm_stage=[rms=%d norm_mul=%d silu=%d out=%d final=%d]"
+            " attn_out_stage=[math=%d base=%d named=%d]"
+            " post_attn_stage=[residual=%d rms=%d base=%d named=%d]"
+            " moe_router_stage=[logits_math=%d logits_base=%d logits=%d probs=%d argsort=%d topk=%d weights=%d sum=%d clamped=%d norm=%d scaled=%d]"
+            " moe_gate_up_stage=[gate_up=%d gate=%d up=%d swiglu=%d]"
+            " moe_down_stage=[down=%d weighted=%d out=%d]"
             " replaced=%d/%d bundle=%d kind=%s fattn=%d gdn=%d ssm_conv=%d topk=%d moe_gate_up=%d"
             " moe_down=%d mmid=%d mmid_host_sync=%d blocker=%s\n",
             uid, plan.layer, ok ? (plan.projection_bundle ? "projection-stage" : "qkv-stage") : "blocked", plan.start, plan.end,
             plan.rms, plan.attn_norm, plan.qkv_math, plan.qkv_out, plan.qkv, plan.qkv_skip_end,
             plan.conv_raw, plan.conv_silu, plan.q_l2, plan.k_l2, plan.gdn,
+            plan.gated_norm_rms, plan.gated_norm_mul, plan.gated_silu, plan.gated_out, plan.final_output,
+            plan.linear_attn_out_math, plan.linear_attn_out_base, plan.linear_attn_out,
+            plan.attn_residual, plan.attn_post_norm_rms, plan.attn_post_norm_base, plan.attn_post_norm,
+            plan.moe_logits_math, plan.moe_logits_base, plan.moe_logits, plan.moe_probs,
+            plan.moe_argsort, plan.moe_topk, plan.moe_weights, plan.moe_weights_sum,
+            plan.moe_weights_sum_clamped, plan.moe_weights_norm, plan.moe_weights_scaled,
+            plan.moe_gate_up, plan.moe_gate, plan.moe_up, plan.moe_swiglu,
+            plan.moe_down, plan.moe_weighted, plan.moe_out,
             replaced, plan.n_nodes, plan.projection_bundle ? 1 : 0, plan.is_recurrent ? "recurrent" : "attention",
             plan.n_fattn, plan.n_gdn, plan.n_ssm_conv, plan.n_topk_moe,
             plan.n_moe_gate_up, plan.n_moe_down, plan.n_mmid, plan.n_mmid_host_sync,
@@ -6967,6 +7124,12 @@ static void ggml_cuda_graph_evaluate_and_capture(
             bool qwen36_superlayer_l0_ssm_launched = false;
             bool qwen36_superlayer_l0_l2_launched = false;
             bool qwen36_superlayer_l0_gdn_launched = false;
+            bool qwen36_superlayer_l0_gated_norm_launched = false;
+            bool qwen36_superlayer_l0_attn_out_launched = false;
+            bool qwen36_superlayer_l0_post_attn_launched = false;
+            bool qwen36_superlayer_l0_moe_router_launched = false;
+            bool qwen36_superlayer_l0_moe_gate_up_launched = false;
+            bool qwen36_superlayer_l0_moe_down_launched = false;
             const bool qwen36_superlayer_l0_replace_rms =
                 superlayer_l0_plan != nullptr &&
                 ggml_cuda_rdna3_qwen36_superlayer_replace_l0_rms_enabled(cuda_ctx->device);
@@ -6994,6 +7157,24 @@ static void ggml_cuda_graph_evaluate_and_capture(
             const bool qwen36_superlayer_l0_replace_gdn =
                 superlayer_l0_plan != nullptr &&
                 ggml_cuda_rdna3_qwen36_superlayer_replace_l0_gdn_enabled(cuda_ctx->device);
+            const bool qwen36_superlayer_l0_replace_gated_norm =
+                superlayer_l0_plan != nullptr &&
+                ggml_cuda_rdna3_qwen36_superlayer_replace_l0_gated_norm_enabled(cuda_ctx->device);
+            const bool qwen36_superlayer_l0_replace_attn_out =
+                superlayer_l0_plan != nullptr &&
+                ggml_cuda_rdna3_qwen36_superlayer_replace_l0_attn_out_enabled(cuda_ctx->device);
+            const bool qwen36_superlayer_l0_replace_post_attn =
+                superlayer_l0_plan != nullptr &&
+                ggml_cuda_rdna3_qwen36_superlayer_replace_l0_post_attn_enabled(cuda_ctx->device);
+            const bool qwen36_superlayer_l0_replace_moe_router =
+                superlayer_l0_plan != nullptr &&
+                ggml_cuda_rdna3_qwen36_superlayer_replace_l0_moe_router_enabled(cuda_ctx->device);
+            const bool qwen36_superlayer_l0_replace_moe_gate_up =
+                superlayer_l0_plan != nullptr &&
+                ggml_cuda_rdna3_qwen36_superlayer_replace_l0_moe_gate_up_enabled(cuda_ctx->device);
+            const bool qwen36_superlayer_l0_replace_moe_down =
+                superlayer_l0_plan != nullptr &&
+                ggml_cuda_rdna3_qwen36_superlayer_replace_l0_moe_down_enabled(cuda_ctx->device);
             const uint32_t qwen36_superlayer_l0_rms_qkv_mask =
                 (qwen36_superlayer_l0_replace_rms ? 0x1u : 0u) |
                 (qwen36_superlayer_l0_replace_rms && qwen36_superlayer_l0_replace_qkv ? 0x2u : 0u);
@@ -7033,6 +7214,18 @@ static void ggml_cuda_graph_evaluate_and_capture(
                 qwen36_superlayer_l0_replace_l2 ? 0x80u : 0u;
             const uint32_t qwen36_superlayer_l0_gdn_mask =
                 qwen36_superlayer_l0_replace_gdn ? 0x100u : 0u;
+            const uint32_t qwen36_superlayer_l0_gated_norm_mask =
+                qwen36_superlayer_l0_replace_gated_norm ? 0x200u : 0u;
+            const uint32_t qwen36_superlayer_l0_attn_out_mask =
+                qwen36_superlayer_l0_replace_attn_out ? 0x400u : 0u;
+            const uint32_t qwen36_superlayer_l0_post_attn_mask =
+                qwen36_superlayer_l0_replace_post_attn ? 0x800u : 0u;
+            const uint32_t qwen36_superlayer_l0_moe_router_mask =
+                qwen36_superlayer_l0_replace_moe_router ? 0x1000u : 0u;
+            const uint32_t qwen36_superlayer_l0_moe_gate_up_mask =
+                qwen36_superlayer_l0_replace_moe_gate_up ? 0x2000u : 0u;
+            const uint32_t qwen36_superlayer_l0_moe_down_mask =
+                qwen36_superlayer_l0_replace_moe_down ? 0x4000u : 0u;
             const int qwen36_superlayer_l0_projection_node =
                 qwen36_superlayer_l0_proj_alpha_mask != 0 ? superlayer_l0_plan->alpha_gate :
                 qwen36_superlayer_l0_proj_beta_mask != 0  ? superlayer_l0_plan->beta_sigmoid :
@@ -7112,6 +7305,54 @@ static void ggml_cuda_graph_evaluate_and_capture(
                     qwen36_superlayer_l0_launch_mask(i, "gdn", qwen36_superlayer_l0_gdn_mask);
                     qwen36_superlayer_l0_gdn_launched = true;
                 }
+                if (superlayer_l0_plan != nullptr &&
+                        !qwen36_superlayer_l0_gated_norm_launched &&
+                        i == superlayer_l0_plan->gated_norm_rms &&
+                        qwen36_superlayer_l0_gated_norm_mask != 0) {
+                    qwen36_superlayer_l0_launch_mask(
+                            i, "gated-norm", qwen36_superlayer_l0_gated_norm_mask);
+                    qwen36_superlayer_l0_gated_norm_launched = true;
+                }
+                if (superlayer_l0_plan != nullptr &&
+                        !qwen36_superlayer_l0_attn_out_launched &&
+                        i == superlayer_l0_plan->linear_attn_out_math &&
+                        qwen36_superlayer_l0_attn_out_mask != 0) {
+                    qwen36_superlayer_l0_launch_mask(
+                            i, "attn-out", qwen36_superlayer_l0_attn_out_mask);
+                    qwen36_superlayer_l0_attn_out_launched = true;
+                }
+                if (superlayer_l0_plan != nullptr &&
+                        !qwen36_superlayer_l0_post_attn_launched &&
+                        i == superlayer_l0_plan->attn_residual &&
+                        qwen36_superlayer_l0_post_attn_mask != 0) {
+                    qwen36_superlayer_l0_launch_mask(
+                            i, "post-attn", qwen36_superlayer_l0_post_attn_mask);
+                    qwen36_superlayer_l0_post_attn_launched = true;
+                }
+                if (superlayer_l0_plan != nullptr &&
+                        !qwen36_superlayer_l0_moe_router_launched &&
+                        i == superlayer_l0_plan->moe_logits_math &&
+                        qwen36_superlayer_l0_moe_router_mask != 0) {
+                    qwen36_superlayer_l0_launch_mask(
+                            i, "moe-router", qwen36_superlayer_l0_moe_router_mask);
+                    qwen36_superlayer_l0_moe_router_launched = true;
+                }
+                if (superlayer_l0_plan != nullptr &&
+                        !qwen36_superlayer_l0_moe_gate_up_launched &&
+                        i == superlayer_l0_plan->moe_gate_up &&
+                        qwen36_superlayer_l0_moe_gate_up_mask != 0) {
+                    qwen36_superlayer_l0_launch_mask(
+                            i, "moe-gate-up", qwen36_superlayer_l0_moe_gate_up_mask);
+                    qwen36_superlayer_l0_moe_gate_up_launched = true;
+                }
+                if (superlayer_l0_plan != nullptr &&
+                        !qwen36_superlayer_l0_moe_down_launched &&
+                        i == superlayer_l0_plan->moe_down &&
+                        qwen36_superlayer_l0_moe_down_mask != 0) {
+                    qwen36_superlayer_l0_launch_mask(
+                            i, "moe-down", qwen36_superlayer_l0_moe_down_mask);
+                    qwen36_superlayer_l0_moe_down_launched = true;
+                }
                 const bool qwen36_superlayer_l0_skip =
                     superlayer_l0_plan != nullptr &&
                     ((qwen36_superlayer_l0_replace_rms &&
@@ -7142,7 +7383,41 @@ static void ggml_cuda_graph_evaluate_and_capture(
                       (i == superlayer_l0_plan->q_l2 ||
                        i == superlayer_l0_plan->k_l2)) ||
                      (qwen36_superlayer_l0_replace_gdn &&
-                      i == superlayer_l0_plan->gdn));
+                      i == superlayer_l0_plan->gdn) ||
+                     (qwen36_superlayer_l0_replace_gated_norm &&
+                      (i == superlayer_l0_plan->gated_norm_rms ||
+                       i == superlayer_l0_plan->gated_norm_mul ||
+                       i == superlayer_l0_plan->gated_silu ||
+                       i == superlayer_l0_plan->gated_out)) ||
+                     (qwen36_superlayer_l0_replace_attn_out &&
+                      (i == superlayer_l0_plan->linear_attn_out_math ||
+                       i == superlayer_l0_plan->linear_attn_out_base ||
+                       i == superlayer_l0_plan->linear_attn_out)) ||
+                     (qwen36_superlayer_l0_replace_post_attn &&
+                      (i == superlayer_l0_plan->attn_residual ||
+                       i == superlayer_l0_plan->attn_post_norm_rms ||
+                       i == superlayer_l0_plan->attn_post_norm_base ||
+                       i == superlayer_l0_plan->attn_post_norm)) ||
+                     (qwen36_superlayer_l0_replace_moe_router &&
+                      (i == superlayer_l0_plan->moe_logits_math ||
+                       i == superlayer_l0_plan->moe_logits_base ||
+                       i == superlayer_l0_plan->moe_logits ||
+                       i == superlayer_l0_plan->moe_probs ||
+                       i == superlayer_l0_plan->moe_argsort ||
+                       i == superlayer_l0_plan->moe_topk ||
+                       i == superlayer_l0_plan->moe_weights ||
+                       i == superlayer_l0_plan->moe_weights_sum ||
+                       i == superlayer_l0_plan->moe_weights_sum_clamped ||
+                       i == superlayer_l0_plan->moe_weights_norm ||
+                       i == superlayer_l0_plan->moe_weights_scaled)) ||
+                     (qwen36_superlayer_l0_replace_moe_gate_up &&
+                      (i == superlayer_l0_plan->moe_gate_up ||
+                       i == superlayer_l0_plan->moe_gate ||
+                       i == superlayer_l0_plan->moe_up ||
+                       i == superlayer_l0_plan->moe_swiglu)) ||
+                     (qwen36_superlayer_l0_replace_moe_down &&
+                      i >= superlayer_l0_plan->moe_down &&
+                      i <= superlayer_l0_plan->moe_out));
                 int qwen36_one_layer_qkv_hit_idx = -1;
                 int qwen36_one_layer_qkv_skip_idx = -1;
                 if (one_layer_plans != nullptr) {
@@ -8271,14 +8546,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             }
 
             if (superlayer_ok) {
-                if (!qwen36_superlayer_final &&
-                        ggml_cuda_rdna3_qwen36_superlayer_replace_l0_enabled(cuda_ctx->device)) {
+                if (ggml_cuda_rdna3_qwen36_superlayer_replace_l0_enabled(cuda_ctx->device)) {
                     qwen36_superlayer_l0_plan =
                         ggml_cuda_rdna3_qwen36_one_layer_mega_make_plan(cgraph, cuda_ctx->device, 0);
                     qwen36_superlayer_l0_replace_ready =
                         ggml_cuda_rdna3_qwen36_l0_replacement_plan_ok(qwen36_superlayer_l0_plan);
                     if (!qwen36_superlayer_l0_replace_ready &&
-                            ggml_cuda_rdna3_qwen36_superlayer_required(cuda_ctx->device)) {
+                            (qwen36_superlayer_final ||
+                             ggml_cuda_rdna3_qwen36_superlayer_required(cuda_ctx->device))) {
                         GGML_ABORT("%s: Qwen3.6 RDNA3 physical superlayer L0 replacement failed: %s",
                                 __func__, qwen36_superlayer_l0_plan.blocker.c_str());
                     }

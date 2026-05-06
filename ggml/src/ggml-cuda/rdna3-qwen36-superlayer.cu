@@ -12,6 +12,7 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <cfloat>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -60,6 +61,22 @@ static bool qwen36_superlayer_direct_l0_ssm_weights_requested() {
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DIRECT_L0_SSM_WEIGHTS");
 }
 
+static bool qwen36_superlayer_direct_l0_out_weights_requested() {
+    return qwen36_superlayer_direct_l0_weights_requested() ||
+        qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DIRECT_L0_OUT_WEIGHTS");
+}
+
+static bool qwen36_superlayer_direct_l0_moe_weights_requested() {
+    return qwen36_superlayer_direct_l0_weights_requested() ||
+        qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DIRECT_L0_MOE_WEIGHTS");
+}
+
+static bool qwen36_superlayer_replace_l0_all_stages_requested() {
+    return qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_FINAL") ||
+        qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_FINAL_PHYSICAL_L0") ||
+        qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0");
+}
+
 static uint32_t qwen36_superlayer_direct_l0_stage_mask() {
     uint32_t mask = 0;
     if (qwen36_superlayer_direct_l0_norm_weights_requested()) {
@@ -76,6 +93,15 @@ static uint32_t qwen36_superlayer_direct_l0_stage_mask() {
     }
     if (qwen36_superlayer_direct_l0_norm_weights_requested()) {
         mask |= 0x200u;
+    }
+    if (qwen36_superlayer_direct_l0_out_weights_requested()) {
+        mask |= 0x400u;
+    }
+    if (qwen36_superlayer_direct_l0_norm_weights_requested()) {
+        mask |= 0x800u;
+    }
+    if (qwen36_superlayer_direct_l0_moe_weights_requested()) {
+        mask |= 0x7000u;
     }
     return mask;
 }
@@ -384,6 +410,125 @@ struct qwen36_superlayer_l0_gated_norm_desc {
     uint32_t ready = 0;
 };
 
+struct qwen36_superlayer_l0_attn_out_desc {
+    const float * x = nullptr;
+    float * math_dst = nullptr;
+    float * out_dst = nullptr;
+    float * named_dst = nullptr;
+    const char * w_data = nullptr;
+    const float * scale_data = nullptr;
+    uint64_t w_offset = 0;
+    uint64_t scale_offset = 0;
+    uint64_t w_nb1 = 0;
+    uint32_t n_embd = 0;
+    uint32_t n_out = 0;
+    int32_t w_type = GGML_TYPE_COUNT;
+    uint32_t scale_n = 0;
+    uint32_t has_scale = 0;
+    uint32_t use_direct_weights = 0;
+    uint32_t ready = 0;
+};
+
+struct qwen36_superlayer_l0_post_attn_desc {
+    const float * attn = nullptr;
+    const float * skip = nullptr;
+    const float * norm_w_data = nullptr;
+    float * residual_dst = nullptr;
+    float * residual_named_dst = nullptr;
+    float * rms_dst = nullptr;
+    float * norm_dst = nullptr;
+    float * named_dst = nullptr;
+    uint64_t norm_w_offset = 0;
+    uint32_t ncols = 0;
+    uint32_t nrows = 0;
+    float eps = 0.0f;
+    uint32_t has_norm_w = 0;
+    uint32_t use_direct_weights = 0;
+    uint32_t ready = 0;
+};
+
+struct qwen36_superlayer_l0_moe_router_desc {
+    const float * x = nullptr;
+    float * logits_math_dst = nullptr;
+    float * logits_dst = nullptr;
+    float * logits_named_dst = nullptr;
+    float * probs_dst = nullptr;
+    int32_t * argsort_dst = nullptr;
+    int32_t * topk_dst = nullptr;
+    float * weights_dst = nullptr;
+    float * weights_sum_dst = nullptr;
+    float * weights_sum_clamped_dst = nullptr;
+    float * weights_norm_dst = nullptr;
+    float * weights_scaled_dst = nullptr;
+    const char * w_data = nullptr;
+    const float * scale_data = nullptr;
+    uint64_t w_offset = 0;
+    uint64_t scale_offset = 0;
+    uint64_t w_nb1 = 0;
+    uint32_t n_embd = 0;
+    uint32_t n_expert = 0;
+    uint32_t n_expert_used = 0;
+    int32_t w_type = GGML_TYPE_COUNT;
+    uint32_t scale_n = 0;
+    float weights_scale = 1.0f;
+    float clamp_min = 6.103515625e-5f;
+    uint32_t has_scale = 0;
+    uint32_t has_weights_sum = 0;
+    uint32_t has_weights_norm = 0;
+    uint32_t has_weights_scaled = 0;
+    uint32_t use_direct_weights = 0;
+    uint32_t ready = 0;
+};
+
+struct qwen36_superlayer_l0_moe_gate_up_desc {
+    const float * x = nullptr;
+    const int32_t * ids = nullptr;
+    float * gate_up_dst = nullptr;
+    float * gate_dst = nullptr;
+    float * up_dst = nullptr;
+    float * swiglu_dst = nullptr;
+    const char * w_data = nullptr;
+    uint64_t w_offset = 0;
+    uint64_t w_nb1 = 0;
+    uint64_t w_nb2 = 0;
+    uint64_t gate_up_nb1 = 0;
+    uint64_t gate_nb1 = 0;
+    uint64_t up_nb1 = 0;
+    uint64_t swiglu_nb1 = 0;
+    uint32_t n_embd = 0;
+    uint32_t n_ff = 0;
+    uint32_t n_expert = 0;
+    uint32_t n_expert_used = 0;
+    int32_t w_type = GGML_TYPE_COUNT;
+    uint32_t use_direct_weights = 0;
+    uint32_t ready = 0;
+};
+
+struct qwen36_superlayer_l0_moe_down_desc {
+    const float * x = nullptr;
+    const int32_t * ids = nullptr;
+    const float * weights = nullptr;
+    float * down_dst = nullptr;
+    float * weighted_dst = nullptr;
+    float * out_dst = nullptr;
+    const char * w_data = nullptr;
+    uint64_t w_offset = 0;
+    uint64_t w_nb1 = 0;
+    uint64_t w_nb2 = 0;
+    uint64_t x_nb1 = 0;
+    uint64_t weights_nb1 = 0;
+    uint64_t down_nb1 = 0;
+    uint64_t weighted_nb1 = 0;
+    uint64_t out_nb1 = 0;
+    uint32_t n_ff = 0;
+    uint32_t n_embd = 0;
+    uint32_t n_expert = 0;
+    uint32_t n_expert_used = 0;
+    int32_t w_type = GGML_TYPE_COUNT;
+    uint32_t use_direct_weights = 0;
+    uint32_t ready = 0;
+};
+
 struct qwen36_superlayer_device_pack_entry {
     int device = -1;
     uint64_t fingerprint = 0;
@@ -399,6 +544,11 @@ struct qwen36_superlayer_device_pack_entry {
     qwen36_superlayer_l0_l2_desc * l0_l2 = nullptr;
     qwen36_superlayer_l0_gdn_desc * l0_gdn = nullptr;
     qwen36_superlayer_l0_gated_norm_desc * l0_gated_norm = nullptr;
+    qwen36_superlayer_l0_attn_out_desc * l0_attn_out = nullptr;
+    qwen36_superlayer_l0_post_attn_desc * l0_post_attn = nullptr;
+    qwen36_superlayer_l0_moe_router_desc * l0_moe_router = nullptr;
+    qwen36_superlayer_l0_moe_gate_up_desc * l0_moe_gate_up = nullptr;
+    qwen36_superlayer_l0_moe_down_desc * l0_moe_down = nullptr;
     void * scratch = nullptr;
     size_t bytes = 0;
     size_t tensors = 0;
@@ -419,6 +569,11 @@ struct qwen36_superlayer_device_pack_view {
     qwen36_superlayer_l0_l2_desc * l0_l2 = nullptr;
     qwen36_superlayer_l0_gdn_desc * l0_gdn = nullptr;
     qwen36_superlayer_l0_gated_norm_desc * l0_gated_norm = nullptr;
+    qwen36_superlayer_l0_attn_out_desc * l0_attn_out = nullptr;
+    qwen36_superlayer_l0_post_attn_desc * l0_post_attn = nullptr;
+    qwen36_superlayer_l0_moe_router_desc * l0_moe_router = nullptr;
+    qwen36_superlayer_l0_moe_gate_up_desc * l0_moe_gate_up = nullptr;
+    qwen36_superlayer_l0_moe_down_desc * l0_moe_down = nullptr;
     void * scratch = nullptr;
     size_t bytes = 0;
     size_t tensors = 0;
@@ -1687,7 +1842,8 @@ static bool qwen36_superlayer_make_l0_proj_desc(
 }
 
 static bool qwen36_superlayer_l0_ssm_requested() {
-    return qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_SSM", 0) != 0;
+    return qwen36_superlayer_replace_l0_all_stages_requested() ||
+        qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_SSM", 0) != 0;
 }
 
 static bool qwen36_superlayer_make_l0_ssm_desc(
@@ -1831,7 +1987,8 @@ static bool qwen36_superlayer_make_l0_ssm_desc(
 }
 
 static bool qwen36_superlayer_l0_l2_requested() {
-    return qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_L2", 0) != 0;
+    return qwen36_superlayer_replace_l0_all_stages_requested() ||
+        qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_L2", 0) != 0;
 }
 
 static bool qwen36_superlayer_make_l0_l2_desc(
@@ -1952,7 +2109,8 @@ static bool qwen36_superlayer_make_l0_l2_desc(
 }
 
 static bool qwen36_superlayer_l0_gdn_requested() {
-    return qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_GDN", 0) != 0;
+    return qwen36_superlayer_replace_l0_all_stages_requested() ||
+        qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_GDN", 0) != 0;
 }
 
 static bool qwen36_superlayer_make_l0_gdn_desc(
@@ -2088,6 +2246,1293 @@ static bool qwen36_superlayer_make_l0_gdn_desc(
     return true;
 }
 
+static bool qwen36_superlayer_l0_gated_norm_requested() {
+    return qwen36_superlayer_replace_l0_all_stages_requested() ||
+        qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_GATED_NORM", 0) != 0;
+}
+
+static bool qwen36_superlayer_make_l0_gated_norm_desc(
+        const ggml_cgraph * cgraph,
+        const qwen36_superlayer_plan & plan,
+        const qwen36_superlayer_pack_plan & pack,
+        const int device,
+        qwen36_superlayer_l0_gated_norm_desc * desc,
+        std::string * blocker) {
+    if (desc == nullptr) {
+        if (blocker != nullptr) {
+            *blocker = "missing L0 gated norm descriptor output";
+        }
+        return false;
+    }
+    *desc = qwen36_superlayer_l0_gated_norm_desc{};
+
+    const bool requested = qwen36_superlayer_l0_gated_norm_requested();
+    if (!requested) {
+        return true;
+    }
+
+    const int begin = plan.layer_start[0] >= 0 ? plan.layer_start[0] : 0;
+    const int end   = plan.layer_end[0]   >= begin ? plan.layer_end[0]   : cgraph->n_nodes - 1;
+    const ggml_tensor * attn_output = nullptr;
+    const ggml_tensor * final_output = nullptr;
+    for (int i = begin; i <= end; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (attn_output == nullptr && tensor_name_matches_layer(node, "attn_output", 0)) {
+            attn_output = node;
+        } else if (final_output == nullptr && tensor_name_matches_layer(node, "final_output", 0)) {
+            final_output = node;
+        }
+    }
+
+    const ggml_tensor * out = qwen36_superlayer_strip_view_ops(final_output);
+    if (attn_output == nullptr || final_output == nullptr || out == nullptr || out->op != GGML_OP_MUL) {
+        if (blocker != nullptr) {
+            *blocker = "L0 gated norm fusion requires attn_output-0 and final_output-0";
+        }
+        return false;
+    }
+
+    const ggml_tensor * norm_mul = nullptr;
+    const ggml_tensor * silu = nullptr;
+    if (out->src[0] != nullptr && out->src[0]->op == GGML_OP_UNARY &&
+            ggml_get_unary_op(out->src[0]) == GGML_UNARY_OP_SILU) {
+        silu = out->src[0];
+        norm_mul = out->src[1];
+    } else if (out->src[1] != nullptr && out->src[1]->op == GGML_OP_UNARY &&
+            ggml_get_unary_op(out->src[1]) == GGML_UNARY_OP_SILU) {
+        silu = out->src[1];
+        norm_mul = out->src[0];
+    }
+    if (norm_mul == nullptr || silu == nullptr || silu->src[0] == nullptr) {
+        if (blocker != nullptr) {
+            *blocker = "L0 gated norm fusion requires MUL(RMSNorm*weight, SILU(z))";
+        }
+        return false;
+    }
+
+    const ggml_tensor * rms = nullptr;
+    const ggml_tensor * norm_w = nullptr;
+    if (norm_mul->op == GGML_OP_MUL) {
+        if (norm_mul->src[0] != nullptr && norm_mul->src[0]->op == GGML_OP_RMS_NORM) {
+            rms = norm_mul->src[0];
+            norm_w = norm_mul->src[1];
+        } else if (norm_mul->src[1] != nullptr && norm_mul->src[1]->op == GGML_OP_RMS_NORM) {
+            rms = norm_mul->src[1];
+            norm_w = norm_mul->src[0];
+        }
+    } else if (norm_mul->op == GGML_OP_RMS_NORM) {
+        rms = norm_mul;
+    }
+    if (rms == nullptr || rms->src[0] == nullptr ||
+            !qwen36_superlayer_same_tensor_or_view(rms->src[0], attn_output)) {
+        if (blocker != nullptr) {
+            *blocker = "L0 gated norm fusion could not resolve RMS_NORM(attn_output-0)";
+        }
+        return false;
+    }
+
+    const ggml_tensor * gate = silu->src[0];
+    if (rms->type != GGML_TYPE_F32 || rms->src[0]->type != GGML_TYPE_F32 ||
+            gate->type != GGML_TYPE_F32 || silu->type != GGML_TYPE_F32 ||
+            norm_mul->type != GGML_TYPE_F32 || out->type != GGML_TYPE_F32 ||
+            final_output->type != GGML_TYPE_F32 ||
+            (norm_w != nullptr && norm_w->type != GGML_TYPE_F32)) {
+        if (blocker != nullptr) {
+            *blocker = "L0 gated norm fusion currently requires F32 tensors";
+        }
+        return false;
+    }
+
+    const int64_t ncols = rms->src[0]->ne[0];
+    const int64_t nrows = ggml_nelements(rms->src[0]) / ncols;
+    if (ncols <= 0 || nrows <= 0 ||
+            ggml_nelements(gate) != ggml_nelements(rms->src[0]) ||
+            ggml_nelements(rms) != ggml_nelements(rms->src[0]) ||
+            ggml_nelements(norm_mul) != ggml_nelements(rms->src[0]) ||
+            ggml_nelements(silu) != ggml_nelements(rms->src[0]) ||
+            ggml_nelements(out) != ggml_nelements(rms->src[0]) ||
+            ggml_nelements(final_output) != ggml_nelements(rms->src[0]) ||
+            (norm_w != nullptr && ggml_nelements(norm_w) != ncols)) {
+        if (blocker != nullptr) {
+            *blocker = "L0 gated norm fusion tensor dimensions do not match";
+        }
+        return false;
+    }
+    if (rms->src[0]->nb[0] != (int64_t) sizeof(float) ||
+            gate->nb[0] != (int64_t) sizeof(float) ||
+            rms->nb[0] != (int64_t) sizeof(float) ||
+            norm_mul->nb[0] != (int64_t) sizeof(float) ||
+            silu->nb[0] != (int64_t) sizeof(float) ||
+            out->nb[0] != (int64_t) sizeof(float) ||
+            final_output->nb[0] != (int64_t) sizeof(float) ||
+            (norm_w != nullptr && norm_w->nb[0] != (int64_t) sizeof(float)) ||
+            !ggml_is_contiguous(rms->src[0]) ||
+            !ggml_is_contiguous(gate) ||
+            !ggml_is_contiguous(rms) ||
+            !ggml_is_contiguous(norm_mul) ||
+            !ggml_is_contiguous(silu) ||
+            !ggml_is_contiguous(out) ||
+            !ggml_is_contiguous(final_output)) {
+        if (blocker != nullptr) {
+            *blocker = "L0 gated norm fusion requires contiguous F32 layout";
+        }
+        return false;
+    }
+    const float eps = ggml_get_op_params_f32(rms, 0);
+    if (eps < 0.0f) {
+        if (blocker != nullptr) {
+            *blocker = "L0 gated norm epsilon is negative";
+        }
+        return false;
+    }
+    if (!qwen36_superlayer_tensor_data_on_device(rms->src[0], device, "L0 gated norm input", blocker) ||
+            !qwen36_superlayer_tensor_data_on_device(gate, device, "L0 gated norm gate", blocker) ||
+            !qwen36_superlayer_tensor_data_on_device(rms, device, "L0 gated norm RMS output", blocker) ||
+            !qwen36_superlayer_tensor_data_on_device(norm_mul, device, "L0 gated norm weighted output", blocker) ||
+            !qwen36_superlayer_tensor_data_on_device(silu, device, "L0 gated norm silu output", blocker) ||
+            !qwen36_superlayer_tensor_data_on_device(out, device, "L0 gated norm output", blocker) ||
+            !qwen36_superlayer_tensor_data_on_device(final_output, device, "L0 final output", blocker)) {
+        return false;
+    }
+
+    const bool use_direct_weights = qwen36_superlayer_direct_l0_norm_weights_requested();
+    uint64_t norm_w_offset = 0;
+    if (norm_w != nullptr) {
+        if (!qwen36_superlayer_find_pack_offset_named(pack, norm_w, "L0 gated norm weight", &norm_w_offset, blocker)) {
+            return false;
+        }
+        if (use_direct_weights &&
+                !qwen36_superlayer_tensor_data_on_device(norm_w, device, "L0 gated norm weight", blocker)) {
+            return false;
+        }
+    }
+
+    desc->x = (const float *) rms->src[0]->data;
+    desc->gate = (const float *) gate->data;
+    desc->norm_w_data = norm_w != nullptr ? (const float *) norm_w->data : nullptr;
+    desc->rms_dst = (float *) rms->data;
+    desc->norm_dst = (float *) norm_mul->data;
+    desc->silu_dst = (float *) silu->data;
+    desc->out_dst = (float *) out->data;
+    desc->final_dst = final_output->data != out->data ? (float *) final_output->data : nullptr;
+    desc->norm_w_offset = norm_w_offset;
+    desc->ncols = (uint32_t) ncols;
+    desc->nrows = (uint32_t) nrows;
+    desc->eps = eps;
+    desc->use_direct_weights = use_direct_weights ? 1u : 0u;
+    desc->ready = 1u;
+    return true;
+}
+
+static bool qwen36_superlayer_l0_attn_out_requested() {
+    return qwen36_superlayer_replace_l0_all_stages_requested() ||
+        qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_ATTN_OUT", 0) != 0;
+}
+
+static bool qwen36_superlayer_make_l0_attn_out_desc(
+        const ggml_cgraph * cgraph,
+        const qwen36_superlayer_plan & plan,
+        const qwen36_superlayer_pack_plan & pack,
+        const int device,
+        qwen36_superlayer_l0_attn_out_desc * desc,
+        std::string * blocker) {
+    if (desc == nullptr) {
+        if (blocker != nullptr) {
+            *blocker = "missing L0 attention output descriptor output";
+        }
+        return false;
+    }
+    *desc = qwen36_superlayer_l0_attn_out_desc{};
+
+    const bool requested = qwen36_superlayer_l0_attn_out_requested();
+    if (!requested) {
+        return true;
+    }
+
+    const int begin = plan.layer_start[0] >= 0 ? plan.layer_start[0] : 0;
+    const int end   = plan.layer_end[0]   >= begin ? plan.layer_end[0]   : cgraph->n_nodes - 1;
+    const ggml_tensor * final_output = nullptr;
+    const ggml_tensor * linear_attn_out = nullptr;
+    for (int i = begin; i <= end; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (final_output == nullptr && tensor_name_matches_layer(node, "final_output", 0)) {
+            final_output = node;
+        } else if (linear_attn_out == nullptr && tensor_name_matches_layer(node, "linear_attn_out", 0)) {
+            linear_attn_out = node;
+        }
+    }
+
+    const ggml_tensor * out = qwen36_superlayer_strip_view_ops(linear_attn_out);
+    const ggml_tensor * scale = nullptr;
+    const ggml_tensor * mm = qwen36_superlayer_resolve_mul_mat_with_scale(linear_attn_out, &scale);
+    if (final_output == nullptr || linear_attn_out == nullptr || out == nullptr ||
+            mm == nullptr || mm->src[0] == nullptr || mm->src[1] == nullptr) {
+        if (blocker != nullptr) {
+            *blocker = "L0 attention output fusion requires final_output-0 and linear_attn_out-0 MUL_MAT";
+        }
+        return false;
+    }
+    if (!qwen36_superlayer_same_tensor_or_view(mm->src[1], final_output)) {
+        if (blocker != nullptr) {
+            *blocker = "L0 attention output MUL_MAT input is not final_output-0";
+        }
+        return false;
+    }
+
+    const ggml_tensor * w = mm->src[0];
+    if (!qwen36_superlayer_projection_weight_supported(w)) {
+        if (blocker != nullptr) {
+            *blocker = "L0 attention output weight type is not implemented in the superlayer";
+        }
+        return false;
+    }
+    if (final_output->type != GGML_TYPE_F32 || mm->src[1]->type != GGML_TYPE_F32 ||
+            mm->type != GGML_TYPE_F32 || out->type != GGML_TYPE_F32 ||
+            linear_attn_out->type != GGML_TYPE_F32 ||
+            (scale != nullptr && scale->type != GGML_TYPE_F32)) {
+        if (blocker != nullptr) {
+            *blocker = "L0 attention output fusion currently requires F32 activation/output tensors";
+        }
+        return false;
+    }
+
+    const int64_t n_embd = w->ne[0];
+    const int64_t n_out = mm->ne[0];
+    if (n_embd <= 0 || n_out <= 0 ||
+            w->ne[1] != n_out ||
+            mm->src[1]->ne[0] != n_embd ||
+            ggml_nelements(mm->src[1]) != n_embd ||
+            ggml_nelements(final_output) != n_embd ||
+            ggml_nelements(mm) != n_out ||
+            ggml_nelements(out) != n_out ||
+            ggml_nelements(linear_attn_out) != n_out ||
+            (scale != nullptr && ggml_nelements(scale) != 1 && ggml_nelements(scale) != n_out)) {
+        if (blocker != nullptr) {
+            *blocker = "L0 attention output tensor dimensions do not match one-token decode";
+        }
+        return false;
+    }
+    if (mm->src[1]->nb[0] != (int64_t) sizeof(float) ||
+            final_output->nb[0] != (int64_t) sizeof(float) ||
+            mm->nb[0] != (int64_t) sizeof(float) ||
+            out->nb[0] != (int64_t) sizeof(float) ||
+            linear_attn_out->nb[0] != (int64_t) sizeof(float) ||
+            (scale != nullptr && scale->nb[0] != (int64_t) sizeof(float)) ||
+            !ggml_is_contiguous(mm->src[1]) ||
+            !ggml_is_contiguous(final_output) ||
+            !ggml_is_contiguous_1(mm) ||
+            !ggml_is_contiguous_1(out) ||
+            !ggml_is_contiguous_1(linear_attn_out) ||
+            (scale != nullptr && !ggml_is_contiguous_1(scale))) {
+        if (blocker != nullptr) {
+            *blocker = "L0 attention output fusion requires dense F32 one-token layout";
+        }
+        return false;
+    }
+    if (!qwen36_superlayer_tensor_data_on_device(mm->src[1], device, "L0 attention output input", blocker) ||
+            (mm->src[1] != final_output &&
+             !qwen36_superlayer_tensor_data_on_device(final_output, device, "L0 final output", blocker)) ||
+            !qwen36_superlayer_tensor_data_on_device(out, device, "L0 attention output", blocker) ||
+            (mm != out && mm != linear_attn_out &&
+             !qwen36_superlayer_tensor_data_on_device(mm, device, "L0 attention output math output", blocker)) ||
+            (linear_attn_out != out &&
+             !qwen36_superlayer_tensor_data_on_device(linear_attn_out, device, "L0 attention named output", blocker))) {
+        return false;
+    }
+
+    const bool use_direct_weights = qwen36_superlayer_direct_l0_out_weights_requested();
+    uint64_t w_offset = 0;
+    uint64_t scale_offset = 0;
+    if (!qwen36_superlayer_find_pack_offset_named(pack, w, "L0 attention output weight", &w_offset, blocker)) {
+        return false;
+    }
+    if (scale != nullptr &&
+            !qwen36_superlayer_find_pack_offset_named(pack, scale, "L0 attention output post scale", &scale_offset, blocker)) {
+        return false;
+    }
+    if (use_direct_weights) {
+        if (!qwen36_superlayer_tensor_data_on_device(w, device, "L0 attention output weight", blocker) ||
+                (scale != nullptr &&
+                 !qwen36_superlayer_tensor_data_on_device(scale, device, "L0 attention output post scale", blocker))) {
+            return false;
+        }
+    }
+
+    desc->x = (const float *) mm->src[1]->data;
+    desc->math_dst = mm != out && mm != linear_attn_out &&
+        mm->data != out->data && mm->data != linear_attn_out->data ? (float *) mm->data : nullptr;
+    desc->out_dst = (float *) out->data;
+    desc->named_dst = linear_attn_out != out && linear_attn_out->data != out->data ?
+        (float *) linear_attn_out->data : nullptr;
+    desc->w_data = (const char *) w->data;
+    desc->scale_data = scale != nullptr ? (const float *) scale->data : nullptr;
+    desc->w_offset = w_offset;
+    desc->scale_offset = scale_offset;
+    desc->w_nb1 = (uint64_t) w->nb[1];
+    desc->n_embd = (uint32_t) n_embd;
+    desc->n_out = (uint32_t) n_out;
+    desc->w_type = (int32_t) w->type;
+    desc->scale_n = scale != nullptr ? (uint32_t) ggml_nelements(scale) : 0u;
+    desc->has_scale = scale != nullptr ? 1u : 0u;
+    desc->use_direct_weights = use_direct_weights ? 1u : 0u;
+    desc->ready = 1u;
+    return true;
+}
+
+static bool qwen36_superlayer_l0_post_attn_requested() {
+    return qwen36_superlayer_replace_l0_all_stages_requested() ||
+        qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_POST_ATTN", 0) != 0;
+}
+
+static bool qwen36_superlayer_make_l0_post_attn_desc(
+        const ggml_cgraph * cgraph,
+        const qwen36_superlayer_plan & plan,
+        const qwen36_superlayer_pack_plan & pack,
+        const int device,
+        qwen36_superlayer_l0_post_attn_desc * desc,
+        std::string * blocker) {
+    if (desc == nullptr) {
+        if (blocker != nullptr) {
+            *blocker = "missing L0 post-attention descriptor output";
+        }
+        return false;
+    }
+    *desc = qwen36_superlayer_l0_post_attn_desc{};
+
+    const bool requested = qwen36_superlayer_l0_post_attn_requested();
+    if (!requested) {
+        return true;
+    }
+
+    const int begin = plan.layer_start[0] >= 0 ? plan.layer_start[0] : 0;
+    const int end   = plan.layer_end[0]   >= begin ? plan.layer_end[0]   : cgraph->n_nodes - 1;
+    const ggml_tensor * linear_attn_out = nullptr;
+    const ggml_tensor * attn_residual = nullptr;
+    const ggml_tensor * attn_post_norm = nullptr;
+    for (int i = begin; i <= end; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (linear_attn_out == nullptr && tensor_name_matches_layer(node, "linear_attn_out", 0)) {
+            linear_attn_out = node;
+        } else if (attn_residual == nullptr && tensor_name_matches_layer(node, "attn_residual", 0)) {
+            attn_residual = node;
+        } else if (attn_post_norm == nullptr && tensor_name_matches_layer(node, "attn_post_norm", 0)) {
+            attn_post_norm = node;
+        }
+    }
+
+    const ggml_tensor * residual = qwen36_superlayer_strip_view_ops(attn_residual);
+    const ggml_tensor * post_out = qwen36_superlayer_strip_view_ops(attn_post_norm);
+    if (linear_attn_out == nullptr || attn_residual == nullptr || attn_post_norm == nullptr ||
+            residual == nullptr || residual->op != GGML_OP_ADD ||
+            post_out == nullptr) {
+        if (blocker != nullptr) {
+            *blocker = "L0 post-attention fusion requires linear_attn_out-0, attn_residual-0, and attn_post_norm-0";
+        }
+        return false;
+    }
+
+    const ggml_tensor * attn = nullptr;
+    const ggml_tensor * skip = nullptr;
+    if (qwen36_superlayer_same_tensor_or_view(residual->src[0], linear_attn_out)) {
+        attn = residual->src[0];
+        skip = residual->src[1];
+    } else if (qwen36_superlayer_same_tensor_or_view(residual->src[1], linear_attn_out)) {
+        attn = residual->src[1];
+        skip = residual->src[0];
+    }
+    if (attn == nullptr || skip == nullptr) {
+        if (blocker != nullptr) {
+            *blocker = "L0 post-attention residual does not consume linear_attn_out-0";
+        }
+        return false;
+    }
+
+    const ggml_tensor * rms = nullptr;
+    const ggml_tensor * norm_w = nullptr;
+    if (post_out->op == GGML_OP_MUL) {
+        if (post_out->src[0] != nullptr && post_out->src[0]->op == GGML_OP_RMS_NORM) {
+            rms = post_out->src[0];
+            norm_w = post_out->src[1];
+        } else if (post_out->src[1] != nullptr && post_out->src[1]->op == GGML_OP_RMS_NORM) {
+            rms = post_out->src[1];
+            norm_w = post_out->src[0];
+        }
+    } else if (post_out->op == GGML_OP_RMS_NORM) {
+        rms = post_out;
+    }
+    if (rms == nullptr || rms->src[0] == nullptr ||
+            !qwen36_superlayer_same_tensor_or_view(rms->src[0], attn_residual)) {
+        if (blocker != nullptr) {
+            *blocker = "L0 post-attention fusion could not resolve RMS_NORM(attn_residual-0)";
+        }
+        return false;
+    }
+
+    if (attn->type != GGML_TYPE_F32 || skip->type != GGML_TYPE_F32 ||
+            residual->type != GGML_TYPE_F32 || attn_residual->type != GGML_TYPE_F32 ||
+            rms->type != GGML_TYPE_F32 || post_out->type != GGML_TYPE_F32 ||
+            attn_post_norm->type != GGML_TYPE_F32 ||
+            (norm_w != nullptr && norm_w->type != GGML_TYPE_F32)) {
+        if (blocker != nullptr) {
+            *blocker = "L0 post-attention fusion currently requires F32 tensors";
+        }
+        return false;
+    }
+
+    const int64_t ncols = residual->ne[0];
+    if (ncols <= 0) {
+        if (blocker != nullptr) {
+            *blocker = "L0 post-attention tensor hidden dimension is empty";
+        }
+        return false;
+    }
+    const int64_t nrows = ggml_nelements(residual) / ncols;
+    if (nrows <= 0 ||
+            ggml_nelements(attn) != ggml_nelements(residual) ||
+            ggml_nelements(skip) != ggml_nelements(residual) ||
+            ggml_nelements(attn_residual) != ggml_nelements(residual) ||
+            ggml_nelements(rms) != ggml_nelements(residual) ||
+            ggml_nelements(post_out) != ggml_nelements(residual) ||
+            ggml_nelements(attn_post_norm) != ggml_nelements(residual) ||
+            (norm_w != nullptr && ggml_nelements(norm_w) != ncols)) {
+        if (blocker != nullptr) {
+            *blocker = "L0 post-attention tensor dimensions do not match";
+        }
+        return false;
+    }
+    if (attn->nb[0] != (int64_t) sizeof(float) ||
+            skip->nb[0] != (int64_t) sizeof(float) ||
+            residual->nb[0] != (int64_t) sizeof(float) ||
+            attn_residual->nb[0] != (int64_t) sizeof(float) ||
+            rms->nb[0] != (int64_t) sizeof(float) ||
+            post_out->nb[0] != (int64_t) sizeof(float) ||
+            attn_post_norm->nb[0] != (int64_t) sizeof(float) ||
+            (norm_w != nullptr && norm_w->nb[0] != (int64_t) sizeof(float)) ||
+            !ggml_is_contiguous(attn) ||
+            !ggml_is_contiguous(skip) ||
+            !ggml_is_contiguous(residual) ||
+            !ggml_is_contiguous(attn_residual) ||
+            !ggml_is_contiguous(rms) ||
+            !ggml_is_contiguous(post_out) ||
+            !ggml_is_contiguous(attn_post_norm)) {
+        if (blocker != nullptr) {
+            *blocker = "L0 post-attention fusion requires contiguous F32 layout";
+        }
+        return false;
+    }
+
+    const float eps = ggml_get_op_params_f32(rms, 0);
+    if (eps < 0.0f) {
+        if (blocker != nullptr) {
+            *blocker = "L0 post-attention epsilon is negative";
+        }
+        return false;
+    }
+    if (!qwen36_superlayer_tensor_data_on_device(attn, device, "L0 post-attention attention output", blocker) ||
+            !qwen36_superlayer_tensor_data_on_device(skip, device, "L0 post-attention residual input", blocker) ||
+            !qwen36_superlayer_tensor_data_on_device(residual, device, "L0 post-attention residual output", blocker) ||
+            (attn_residual != residual &&
+             !qwen36_superlayer_tensor_data_on_device(attn_residual, device, "L0 attn_residual named output", blocker)) ||
+            !qwen36_superlayer_tensor_data_on_device(rms, device, "L0 attn_post_norm RMS output", blocker) ||
+            !qwen36_superlayer_tensor_data_on_device(post_out, device, "L0 attn_post_norm output", blocker) ||
+            (attn_post_norm != post_out &&
+             !qwen36_superlayer_tensor_data_on_device(attn_post_norm, device, "L0 attn_post_norm named output", blocker))) {
+        return false;
+    }
+
+    const bool use_direct_weights = qwen36_superlayer_direct_l0_norm_weights_requested();
+    uint64_t norm_w_offset = 0;
+    if (norm_w != nullptr) {
+        if (!qwen36_superlayer_find_pack_offset_named(
+                    pack, norm_w, "L0 post-attention norm weight", &norm_w_offset, blocker)) {
+            return false;
+        }
+        if (use_direct_weights &&
+                !qwen36_superlayer_tensor_data_on_device(
+                    norm_w, device, "L0 post-attention norm weight", blocker)) {
+            return false;
+        }
+    }
+
+    desc->attn = (const float *) attn->data;
+    desc->skip = (const float *) skip->data;
+    desc->norm_w_data = norm_w != nullptr ? (const float *) norm_w->data : nullptr;
+    desc->residual_dst = (float *) residual->data;
+    desc->residual_named_dst = attn_residual != residual && attn_residual->data != residual->data ?
+        (float *) attn_residual->data : nullptr;
+    desc->rms_dst = (float *) rms->data;
+    desc->norm_dst = (float *) post_out->data;
+    desc->named_dst = attn_post_norm != post_out && attn_post_norm->data != post_out->data ?
+        (float *) attn_post_norm->data : nullptr;
+    desc->norm_w_offset = norm_w_offset;
+    desc->ncols = (uint32_t) ncols;
+    desc->nrows = (uint32_t) nrows;
+    desc->eps = eps;
+    desc->has_norm_w = norm_w != nullptr ? 1u : 0u;
+    desc->use_direct_weights = use_direct_weights ? 1u : 0u;
+    desc->ready = 1u;
+    return true;
+}
+
+static bool qwen36_superlayer_l0_moe_router_requested() {
+    return qwen36_superlayer_replace_l0_all_stages_requested() ||
+        qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_MOE_ROUTER", 0) != 0;
+}
+
+static bool qwen36_superlayer_make_l0_moe_router_desc(
+        const ggml_cgraph * cgraph,
+        const qwen36_superlayer_plan & plan,
+        const qwen36_superlayer_pack_plan & pack,
+        const int device,
+        qwen36_superlayer_l0_moe_router_desc * desc,
+        std::string * blocker) {
+    if (desc == nullptr) {
+        if (blocker != nullptr) {
+            *blocker = "missing L0 MoE router descriptor output";
+        }
+        return false;
+    }
+    *desc = qwen36_superlayer_l0_moe_router_desc{};
+
+    const bool requested = qwen36_superlayer_l0_moe_router_requested();
+    if (!requested) {
+        return true;
+    }
+
+    const int begin = plan.layer_start[0] >= 0 ? plan.layer_start[0] : 0;
+    const int end   = plan.layer_end[0]   >= begin ? plan.layer_end[0]   : cgraph->n_nodes - 1;
+    const ggml_tensor * attn_post_norm = nullptr;
+    const ggml_tensor * logits = nullptr;
+    const ggml_tensor * probs = nullptr;
+    const ggml_tensor * argsort = nullptr;
+    const ggml_tensor * topk = nullptr;
+    const ggml_tensor * weights = nullptr;
+    const ggml_tensor * weights_sum = nullptr;
+    const ggml_tensor * weights_sum_clamped = nullptr;
+    const ggml_tensor * weights_norm = nullptr;
+    const ggml_tensor * weights_scaled = nullptr;
+    const ggml_tensor * unsupported = nullptr;
+    for (int i = begin; i <= end; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (attn_post_norm == nullptr && tensor_name_matches_layer(node, "attn_post_norm", 0)) {
+            attn_post_norm = node;
+        } else if (logits == nullptr && tensor_name_matches_layer(node, "ffn_moe_logits", 0)) {
+            logits = node;
+        } else if (probs == nullptr && tensor_name_matches_layer(node, "ffn_moe_probs", 0)) {
+            probs = node;
+        } else if (argsort == nullptr && tensor_name_matches_layer(node, "ffn_moe_argsort", 0)) {
+            argsort = node;
+        } else if (topk == nullptr && tensor_name_matches_layer(node, "ffn_moe_topk", 0)) {
+            topk = node;
+        } else if (weights == nullptr && tensor_name_matches_layer(node, "ffn_moe_weights", 0)) {
+            weights = node;
+        } else if (weights_sum == nullptr && tensor_name_matches_layer(node, "ffn_moe_weights_sum", 0)) {
+            weights_sum = node;
+        } else if (weights_sum_clamped == nullptr && tensor_name_matches_layer(node, "ffn_moe_weights_sum_clamped", 0)) {
+            weights_sum_clamped = node;
+        } else if (weights_norm == nullptr && tensor_name_matches_layer(node, "ffn_moe_weights_norm", 0)) {
+            weights_norm = node;
+        } else if (weights_scaled == nullptr && tensor_name_matches_layer(node, "ffn_moe_weights_scaled", 0)) {
+            weights_scaled = node;
+        } else if (tensor_name_matches_layer(node, "ffn_moe_logits_biased", 0) ||
+                tensor_name_matches_layer(node, "ffn_moe_probs_biased", 0) ||
+                tensor_name_matches_layer(node, "ffn_moe_probs_masked", 0) ||
+                tensor_name_matches_layer(node, "ffn_moe_group_topk", 0) ||
+                tensor_name_matches_layer(node, "ffn_moe_weights_softmax", 0)) {
+            unsupported = node;
+        }
+    }
+
+    if (unsupported != nullptr) {
+        if (blocker != nullptr) {
+            *blocker = "L0 MoE router fusion does not support biased/grouped/delayed router node: ";
+            *blocker += unsupported->name;
+        }
+        return false;
+    }
+    if (attn_post_norm == nullptr || logits == nullptr || probs == nullptr ||
+            argsort == nullptr || topk == nullptr || weights == nullptr) {
+        if (blocker != nullptr) {
+            *blocker = "L0 MoE router fusion requires attn_post_norm-0 and ffn_moe logits/probs/topk/weights";
+        }
+        return false;
+    }
+
+    const ggml_tensor * scale = nullptr;
+    const ggml_tensor * mm = qwen36_superlayer_resolve_mul_mat_with_scale(logits, &scale);
+    const ggml_tensor * logits_out = qwen36_superlayer_strip_view_ops(logits);
+    if (mm == nullptr || mm->src[0] == nullptr || mm->src[1] == nullptr || logits_out == nullptr) {
+        if (blocker != nullptr) {
+            *blocker = "L0 MoE router fusion could not resolve ffn_moe_logits-0 to MUL_MAT";
+        }
+        return false;
+    }
+    if (!qwen36_superlayer_same_tensor_or_view(mm->src[1], attn_post_norm)) {
+        if (blocker != nullptr) {
+            *blocker = "L0 MoE router logits input is not attn_post_norm-0";
+        }
+        return false;
+    }
+    if (probs->op != GGML_OP_SOFT_MAX || probs->src[0] == nullptr ||
+            !qwen36_superlayer_same_tensor_or_view(probs->src[0], logits)) {
+        if (blocker != nullptr) {
+            *blocker = "L0 MoE router fusion currently requires SOFT_MAX(ffn_moe_logits-0)";
+        }
+        return false;
+    }
+    if (argsort->op != GGML_OP_ARGSORT || argsort->src[0] == nullptr ||
+            !qwen36_superlayer_same_tensor_or_view(argsort->src[0], probs)) {
+        if (blocker != nullptr) {
+            *blocker = "L0 MoE router fusion requires ARGSORT(ffn_moe_probs-0)";
+        }
+        return false;
+    }
+    if (topk->op != GGML_OP_VIEW || topk->src[0] == nullptr ||
+            !qwen36_superlayer_same_tensor_or_view(topk->src[0], argsort)) {
+        if (blocker != nullptr) {
+            *blocker = "L0 MoE router fusion requires ffn_moe_topk-0 VIEW of ffn_moe_argsort-0";
+        }
+        return false;
+    }
+    if (weights->op != GGML_OP_GET_ROWS || weights->src[0] == nullptr || weights->src[1] == nullptr ||
+            !qwen36_superlayer_same_tensor_or_view(weights->src[0], probs) ||
+            !qwen36_superlayer_same_tensor_or_view(weights->src[1], topk)) {
+        if (blocker != nullptr) {
+            *blocker = "L0 MoE router fusion requires GET_ROWS(reshape(ffn_moe_probs-0), ffn_moe_topk-0)";
+        }
+        return false;
+    }
+
+    const bool has_norm =
+        weights_sum != nullptr || weights_sum_clamped != nullptr || weights_norm != nullptr;
+    if (has_norm &&
+            (weights_sum == nullptr || weights_sum_clamped == nullptr || weights_norm == nullptr)) {
+        if (blocker != nullptr) {
+            *blocker = "L0 MoE router fusion requires the complete weights sum/clamp/div normalization chain";
+        }
+        return false;
+    }
+    if (has_norm) {
+        if (weights_sum->op != GGML_OP_SUM_ROWS || weights_sum->src[0] == nullptr ||
+                !qwen36_superlayer_same_tensor_or_view(weights_sum->src[0], weights) ||
+                weights_sum_clamped->op != GGML_OP_CLAMP || weights_sum_clamped->src[0] != weights_sum ||
+                weights_norm->op != GGML_OP_DIV || weights_norm->src[0] == nullptr ||
+                !qwen36_superlayer_same_tensor_or_view(weights_norm->src[0], weights) ||
+                weights_norm->src[1] != weights_sum_clamped) {
+            if (blocker != nullptr) {
+                *blocker = "L0 MoE router fusion weights normalization chain has unexpected topology";
+            }
+            return false;
+        }
+    }
+    if (weights_scaled != nullptr) {
+        const ggml_tensor * expected = has_norm ? weights_norm : weights;
+        if (weights_scaled->op != GGML_OP_SCALE || weights_scaled->src[0] == nullptr ||
+                !qwen36_superlayer_same_tensor_or_view(weights_scaled->src[0], expected) ||
+                ggml_get_op_params_f32(weights_scaled, 1) != 0.0f) {
+            if (blocker != nullptr) {
+                *blocker = "L0 MoE router fusion requires SCALE(weights) with zero bias";
+            }
+            return false;
+        }
+    }
+
+    const ggml_tensor * w = mm->src[0];
+    if (!qwen36_superlayer_projection_weight_supported(w)) {
+        if (blocker != nullptr) {
+            *blocker = "L0 MoE router weight type is not implemented in the superlayer";
+        }
+        return false;
+    }
+    if (mm->src[1]->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 ||
+            logits_out->type != GGML_TYPE_F32 || logits->type != GGML_TYPE_F32 ||
+            probs->type != GGML_TYPE_F32 || weights->type != GGML_TYPE_F32 ||
+            argsort->type != GGML_TYPE_I32 || topk->type != GGML_TYPE_I32 ||
+            (scale != nullptr && scale->type != GGML_TYPE_F32) ||
+            (weights_sum != nullptr && weights_sum->type != GGML_TYPE_F32) ||
+            (weights_sum_clamped != nullptr && weights_sum_clamped->type != GGML_TYPE_F32) ||
+            (weights_norm != nullptr && weights_norm->type != GGML_TYPE_F32) ||
+            (weights_scaled != nullptr && weights_scaled->type != GGML_TYPE_F32)) {
+        if (blocker != nullptr) {
+            *blocker = "L0 MoE router fusion currently requires F32 logits/probs/weights and I32 ids";
+        }
+        return false;
+    }
+
+    const int64_t n_embd = w->ne[0];
+    const int64_t n_expert = mm->ne[0];
+    const int64_t n_expert_used = ggml_nelements(topk);
+    if (n_embd <= 0 || n_expert <= 0 || n_expert_used <= 0 || n_expert_used > n_expert ||
+            n_expert_used > 64 ||
+            w->ne[1] != n_expert ||
+            mm->src[1]->ne[0] != n_embd ||
+            ggml_nelements(mm->src[1]) != n_embd ||
+            ggml_nelements(attn_post_norm) != n_embd ||
+            ggml_nelements(mm) != n_expert ||
+            ggml_nelements(logits_out) != n_expert ||
+            ggml_nelements(logits) != n_expert ||
+            ggml_nelements(probs) != n_expert ||
+            ggml_nelements(argsort) < n_expert_used ||
+            ggml_nelements(weights) != n_expert_used ||
+            (scale != nullptr && ggml_nelements(scale) != 1 && ggml_nelements(scale) != n_expert) ||
+            (weights_sum != nullptr && ggml_nelements(weights_sum) != 1) ||
+            (weights_sum_clamped != nullptr && ggml_nelements(weights_sum_clamped) != 1) ||
+            (weights_norm != nullptr && ggml_nelements(weights_norm) != n_expert_used) ||
+            (weights_scaled != nullptr && ggml_nelements(weights_scaled) != n_expert_used)) {
+        if (blocker != nullptr) {
+            *blocker = "L0 MoE router tensor dimensions do not match one-token decode";
+        }
+        return false;
+    }
+    if (mm->src[1]->nb[0] != (int64_t) sizeof(float) ||
+            attn_post_norm->nb[0] != (int64_t) sizeof(float) ||
+            mm->nb[0] != (int64_t) sizeof(float) ||
+            logits_out->nb[0] != (int64_t) sizeof(float) ||
+            logits->nb[0] != (int64_t) sizeof(float) ||
+            probs->nb[0] != (int64_t) sizeof(float) ||
+            argsort->nb[0] != (int64_t) sizeof(int32_t) ||
+            topk->nb[0] != (int64_t) sizeof(int32_t) ||
+            weights->nb[0] != (int64_t) sizeof(float) ||
+            (scale != nullptr && scale->nb[0] != (int64_t) sizeof(float)) ||
+            (weights_sum != nullptr && weights_sum->nb[0] != (int64_t) sizeof(float)) ||
+            (weights_sum_clamped != nullptr && weights_sum_clamped->nb[0] != (int64_t) sizeof(float)) ||
+            (weights_norm != nullptr && weights_norm->nb[0] != (int64_t) sizeof(float)) ||
+            (weights_scaled != nullptr && weights_scaled->nb[0] != (int64_t) sizeof(float)) ||
+            !ggml_is_contiguous(mm->src[1]) ||
+            !ggml_is_contiguous(attn_post_norm) ||
+            !ggml_is_contiguous_1(mm) ||
+            !ggml_is_contiguous_1(logits_out) ||
+            !ggml_is_contiguous_1(logits) ||
+            !ggml_is_contiguous_1(probs) ||
+            !ggml_is_contiguous_1(argsort) ||
+            !ggml_is_contiguous_1(topk) ||
+            !ggml_is_contiguous_1(weights) ||
+            (scale != nullptr && !ggml_is_contiguous_1(scale)) ||
+            (weights_sum != nullptr && !ggml_is_contiguous_1(weights_sum)) ||
+            (weights_sum_clamped != nullptr && !ggml_is_contiguous_1(weights_sum_clamped)) ||
+            (weights_norm != nullptr && !ggml_is_contiguous_1(weights_norm)) ||
+            (weights_scaled != nullptr && !ggml_is_contiguous_1(weights_scaled))) {
+        if (blocker != nullptr) {
+            *blocker = "L0 MoE router fusion requires dense one-token F32/I32 layout";
+        }
+        return false;
+    }
+    if (!qwen36_superlayer_tensor_data_on_device(mm->src[1], device, "L0 MoE router input", blocker) ||
+            (mm->src[1] != attn_post_norm &&
+             !qwen36_superlayer_tensor_data_on_device(attn_post_norm, device, "L0 MoE router attn_post_norm", blocker)) ||
+            !qwen36_superlayer_tensor_data_on_device(logits_out, device, "L0 MoE logits output", blocker) ||
+            (mm != logits_out && mm != logits &&
+             !qwen36_superlayer_tensor_data_on_device(mm, device, "L0 MoE logits math output", blocker)) ||
+            (logits != logits_out &&
+             !qwen36_superlayer_tensor_data_on_device(logits, device, "L0 MoE logits named output", blocker)) ||
+            !qwen36_superlayer_tensor_data_on_device(probs, device, "L0 MoE probs output", blocker) ||
+            !qwen36_superlayer_tensor_data_on_device(argsort, device, "L0 MoE argsort output", blocker) ||
+            !qwen36_superlayer_tensor_data_on_device(topk, device, "L0 MoE topk output", blocker) ||
+            !qwen36_superlayer_tensor_data_on_device(weights, device, "L0 MoE weights output", blocker) ||
+            (weights_sum != nullptr &&
+             !qwen36_superlayer_tensor_data_on_device(weights_sum, device, "L0 MoE weights sum output", blocker)) ||
+            (weights_sum_clamped != nullptr &&
+             !qwen36_superlayer_tensor_data_on_device(weights_sum_clamped, device, "L0 MoE weights sum clamped output", blocker)) ||
+            (weights_norm != nullptr &&
+             !qwen36_superlayer_tensor_data_on_device(weights_norm, device, "L0 MoE weights norm output", blocker)) ||
+            (weights_scaled != nullptr &&
+             !qwen36_superlayer_tensor_data_on_device(weights_scaled, device, "L0 MoE weights scaled output", blocker))) {
+        return false;
+    }
+
+    const bool use_direct_weights = qwen36_superlayer_direct_l0_moe_weights_requested();
+    uint64_t w_offset = 0;
+    uint64_t scale_offset = 0;
+    if (!qwen36_superlayer_find_pack_offset_named(pack, w, "L0 MoE router weight", &w_offset, blocker)) {
+        return false;
+    }
+    if (scale != nullptr &&
+            !qwen36_superlayer_find_pack_offset_named(pack, scale, "L0 MoE router post scale", &scale_offset, blocker)) {
+        return false;
+    }
+    if (use_direct_weights) {
+        if (!qwen36_superlayer_tensor_data_on_device(w, device, "L0 MoE router weight", blocker) ||
+                (scale != nullptr &&
+                 !qwen36_superlayer_tensor_data_on_device(scale, device, "L0 MoE router post scale", blocker))) {
+            return false;
+        }
+    }
+
+    desc->x = (const float *) mm->src[1]->data;
+    desc->logits_math_dst = mm != logits_out && mm != logits &&
+        mm->data != logits_out->data && mm->data != logits->data ? (float *) mm->data : nullptr;
+    desc->logits_dst = (float *) logits_out->data;
+    desc->logits_named_dst = logits != logits_out && logits->data != logits_out->data ?
+        (float *) logits->data : nullptr;
+    desc->probs_dst = (float *) probs->data;
+    desc->argsort_dst = (int32_t *) argsort->data;
+    desc->topk_dst = (int32_t *) topk->data;
+    desc->weights_dst = (float *) weights->data;
+    desc->weights_sum_dst = weights_sum != nullptr ? (float *) weights_sum->data : nullptr;
+    desc->weights_sum_clamped_dst = weights_sum_clamped != nullptr ? (float *) weights_sum_clamped->data : nullptr;
+    desc->weights_norm_dst = weights_norm != nullptr ? (float *) weights_norm->data : nullptr;
+    desc->weights_scaled_dst = weights_scaled != nullptr ? (float *) weights_scaled->data : nullptr;
+    desc->w_data = (const char *) w->data;
+    desc->scale_data = scale != nullptr ? (const float *) scale->data : nullptr;
+    desc->w_offset = w_offset;
+    desc->scale_offset = scale_offset;
+    desc->w_nb1 = (uint64_t) w->nb[1];
+    desc->n_embd = (uint32_t) n_embd;
+    desc->n_expert = (uint32_t) n_expert;
+    desc->n_expert_used = (uint32_t) n_expert_used;
+    desc->w_type = (int32_t) w->type;
+    desc->scale_n = scale != nullptr ? (uint32_t) ggml_nelements(scale) : 0u;
+    desc->weights_scale = weights_scaled != nullptr ? ggml_get_op_params_f32(weights_scaled, 0) : 1.0f;
+    desc->clamp_min = weights_sum_clamped != nullptr ? ggml_get_op_params_f32(weights_sum_clamped, 0) : 0.0f;
+    desc->has_scale = scale != nullptr ? 1u : 0u;
+    desc->has_weights_sum = weights_sum != nullptr ? 1u : 0u;
+    desc->has_weights_norm = weights_norm != nullptr ? 1u : 0u;
+    desc->has_weights_scaled = weights_scaled != nullptr ? 1u : 0u;
+    desc->use_direct_weights = use_direct_weights ? 1u : 0u;
+    desc->ready = 1u;
+    return true;
+}
+
+static bool qwen36_superlayer_l0_moe_gate_up_requested() {
+    return qwen36_superlayer_replace_l0_all_stages_requested() ||
+        qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_MOE_GATE_UP", 0) != 0;
+}
+
+static bool qwen36_superlayer_make_l0_moe_gate_up_desc(
+        const ggml_cgraph * cgraph,
+        const qwen36_superlayer_plan & plan,
+        const qwen36_superlayer_pack_plan & pack,
+        const int device,
+        qwen36_superlayer_l0_moe_gate_up_desc * desc,
+        std::string * blocker) {
+    if (desc == nullptr) {
+        if (blocker != nullptr) {
+            *blocker = "missing L0 MoE gate/up descriptor output";
+        }
+        return false;
+    }
+    *desc = qwen36_superlayer_l0_moe_gate_up_desc{};
+
+    const bool requested = qwen36_superlayer_l0_moe_gate_up_requested();
+    if (!requested) {
+        return true;
+    }
+
+    const int begin = plan.layer_start[0] >= 0 ? plan.layer_start[0] : 0;
+    const int end   = plan.layer_end[0]   >= begin ? plan.layer_end[0]   : cgraph->n_nodes - 1;
+    const ggml_tensor * attn_post_norm = nullptr;
+    const ggml_tensor * topk = nullptr;
+    const ggml_tensor * gate_up = nullptr;
+    const ggml_tensor * gate = nullptr;
+    const ggml_tensor * up = nullptr;
+    const ggml_tensor * swiglu = nullptr;
+    const ggml_tensor * unsupported = nullptr;
+    for (int i = begin; i <= end; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (attn_post_norm == nullptr && tensor_name_matches_layer(node, "attn_post_norm", 0)) {
+            attn_post_norm = node;
+        } else if (topk == nullptr && tensor_name_matches_layer(node, "ffn_moe_topk", 0)) {
+            topk = node;
+        } else if (gate_up == nullptr && tensor_name_matches_layer(node, "ffn_moe_gate_up", 0)) {
+            gate_up = node;
+        } else if (gate == nullptr && tensor_name_matches_layer(node, "ffn_moe_gate", 0)) {
+            gate = node;
+        } else if (up == nullptr && tensor_name_matches_layer(node, "ffn_moe_up", 0)) {
+            up = node;
+        } else if (swiglu == nullptr && tensor_name_matches_layer(node, "ffn_moe_swiglu", 0)) {
+            swiglu = node;
+        } else if (tensor_name_matches_layer(node, "ffn_moe_gate_up_biased", 0) ||
+                tensor_name_matches_layer(node, "ffn_moe_gate_up_scaled", 0) ||
+                tensor_name_matches_layer(node, "ffn_moe_gate_biased", 0) ||
+                tensor_name_matches_layer(node, "ffn_moe_gate_scaled", 0) ||
+                tensor_name_matches_layer(node, "ffn_moe_up_biased", 0) ||
+                tensor_name_matches_layer(node, "ffn_moe_up_scaled", 0) ||
+                tensor_name_matches_layer(node, "ffn_moe_silu", 0) ||
+                tensor_name_matches_layer(node, "ffn_moe_geglu", 0) ||
+                tensor_name_matches_layer(node, "ffn_moe_reglu", 0) ||
+                tensor_name_matches_layer(node, "ffn_moe_swiglu_oai", 0) ||
+                tensor_name_matches_layer(node, "ffn_moe_swiglu_limited", 0)) {
+            unsupported = node;
+        }
+    }
+
+    if (unsupported != nullptr) {
+        if (blocker != nullptr) {
+            *blocker = "L0 MoE gate/up fusion does not support biased/scaled/non-SwiGLU node: ";
+            *blocker += unsupported->name;
+        }
+        return false;
+    }
+    if (attn_post_norm == nullptr || topk == nullptr || gate_up == nullptr ||
+            gate == nullptr || up == nullptr || swiglu == nullptr) {
+        if (blocker != nullptr) {
+            *blocker = "L0 MoE gate/up fusion requires attn_post_norm/topk/gate_up/gate/up/swiglu nodes";
+        }
+        return false;
+    }
+    if (gate_up->op != GGML_OP_MUL_MAT_ID || gate_up->src[0] == nullptr ||
+            gate_up->src[1] == nullptr || gate_up->src[2] == nullptr ||
+            !qwen36_superlayer_same_tensor_or_view(gate_up->src[1], attn_post_norm) ||
+            !qwen36_superlayer_same_tensor_or_view(gate_up->src[2], topk)) {
+        if (blocker != nullptr) {
+            *blocker = "L0 MoE gate/up fusion requires MUL_MAT_ID(weight, reshape(attn_post_norm-0), ffn_moe_topk-0)";
+        }
+        return false;
+    }
+    if (gate->op != GGML_OP_VIEW || up->op != GGML_OP_VIEW ||
+            gate->src[0] != gate_up || up->src[0] != gate_up ||
+            swiglu->op != GGML_OP_GLU ||
+            ggml_get_glu_op(swiglu) != GGML_GLU_OP_SWIGLU ||
+            ggml_get_op_params_i32(swiglu, 1) != 0 ||
+            swiglu->src[0] != gate || swiglu->src[1] != up) {
+        if (blocker != nullptr) {
+            *blocker = "L0 MoE gate/up fusion requires gate/up views followed by SWIGLU";
+        }
+        return false;
+    }
+
+    const ggml_tensor * w = gate_up->src[0];
+    if (!qwen36_superlayer_projection_weight_supported(w)) {
+        if (blocker != nullptr) {
+            *blocker = "L0 MoE gate/up weight type is not implemented in the superlayer";
+        }
+        return false;
+    }
+    if (gate_up->src[1]->type != GGML_TYPE_F32 || gate_up->src[2]->type != GGML_TYPE_I32 ||
+            gate_up->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 ||
+            up->type != GGML_TYPE_F32 || swiglu->type != GGML_TYPE_F32) {
+        if (blocker != nullptr) {
+            *blocker = "L0 MoE gate/up fusion currently requires F32 activations and I32 ids";
+        }
+        return false;
+    }
+
+    const int64_t n_embd = w->ne[0];
+    const int64_t n_ff2 = gate_up->ne[0];
+    const int64_t n_expert_used = gate_up->ne[1];
+    const int64_t n_tokens = gate_up->ne[2];
+    const int64_t n_expert = w->ne[2];
+    if (n_embd <= 0 || n_ff2 <= 0 || (n_ff2 % 2) != 0 || n_expert <= 0 ||
+            n_expert_used <= 0 || n_expert_used > 64 || n_tokens != 1 ||
+            w->ne[1] != n_ff2 || gate_up->src[1]->ne[0] != n_embd ||
+            ggml_nelements(gate_up->src[1]) != n_embd ||
+            ggml_nelements(attn_post_norm) != n_embd ||
+            ggml_nelements(topk) != n_expert_used ||
+            gate->ne[0] != n_ff2/2 || up->ne[0] != n_ff2/2 ||
+            gate->ne[1] != n_expert_used || up->ne[1] != n_expert_used ||
+            gate->ne[2] != 1 || up->ne[2] != 1 ||
+            swiglu->ne[0] != n_ff2/2 || swiglu->ne[1] != n_expert_used ||
+            swiglu->ne[2] != 1) {
+        if (blocker != nullptr) {
+            *blocker = "L0 MoE gate/up tensor dimensions do not match one-token decode";
+        }
+        return false;
+    }
+    if (gate_up->src[1]->nb[0] != (int64_t) sizeof(float) ||
+            gate_up->src[2]->nb[0] != (int64_t) sizeof(int32_t) ||
+            attn_post_norm->nb[0] != (int64_t) sizeof(float) ||
+            gate_up->nb[0] != (int64_t) sizeof(float) ||
+            gate->nb[0] != (int64_t) sizeof(float) ||
+            up->nb[0] != (int64_t) sizeof(float) ||
+            swiglu->nb[0] != (int64_t) sizeof(float) ||
+            !ggml_is_contiguous(gate_up->src[1]) ||
+            !ggml_is_contiguous_1(gate_up->src[2]) ||
+            !ggml_is_contiguous(attn_post_norm) ||
+            !ggml_is_contiguous_1(gate_up) ||
+            !ggml_is_contiguous_1(gate) ||
+            !ggml_is_contiguous_1(up) ||
+            !ggml_is_contiguous_1(swiglu)) {
+        if (blocker != nullptr) {
+            *blocker = "L0 MoE gate/up fusion requires dense one-token F32/I32 layout";
+        }
+        return false;
+    }
+    if (!qwen36_superlayer_tensor_data_on_device(gate_up->src[1], device, "L0 MoE gate/up input", blocker) ||
+            (gate_up->src[1] != attn_post_norm &&
+             !qwen36_superlayer_tensor_data_on_device(attn_post_norm, device, "L0 MoE gate/up attn_post_norm", blocker)) ||
+            !qwen36_superlayer_tensor_data_on_device(gate_up->src[2], device, "L0 MoE gate/up ids", blocker) ||
+            !qwen36_superlayer_tensor_data_on_device(gate_up, device, "L0 MoE gate_up output", blocker) ||
+            !qwen36_superlayer_tensor_data_on_device(gate, device, "L0 MoE gate view", blocker) ||
+            !qwen36_superlayer_tensor_data_on_device(up, device, "L0 MoE up view", blocker) ||
+            !qwen36_superlayer_tensor_data_on_device(swiglu, device, "L0 MoE swiglu output", blocker)) {
+        return false;
+    }
+
+    const bool use_direct_weights = qwen36_superlayer_direct_l0_moe_weights_requested();
+    uint64_t w_offset = 0;
+    if (!qwen36_superlayer_find_pack_offset_named(pack, w, "L0 MoE gate/up weight", &w_offset, blocker)) {
+        return false;
+    }
+    if (use_direct_weights &&
+            !qwen36_superlayer_tensor_data_on_device(w, device, "L0 MoE gate/up weight", blocker)) {
+        return false;
+    }
+
+    desc->x = (const float *) gate_up->src[1]->data;
+    desc->ids = (const int32_t *) gate_up->src[2]->data;
+    desc->gate_up_dst = (float *) gate_up->data;
+    desc->gate_dst = (float *) gate->data;
+    desc->up_dst = (float *) up->data;
+    desc->swiglu_dst = (float *) swiglu->data;
+    desc->w_data = (const char *) w->data;
+    desc->w_offset = w_offset;
+    desc->w_nb1 = (uint64_t) w->nb[1];
+    desc->w_nb2 = (uint64_t) w->nb[2];
+    desc->gate_up_nb1 = (uint64_t) gate_up->nb[1];
+    desc->gate_nb1 = (uint64_t) gate->nb[1];
+    desc->up_nb1 = (uint64_t) up->nb[1];
+    desc->swiglu_nb1 = (uint64_t) swiglu->nb[1];
+    desc->n_embd = (uint32_t) n_embd;
+    desc->n_ff = (uint32_t) (n_ff2/2);
+    desc->n_expert = (uint32_t) n_expert;
+    desc->n_expert_used = (uint32_t) n_expert_used;
+    desc->w_type = (int32_t) w->type;
+    desc->use_direct_weights = use_direct_weights ? 1u : 0u;
+    desc->ready = 1u;
+    return true;
+}
+
+static bool qwen36_superlayer_l0_moe_down_requested() {
+    return qwen36_superlayer_replace_l0_all_stages_requested() ||
+        qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_MOE_DOWN", 0) != 0;
+}
+
+static bool qwen36_superlayer_make_l0_moe_down_desc(
+        const ggml_cgraph * cgraph,
+        const qwen36_superlayer_plan & plan,
+        const qwen36_superlayer_pack_plan & pack,
+        const int device,
+        qwen36_superlayer_l0_moe_down_desc * desc,
+        std::string * blocker) {
+    if (desc == nullptr) {
+        if (blocker != nullptr) {
+            *blocker = "missing L0 MoE down descriptor output";
+        }
+        return false;
+    }
+    *desc = qwen36_superlayer_l0_moe_down_desc{};
+
+    const bool requested = qwen36_superlayer_l0_moe_down_requested();
+    if (!requested) {
+        return true;
+    }
+
+    const int begin = plan.layer_start[0] >= 0 ? plan.layer_start[0] : 0;
+    const int end   = plan.layer_end[0]   >= begin ? plan.layer_end[0]   : cgraph->n_nodes - 1;
+    const ggml_tensor * swiglu = nullptr;
+    const ggml_tensor * topk = nullptr;
+    const ggml_tensor * down = nullptr;
+    const ggml_tensor * weighted = nullptr;
+    const ggml_tensor * out = nullptr;
+    const ggml_tensor * unsupported = nullptr;
+    int down_idx = -1;
+    int weighted_idx = -1;
+    int out_idx = -1;
+    for (int i = begin; i <= end; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (swiglu == nullptr && tensor_name_matches_layer(node, "ffn_moe_swiglu", 0)) {
+            swiglu = node;
+        } else if (topk == nullptr && tensor_name_matches_layer(node, "ffn_moe_topk", 0)) {
+            topk = node;
+        } else if (down == nullptr && tensor_name_matches_layer(node, "ffn_moe_down", 0)) {
+            down = node;
+            down_idx = i;
+        } else if (weighted == nullptr && tensor_name_matches_layer(node, "ffn_moe_weighted", 0)) {
+            weighted = node;
+            weighted_idx = i;
+        } else if (out == nullptr && tensor_name_matches_layer(node, "ffn_moe_out", 0)) {
+            out = node;
+            out_idx = i;
+        } else if (tensor_name_matches_layer(node, "ffn_moe_down_biased", 0) ||
+                tensor_name_matches_layer(node, "ffn_moe_down_scaled", 0)) {
+            unsupported = node;
+        }
+    }
+
+    if (unsupported != nullptr) {
+        if (blocker != nullptr) {
+            *blocker = "L0 MoE down fusion does not support biased/scaled down node: ";
+            *blocker += unsupported->name;
+        }
+        return false;
+    }
+    if (swiglu == nullptr || topk == nullptr || down == nullptr || weighted == nullptr || out == nullptr ||
+            down_idx < 0 || weighted_idx < 0 || out_idx < 0) {
+        if (blocker != nullptr) {
+            *blocker = "L0 MoE down fusion requires swiglu/topk/down/weighted/out nodes";
+        }
+        return false;
+    }
+    if (down->op != GGML_OP_MUL_MAT_ID || down->src[0] == nullptr ||
+            down->src[1] == nullptr || down->src[2] == nullptr ||
+            !qwen36_superlayer_same_tensor_or_view(down->src[1], swiglu) ||
+            !qwen36_superlayer_same_tensor_or_view(down->src[2], topk)) {
+        if (blocker != nullptr) {
+            *blocker = "L0 MoE down fusion requires MUL_MAT_ID(weight, ffn_moe_swiglu-0, ffn_moe_topk-0)";
+        }
+        return false;
+    }
+
+    auto is_factor_tensor = [](const ggml_tensor * tensor, const int64_t n_expert_used, const int64_t n_tokens) {
+        return tensor != nullptr &&
+            tensor->type == GGML_TYPE_F32 &&
+            tensor->ne[0] == 1 &&
+            tensor->ne[1] == n_expert_used &&
+            tensor->ne[2] == n_tokens;
+    };
+    auto mul_factor = [&](const ggml_tensor * mul, const ggml_tensor * expected,
+            const int64_t n_expert_used, const int64_t n_tokens, const ggml_tensor *& factor) {
+        if (mul == nullptr || mul->op != GGML_OP_MUL || mul->type != GGML_TYPE_F32) {
+            return false;
+        }
+        if (mul->src[0] == expected && is_factor_tensor(mul->src[1], n_expert_used, n_tokens)) {
+            factor = mul->src[1];
+            return true;
+        }
+        if (mul->src[1] == expected && is_factor_tensor(mul->src[0], n_expert_used, n_tokens)) {
+            factor = mul->src[0];
+            return true;
+        }
+        return false;
+    };
+
+    const int64_t n_embd = down->ne[0];
+    const int64_t n_expert_used = down->ne[1];
+    const int64_t n_tokens = down->ne[2];
+    const ggml_tensor * weights = nullptr;
+    if (!mul_factor(weighted, down, n_expert_used, n_tokens, weights)) {
+        if (blocker != nullptr) {
+            *blocker = "L0 MoE down fusion requires ffn_moe_weighted-0 = ffn_moe_down-0 * weights";
+        }
+        return false;
+    }
+
+    const int views_start = weighted_idx + 1;
+    const int adds_start = views_start + (int) n_expert_used;
+    const int last_node = adds_start + (int) n_expert_used - 2;
+    if (last_node != out_idx || last_node >= cgraph->n_nodes) {
+        if (blocker != nullptr) {
+            *blocker = "L0 MoE down fusion requires ffn_moe_out-0 to terminate the weighted view/add tail";
+        }
+        return false;
+    }
+
+    for (int i = 0; i < (int) n_expert_used; ++i) {
+        const ggml_tensor * view = cgraph->nodes[views_start + i];
+        if (view->op != GGML_OP_VIEW || view->src[0] != weighted || view->view_src != weighted ||
+                view->type != GGML_TYPE_F32 || view->ne[0] != n_embd || view->ne[1] != n_tokens ||
+                view->nb[0] != weighted->nb[0] || view->nb[1] != weighted->nb[2] ||
+                view->view_offs != size_t(i)*weighted->nb[1]) {
+            if (blocker != nullptr) {
+                *blocker = "L0 MoE down fusion requires ordered expert views of ffn_moe_weighted-0";
+            }
+            return false;
+        }
+    }
+    const ggml_tensor * prev = cgraph->nodes[views_start];
+    for (int i = 1; i < (int) n_expert_used; ++i) {
+        const ggml_tensor * add = cgraph->nodes[adds_start + i - 1];
+        if (add->op != GGML_OP_ADD || add->src[0] != prev || add->src[1] != cgraph->nodes[views_start + i] ||
+                add->type != GGML_TYPE_F32 || add->ne[0] != n_embd || add->ne[1] != n_tokens) {
+            if (blocker != nullptr) {
+                *blocker = "L0 MoE down fusion requires ordered add tail ending at ffn_moe_out-0";
+            }
+            return false;
+        }
+        prev = add;
+    }
+
+    const ggml_tensor * w = down->src[0];
+    if (!qwen36_superlayer_projection_weight_supported(w)) {
+        if (blocker != nullptr) {
+            *blocker = "L0 MoE down weight type is not implemented in the superlayer";
+        }
+        return false;
+    }
+    if (down->src[1]->type != GGML_TYPE_F32 || down->src[2]->type != GGML_TYPE_I32 ||
+            down->type != GGML_TYPE_F32 || weighted->type != GGML_TYPE_F32 || out->type != GGML_TYPE_F32) {
+        if (blocker != nullptr) {
+            *blocker = "L0 MoE down fusion currently requires F32 activations and I32 ids";
+        }
+        return false;
+    }
+
+    const int64_t n_ff = w->ne[0];
+    const int64_t n_expert = w->ne[2];
+    if (n_embd <= 0 || n_ff <= 0 || n_expert <= 0 ||
+            n_expert_used <= 0 || n_expert_used > 64 || n_tokens != 1 ||
+            w->ne[1] != n_embd || down->src[1]->ne[0] != n_ff ||
+            down->src[1]->ne[1] != n_expert_used || down->src[1]->ne[2] != 1 ||
+            ggml_nelements(topk) != n_expert_used ||
+            down->ne[0] != n_embd || down->ne[1] != n_expert_used || down->ne[2] != 1 ||
+            weighted->ne[0] != n_embd || weighted->ne[1] != n_expert_used || weighted->ne[2] != 1 ||
+            out->ne[0] != n_embd || out->ne[1] != 1) {
+        if (blocker != nullptr) {
+            *blocker = "L0 MoE down tensor dimensions do not match one-token decode";
+        }
+        return false;
+    }
+    if (down->src[1]->nb[0] != (int64_t) sizeof(float) ||
+            down->src[2]->nb[0] != (int64_t) sizeof(int32_t) ||
+            weights->nb[0] != (int64_t) sizeof(float) ||
+            down->nb[0] != (int64_t) sizeof(float) ||
+            weighted->nb[0] != (int64_t) sizeof(float) ||
+            out->nb[0] != (int64_t) sizeof(float) ||
+            !ggml_is_contiguous_1(down->src[1]) ||
+            !ggml_is_contiguous_1(down->src[2]) ||
+            !ggml_is_contiguous_1(weights) ||
+            !ggml_is_contiguous_1(down) ||
+            !ggml_is_contiguous_1(weighted) ||
+            !ggml_is_contiguous(out)) {
+        if (blocker != nullptr) {
+            *blocker = "L0 MoE down fusion requires dense one-token F32/I32 layout";
+        }
+        return false;
+    }
+    if (!qwen36_superlayer_tensor_data_on_device(down->src[1], device, "L0 MoE down input", blocker) ||
+            !qwen36_superlayer_tensor_data_on_device(down->src[2], device, "L0 MoE down ids", blocker) ||
+            !qwen36_superlayer_tensor_data_on_device(weights, device, "L0 MoE down weights", blocker) ||
+            !qwen36_superlayer_tensor_data_on_device(down, device, "L0 MoE down output", blocker) ||
+            !qwen36_superlayer_tensor_data_on_device(weighted, device, "L0 MoE weighted output", blocker) ||
+            !qwen36_superlayer_tensor_data_on_device(out, device, "L0 MoE final output", blocker)) {
+        return false;
+    }
+
+    const bool use_direct_weights = qwen36_superlayer_direct_l0_moe_weights_requested();
+    uint64_t w_offset = 0;
+    if (!qwen36_superlayer_find_pack_offset_named(pack, w, "L0 MoE down weight", &w_offset, blocker)) {
+        return false;
+    }
+    if (use_direct_weights &&
+            !qwen36_superlayer_tensor_data_on_device(w, device, "L0 MoE down weight", blocker)) {
+        return false;
+    }
+
+    desc->x = (const float *) down->src[1]->data;
+    desc->ids = (const int32_t *) down->src[2]->data;
+    desc->weights = (const float *) weights->data;
+    desc->down_dst = (float *) down->data;
+    desc->weighted_dst = (float *) weighted->data;
+    desc->out_dst = (float *) out->data;
+    desc->w_data = (const char *) w->data;
+    desc->w_offset = w_offset;
+    desc->w_nb1 = (uint64_t) w->nb[1];
+    desc->w_nb2 = (uint64_t) w->nb[2];
+    desc->x_nb1 = (uint64_t) down->src[1]->nb[1];
+    desc->weights_nb1 = (uint64_t) weights->nb[1];
+    desc->down_nb1 = (uint64_t) down->nb[1];
+    desc->weighted_nb1 = (uint64_t) weighted->nb[1];
+    desc->out_nb1 = (uint64_t) out->nb[1];
+    desc->n_ff = (uint32_t) n_ff;
+    desc->n_embd = (uint32_t) n_embd;
+    desc->n_expert = (uint32_t) n_expert;
+    desc->n_expert_used = (uint32_t) n_expert_used;
+    desc->w_type = (int32_t) w->type;
+    desc->use_direct_weights = use_direct_weights ? 1u : 0u;
+    desc->ready = 1u;
+    return true;
+}
+
 static bool qwen36_superlayer_materialize_device_pack(
         ggml_backend_cuda_context * cuda_ctx,
         const ggml_cgraph * cgraph,
@@ -2141,6 +3586,36 @@ static bool qwen36_superlayer_materialize_device_pack(
     qwen36_superlayer_l0_gdn_desc l0_gdn_host;
     if (!qwen36_superlayer_make_l0_gdn_desc(
                 cgraph, plan, cuda_ctx->device, &l0_gdn_host, blocker)) {
+        return false;
+    }
+    qwen36_superlayer_l0_gated_norm_desc l0_gated_norm_host;
+    if (!qwen36_superlayer_make_l0_gated_norm_desc(
+                cgraph, plan, pack, cuda_ctx->device, &l0_gated_norm_host, blocker)) {
+        return false;
+    }
+    qwen36_superlayer_l0_attn_out_desc l0_attn_out_host;
+    if (!qwen36_superlayer_make_l0_attn_out_desc(
+                cgraph, plan, pack, cuda_ctx->device, &l0_attn_out_host, blocker)) {
+        return false;
+    }
+    qwen36_superlayer_l0_post_attn_desc l0_post_attn_host;
+    if (!qwen36_superlayer_make_l0_post_attn_desc(
+                cgraph, plan, pack, cuda_ctx->device, &l0_post_attn_host, blocker)) {
+        return false;
+    }
+    qwen36_superlayer_l0_moe_router_desc l0_moe_router_host;
+    if (!qwen36_superlayer_make_l0_moe_router_desc(
+                cgraph, plan, pack, cuda_ctx->device, &l0_moe_router_host, blocker)) {
+        return false;
+    }
+    qwen36_superlayer_l0_moe_gate_up_desc l0_moe_gate_up_host;
+    if (!qwen36_superlayer_make_l0_moe_gate_up_desc(
+                cgraph, plan, pack, cuda_ctx->device, &l0_moe_gate_up_host, blocker)) {
+        return false;
+    }
+    qwen36_superlayer_l0_moe_down_desc l0_moe_down_host;
+    if (!qwen36_superlayer_make_l0_moe_down_desc(
+                cgraph, plan, pack, cuda_ctx->device, &l0_moe_down_host, blocker)) {
         return false;
     }
 
@@ -2443,9 +3918,261 @@ static bool qwen36_superlayer_materialize_device_pack(
                 return false;
             }
 
+            qwen36_superlayer_l0_gated_norm_desc * l0_gated_norm = nullptr;
+            err = cudaMalloc((void **) &l0_gated_norm, sizeof(qwen36_superlayer_l0_gated_norm_desc));
+            if (err != cudaSuccess) {
+                (void) cudaFree(l0_gdn);
+                (void) cudaFree(l0_l2);
+                (void) cudaFree(l0_ssm);
+                (void) cudaFree(l0_proj);
+                (void) cudaFree(l0_qkv);
+                (void) cudaFree(l0_norm);
+                (void) cudaFree(io_descs);
+                (void) cudaFree(scratch);
+                (void) cudaFree(layer_descs);
+                (void) cudaFree(data);
+                (void) cudaGetLastError();
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to allocate L0 gated norm descriptor", err);
+                return false;
+            }
+            err = cudaMemcpy(
+                    l0_gated_norm, &l0_gated_norm_host, sizeof(qwen36_superlayer_l0_gated_norm_desc),
+                    cudaMemcpyHostToDevice);
+            if (err != cudaSuccess) {
+                (void) cudaFree(l0_gated_norm);
+                (void) cudaFree(l0_gdn);
+                (void) cudaFree(l0_l2);
+                (void) cudaFree(l0_ssm);
+                (void) cudaFree(l0_proj);
+                (void) cudaFree(l0_qkv);
+                (void) cudaFree(l0_norm);
+                (void) cudaFree(io_descs);
+                (void) cudaFree(scratch);
+                (void) cudaFree(layer_descs);
+                (void) cudaFree(data);
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to upload L0 gated norm descriptor", err);
+                return false;
+            }
+
+            qwen36_superlayer_l0_attn_out_desc * l0_attn_out = nullptr;
+            err = cudaMalloc((void **) &l0_attn_out, sizeof(qwen36_superlayer_l0_attn_out_desc));
+            if (err != cudaSuccess) {
+                (void) cudaFree(l0_gated_norm);
+                (void) cudaFree(l0_gdn);
+                (void) cudaFree(l0_l2);
+                (void) cudaFree(l0_ssm);
+                (void) cudaFree(l0_proj);
+                (void) cudaFree(l0_qkv);
+                (void) cudaFree(l0_norm);
+                (void) cudaFree(io_descs);
+                (void) cudaFree(scratch);
+                (void) cudaFree(layer_descs);
+                (void) cudaFree(data);
+                (void) cudaGetLastError();
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to allocate L0 attention output descriptor", err);
+                return false;
+            }
+            err = cudaMemcpy(
+                    l0_attn_out, &l0_attn_out_host, sizeof(qwen36_superlayer_l0_attn_out_desc),
+                    cudaMemcpyHostToDevice);
+            if (err != cudaSuccess) {
+                (void) cudaFree(l0_attn_out);
+                (void) cudaFree(l0_gated_norm);
+                (void) cudaFree(l0_gdn);
+                (void) cudaFree(l0_l2);
+                (void) cudaFree(l0_ssm);
+                (void) cudaFree(l0_proj);
+                (void) cudaFree(l0_qkv);
+                (void) cudaFree(l0_norm);
+                (void) cudaFree(io_descs);
+                (void) cudaFree(scratch);
+                (void) cudaFree(layer_descs);
+                (void) cudaFree(data);
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to upload L0 attention output descriptor", err);
+                return false;
+            }
+
+            qwen36_superlayer_l0_post_attn_desc * l0_post_attn = nullptr;
+            err = cudaMalloc((void **) &l0_post_attn, sizeof(qwen36_superlayer_l0_post_attn_desc));
+            if (err != cudaSuccess) {
+                (void) cudaFree(l0_attn_out);
+                (void) cudaFree(l0_gated_norm);
+                (void) cudaFree(l0_gdn);
+                (void) cudaFree(l0_l2);
+                (void) cudaFree(l0_ssm);
+                (void) cudaFree(l0_proj);
+                (void) cudaFree(l0_qkv);
+                (void) cudaFree(l0_norm);
+                (void) cudaFree(io_descs);
+                (void) cudaFree(scratch);
+                (void) cudaFree(layer_descs);
+                (void) cudaFree(data);
+                (void) cudaGetLastError();
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to allocate L0 post-attention descriptor", err);
+                return false;
+            }
+            err = cudaMemcpy(
+                    l0_post_attn, &l0_post_attn_host, sizeof(qwen36_superlayer_l0_post_attn_desc),
+                    cudaMemcpyHostToDevice);
+            if (err != cudaSuccess) {
+                (void) cudaFree(l0_post_attn);
+                (void) cudaFree(l0_attn_out);
+                (void) cudaFree(l0_gated_norm);
+                (void) cudaFree(l0_gdn);
+                (void) cudaFree(l0_l2);
+                (void) cudaFree(l0_ssm);
+                (void) cudaFree(l0_proj);
+                (void) cudaFree(l0_qkv);
+                (void) cudaFree(l0_norm);
+                (void) cudaFree(io_descs);
+                (void) cudaFree(scratch);
+                (void) cudaFree(layer_descs);
+                (void) cudaFree(data);
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to upload L0 post-attention descriptor", err);
+                return false;
+            }
+
+            qwen36_superlayer_l0_moe_router_desc * l0_moe_router = nullptr;
+            err = cudaMalloc((void **) &l0_moe_router, sizeof(qwen36_superlayer_l0_moe_router_desc));
+            if (err != cudaSuccess) {
+                (void) cudaFree(l0_post_attn);
+                (void) cudaFree(l0_attn_out);
+                (void) cudaFree(l0_gated_norm);
+                (void) cudaFree(l0_gdn);
+                (void) cudaFree(l0_l2);
+                (void) cudaFree(l0_ssm);
+                (void) cudaFree(l0_proj);
+                (void) cudaFree(l0_qkv);
+                (void) cudaFree(l0_norm);
+                (void) cudaFree(io_descs);
+                (void) cudaFree(scratch);
+                (void) cudaFree(layer_descs);
+                (void) cudaFree(data);
+                (void) cudaGetLastError();
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to allocate L0 MoE router descriptor", err);
+                return false;
+            }
+            err = cudaMemcpy(
+                    l0_moe_router, &l0_moe_router_host, sizeof(qwen36_superlayer_l0_moe_router_desc),
+                    cudaMemcpyHostToDevice);
+            if (err != cudaSuccess) {
+                (void) cudaFree(l0_moe_router);
+                (void) cudaFree(l0_post_attn);
+                (void) cudaFree(l0_attn_out);
+                (void) cudaFree(l0_gated_norm);
+                (void) cudaFree(l0_gdn);
+                (void) cudaFree(l0_l2);
+                (void) cudaFree(l0_ssm);
+                (void) cudaFree(l0_proj);
+                (void) cudaFree(l0_qkv);
+                (void) cudaFree(l0_norm);
+                (void) cudaFree(io_descs);
+                (void) cudaFree(scratch);
+                (void) cudaFree(layer_descs);
+                (void) cudaFree(data);
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to upload L0 MoE router descriptor", err);
+                return false;
+            }
+
+            qwen36_superlayer_l0_moe_gate_up_desc * l0_moe_gate_up = nullptr;
+            err = cudaMalloc((void **) &l0_moe_gate_up, sizeof(qwen36_superlayer_l0_moe_gate_up_desc));
+            if (err != cudaSuccess) {
+                (void) cudaFree(l0_moe_router);
+                (void) cudaFree(l0_post_attn);
+                (void) cudaFree(l0_attn_out);
+                (void) cudaFree(l0_gated_norm);
+                (void) cudaFree(l0_gdn);
+                (void) cudaFree(l0_l2);
+                (void) cudaFree(l0_ssm);
+                (void) cudaFree(l0_proj);
+                (void) cudaFree(l0_qkv);
+                (void) cudaFree(l0_norm);
+                (void) cudaFree(io_descs);
+                (void) cudaFree(scratch);
+                (void) cudaFree(layer_descs);
+                (void) cudaFree(data);
+                (void) cudaGetLastError();
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to allocate L0 MoE gate/up descriptor", err);
+                return false;
+            }
+            err = cudaMemcpy(
+                    l0_moe_gate_up, &l0_moe_gate_up_host, sizeof(qwen36_superlayer_l0_moe_gate_up_desc),
+                    cudaMemcpyHostToDevice);
+            if (err != cudaSuccess) {
+                (void) cudaFree(l0_moe_gate_up);
+                (void) cudaFree(l0_moe_router);
+                (void) cudaFree(l0_post_attn);
+                (void) cudaFree(l0_attn_out);
+                (void) cudaFree(l0_gated_norm);
+                (void) cudaFree(l0_gdn);
+                (void) cudaFree(l0_l2);
+                (void) cudaFree(l0_ssm);
+                (void) cudaFree(l0_proj);
+                (void) cudaFree(l0_qkv);
+                (void) cudaFree(l0_norm);
+                (void) cudaFree(io_descs);
+                (void) cudaFree(scratch);
+                (void) cudaFree(layer_descs);
+                (void) cudaFree(data);
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to upload L0 MoE gate/up descriptor", err);
+                return false;
+            }
+
+            qwen36_superlayer_l0_moe_down_desc * l0_moe_down = nullptr;
+            err = cudaMalloc((void **) &l0_moe_down, sizeof(qwen36_superlayer_l0_moe_down_desc));
+            if (err != cudaSuccess) {
+                (void) cudaFree(l0_moe_gate_up);
+                (void) cudaFree(l0_moe_router);
+                (void) cudaFree(l0_post_attn);
+                (void) cudaFree(l0_attn_out);
+                (void) cudaFree(l0_gated_norm);
+                (void) cudaFree(l0_gdn);
+                (void) cudaFree(l0_l2);
+                (void) cudaFree(l0_ssm);
+                (void) cudaFree(l0_proj);
+                (void) cudaFree(l0_qkv);
+                (void) cudaFree(l0_norm);
+                (void) cudaFree(io_descs);
+                (void) cudaFree(scratch);
+                (void) cudaFree(layer_descs);
+                (void) cudaFree(data);
+                (void) cudaGetLastError();
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to allocate L0 MoE down descriptor", err);
+                return false;
+            }
+            err = cudaMemcpy(
+                    l0_moe_down, &l0_moe_down_host, sizeof(qwen36_superlayer_l0_moe_down_desc),
+                    cudaMemcpyHostToDevice);
+            if (err != cudaSuccess) {
+                (void) cudaFree(l0_moe_down);
+                (void) cudaFree(l0_moe_gate_up);
+                (void) cudaFree(l0_moe_router);
+                (void) cudaFree(l0_post_attn);
+                (void) cudaFree(l0_attn_out);
+                (void) cudaFree(l0_gated_norm);
+                (void) cudaFree(l0_gdn);
+                (void) cudaFree(l0_l2);
+                (void) cudaFree(l0_ssm);
+                (void) cudaFree(l0_proj);
+                (void) cudaFree(l0_qkv);
+                (void) cudaFree(l0_norm);
+                (void) cudaFree(io_descs);
+                (void) cudaFree(scratch);
+                (void) cudaFree(layer_descs);
+                (void) cudaFree(data);
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to upload L0 MoE down descriptor", err);
+                return false;
+            }
+
             cudaEvent_t ready_event = nullptr;
             err = cudaEventCreateWithFlags(&ready_event, cudaEventDisableTiming);
             if (err != cudaSuccess) {
+                (void) cudaFree(l0_moe_down);
+                (void) cudaFree(l0_moe_gate_up);
+                (void) cudaFree(l0_moe_router);
+                (void) cudaFree(l0_post_attn);
+                (void) cudaFree(l0_attn_out);
+                (void) cudaFree(l0_gated_norm);
                 (void) cudaFree(l0_gdn);
                 (void) cudaFree(l0_l2);
                 (void) cudaFree(l0_ssm);
@@ -2463,6 +4190,12 @@ static bool qwen36_superlayer_materialize_device_pack(
             err = cudaEventRecord(ready_event, cuda_ctx->stream());
             if (err != cudaSuccess) {
                 (void) cudaEventDestroy(ready_event);
+                (void) cudaFree(l0_moe_down);
+                (void) cudaFree(l0_moe_gate_up);
+                (void) cudaFree(l0_moe_router);
+                (void) cudaFree(l0_post_attn);
+                (void) cudaFree(l0_attn_out);
+                (void) cudaFree(l0_gated_norm);
                 (void) cudaFree(l0_gdn);
                 (void) cudaFree(l0_l2);
                 (void) cudaFree(l0_ssm);
@@ -2491,6 +4224,12 @@ static bool qwen36_superlayer_materialize_device_pack(
             entry.l0_ssm = l0_ssm;
             entry.l0_l2 = l0_l2;
             entry.l0_gdn = l0_gdn;
+            entry.l0_gated_norm = l0_gated_norm;
+            entry.l0_attn_out = l0_attn_out;
+            entry.l0_post_attn = l0_post_attn;
+            entry.l0_moe_router = l0_moe_router;
+            entry.l0_moe_gate_up = l0_moe_gate_up;
+            entry.l0_moe_down = l0_moe_down;
             entry.scratch = scratch;
             entry.bytes = device_weightpack_required ? pack.total_bytes : 0;
             entry.tensors = device_weightpack_required ? pack.refs.size() : 0;
@@ -2655,6 +4394,131 @@ static bool qwen36_superlayer_materialize_device_pack(
                 return false;
             }
 
+            if (it->second.l0_gated_norm == nullptr) {
+                qwen36_superlayer_l0_gated_norm_desc * l0_gated_norm = nullptr;
+                cudaError_t err = cudaMalloc(
+                        (void **) &l0_gated_norm, sizeof(qwen36_superlayer_l0_gated_norm_desc));
+                if (err != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    qwen36_superlayer_set_cuda_blocker(blocker, "failed to allocate L0 gated norm descriptor", err);
+                    return false;
+                }
+                it->second.l0_gated_norm = l0_gated_norm;
+            }
+            err = cudaMemcpy(
+                    it->second.l0_gated_norm, &l0_gated_norm_host,
+                    sizeof(qwen36_superlayer_l0_gated_norm_desc),
+                    cudaMemcpyHostToDevice);
+            if (err != cudaSuccess) {
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to refresh L0 gated norm descriptor", err);
+                return false;
+            }
+
+            if (it->second.l0_attn_out == nullptr) {
+                qwen36_superlayer_l0_attn_out_desc * l0_attn_out = nullptr;
+                cudaError_t err = cudaMalloc(
+                        (void **) &l0_attn_out, sizeof(qwen36_superlayer_l0_attn_out_desc));
+                if (err != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    qwen36_superlayer_set_cuda_blocker(
+                            blocker, "failed to allocate L0 attention output descriptor", err);
+                    return false;
+                }
+                it->second.l0_attn_out = l0_attn_out;
+            }
+            err = cudaMemcpy(
+                    it->second.l0_attn_out, &l0_attn_out_host,
+                    sizeof(qwen36_superlayer_l0_attn_out_desc),
+                    cudaMemcpyHostToDevice);
+            if (err != cudaSuccess) {
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to refresh L0 attention output descriptor", err);
+                return false;
+            }
+
+            if (it->second.l0_post_attn == nullptr) {
+                qwen36_superlayer_l0_post_attn_desc * l0_post_attn = nullptr;
+                cudaError_t err = cudaMalloc(
+                        (void **) &l0_post_attn, sizeof(qwen36_superlayer_l0_post_attn_desc));
+                if (err != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    qwen36_superlayer_set_cuda_blocker(
+                            blocker, "failed to allocate L0 post-attention descriptor", err);
+                    return false;
+                }
+                it->second.l0_post_attn = l0_post_attn;
+            }
+            err = cudaMemcpy(
+                    it->second.l0_post_attn, &l0_post_attn_host,
+                    sizeof(qwen36_superlayer_l0_post_attn_desc),
+                    cudaMemcpyHostToDevice);
+            if (err != cudaSuccess) {
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to refresh L0 post-attention descriptor", err);
+                return false;
+            }
+
+            if (it->second.l0_moe_router == nullptr) {
+                qwen36_superlayer_l0_moe_router_desc * l0_moe_router = nullptr;
+                cudaError_t err = cudaMalloc(
+                        (void **) &l0_moe_router, sizeof(qwen36_superlayer_l0_moe_router_desc));
+                if (err != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    qwen36_superlayer_set_cuda_blocker(
+                            blocker, "failed to allocate L0 MoE router descriptor", err);
+                    return false;
+                }
+                it->second.l0_moe_router = l0_moe_router;
+            }
+            err = cudaMemcpy(
+                    it->second.l0_moe_router, &l0_moe_router_host,
+                    sizeof(qwen36_superlayer_l0_moe_router_desc),
+                    cudaMemcpyHostToDevice);
+            if (err != cudaSuccess) {
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to refresh L0 MoE router descriptor", err);
+                return false;
+            }
+
+            if (it->second.l0_moe_gate_up == nullptr) {
+                qwen36_superlayer_l0_moe_gate_up_desc * l0_moe_gate_up = nullptr;
+                cudaError_t err = cudaMalloc(
+                        (void **) &l0_moe_gate_up, sizeof(qwen36_superlayer_l0_moe_gate_up_desc));
+                if (err != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    qwen36_superlayer_set_cuda_blocker(
+                            blocker, "failed to allocate L0 MoE gate/up descriptor", err);
+                    return false;
+                }
+                it->second.l0_moe_gate_up = l0_moe_gate_up;
+            }
+            err = cudaMemcpy(
+                    it->second.l0_moe_gate_up, &l0_moe_gate_up_host,
+                    sizeof(qwen36_superlayer_l0_moe_gate_up_desc),
+                    cudaMemcpyHostToDevice);
+            if (err != cudaSuccess) {
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to refresh L0 MoE gate/up descriptor", err);
+                return false;
+            }
+
+            if (it->second.l0_moe_down == nullptr) {
+                qwen36_superlayer_l0_moe_down_desc * l0_moe_down = nullptr;
+                cudaError_t err = cudaMalloc(
+                        (void **) &l0_moe_down, sizeof(qwen36_superlayer_l0_moe_down_desc));
+                if (err != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    qwen36_superlayer_set_cuda_blocker(
+                            blocker, "failed to allocate L0 MoE down descriptor", err);
+                    return false;
+                }
+                it->second.l0_moe_down = l0_moe_down;
+            }
+            err = cudaMemcpy(
+                    it->second.l0_moe_down, &l0_moe_down_host,
+                    sizeof(qwen36_superlayer_l0_moe_down_desc),
+                    cudaMemcpyHostToDevice);
+            if (err != cudaSuccess) {
+                qwen36_superlayer_set_cuda_blocker(blocker, "failed to refresh L0 MoE down descriptor", err);
+                return false;
+            }
+
             it->second.runtime_signature = runtime_signature;
             it->second.io_count = io_descs_host.size();
             it->second.runtime = runtime;
@@ -2669,6 +4533,12 @@ static bool qwen36_superlayer_materialize_device_pack(
         local_view.l0_ssm = it->second.l0_ssm;
         local_view.l0_l2 = it->second.l0_l2;
         local_view.l0_gdn = it->second.l0_gdn;
+        local_view.l0_gated_norm = it->second.l0_gated_norm;
+        local_view.l0_attn_out = it->second.l0_attn_out;
+        local_view.l0_post_attn = it->second.l0_post_attn;
+        local_view.l0_moe_router = it->second.l0_moe_router;
+        local_view.l0_moe_gate_up = it->second.l0_moe_gate_up;
+        local_view.l0_moe_down = it->second.l0_moe_down;
         local_view.scratch = it->second.scratch;
         local_view.bytes = it->second.bytes;
         local_view.tensors = it->second.tensors;
@@ -2691,14 +4561,16 @@ static bool qwen36_superlayer_materialize_device_pack(
     if (should_report && qwen36_superlayer_trace_enabled()) {
         fprintf(stderr,
                 "rdna3_qwen36_superlayer: device-pack-ready fingerprint=%s source=%s runtime=%s"
-                " ptr=%p layer_descs=%p io_descs=%p l0_norm=%p l0_qkv=%p l0_proj=%p l0_ssm=%p l0_l2=%p l0_gdn=%p"
+                " ptr=%p layer_descs=%p io_descs=%p l0_norm=%p l0_qkv=%p l0_proj=%p l0_ssm=%p l0_l2=%p l0_gdn=%p l0_gated_norm=%p l0_attn_out=%p l0_post_attn=%p l0_moe_router=%p l0_moe_gate_up=%p l0_moe_down=%p"
                 " scratch=%p tensors=%zu io=%zu bytes=%zu"
                 " scratch_bytes=%zu activation_slot=%zu projection_slot=%zu logits_bytes=%zu router_slot=%zu"
                 " n_embd=%" PRId64 " n_vocab=%" PRId64 "\n",
                 hex_u64(plan.fingerprint).c_str(), hex_u64(source_signature).c_str(),
                 hex_u64(runtime_signature).c_str(),
                 local_view.data, local_view.layers, local_view.io_descs, local_view.l0_norm, local_view.l0_qkv,
-                local_view.l0_proj, local_view.l0_ssm, local_view.l0_l2, local_view.l0_gdn, local_view.scratch,
+                local_view.l0_proj, local_view.l0_ssm, local_view.l0_l2, local_view.l0_gdn,
+                local_view.l0_gated_norm, local_view.l0_attn_out, local_view.l0_post_attn,
+                local_view.l0_moe_router, local_view.l0_moe_gate_up, local_view.l0_moe_down, local_view.scratch,
                 local_view.tensors, local_view.io_count, local_view.bytes,
                 local_view.runtime.scratch_bytes, local_view.runtime.activation_slot_bytes,
                 local_view.runtime.projection_slot_bytes, local_view.runtime.logits_bytes, local_view.runtime.router_slot_bytes,
@@ -3887,6 +5759,500 @@ __device__ __forceinline__ void qwen36_rdna3_superlayer_l0_gdn(
     }
 }
 
+__device__ __forceinline__ void qwen36_rdna3_superlayer_l0_gated_norm(
+        const qwen36_superlayer_l0_gated_norm_desc * desc,
+        const uint8_t * weightpack,
+        float * sums,
+        const uint32_t write_outputs) {
+    if (desc == nullptr || desc->ready == 0 || write_outputs == 0 || sums == nullptr ||
+            desc->x == nullptr || desc->gate == nullptr || desc->rms_dst == nullptr ||
+            desc->norm_dst == nullptr || desc->silu_dst == nullptr || desc->out_dst == nullptr) {
+        return;
+    }
+
+    const uint32_t ncols = desc->ncols;
+    const uint32_t nrows = desc->nrows;
+    if (ncols == 0 || nrows == 0) {
+        return;
+    }
+
+    const bool has_norm_w = desc->norm_w_data != nullptr;
+    const bool use_direct_weights = desc->use_direct_weights != 0;
+    if (has_norm_w && !use_direct_weights && weightpack == nullptr) {
+        return;
+    }
+    const float * norm_w = has_norm_w ?
+        (use_direct_weights ? desc->norm_w_data : (const float *) (weightpack + desc->norm_w_offset)) : nullptr;
+    if (has_norm_w && norm_w == nullptr) {
+        return;
+    }
+
+    for (uint32_t row = blockIdx.x; row < nrows; row += gridDim.x) {
+        const uint64_t row_off = (uint64_t) row*ncols;
+
+        float acc = 0.0f;
+        for (uint32_t col = threadIdx.x; col < ncols; col += blockDim.x) {
+            const float x = desc->x[row_off + col];
+            acc += x*x;
+        }
+
+        sums[threadIdx.x] = acc;
+        __syncthreads();
+        for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                sums[threadIdx.x] += sums[threadIdx.x + stride];
+            }
+            __syncthreads();
+        }
+
+        const float inv_rms = rsqrtf(sums[0]/(float) ncols + desc->eps);
+        for (uint32_t col = threadIdx.x; col < ncols; col += blockDim.x) {
+            const uint64_t idx = row_off + col;
+            const float rms = desc->x[idx]*inv_rms;
+            const float norm = rms*(norm_w != nullptr ? norm_w[col] : 1.0f);
+            const float gate = desc->gate[idx];
+            const float silu = gate/(1.0f + expf(-gate));
+            const float out = norm*silu;
+            desc->rms_dst[idx] = rms;
+            desc->norm_dst[idx] = norm;
+            desc->silu_dst[idx] = silu;
+            desc->out_dst[idx] = out;
+            if (desc->final_dst != nullptr) {
+                desc->final_dst[idx] = out;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+__device__ __forceinline__ void qwen36_rdna3_superlayer_l0_attn_out(
+        const qwen36_superlayer_l0_attn_out_desc * desc,
+        const uint8_t * weightpack,
+        const uint32_t write_outputs) {
+    if (desc == nullptr || desc->ready == 0 || write_outputs == 0 ||
+            desc->x == nullptr || desc->out_dst == nullptr) {
+        return;
+    }
+
+    const bool use_direct_weights = desc->use_direct_weights != 0;
+    if (!use_direct_weights && weightpack == nullptr) {
+        return;
+    }
+    if (use_direct_weights && desc->w_data == nullptr) {
+        return;
+    }
+
+    const uint32_t n_embd = desc->n_embd;
+    const uint32_t n_out = desc->n_out;
+    if (n_embd == 0 || n_out == 0) {
+        return;
+    }
+
+    const char * w = use_direct_weights ? desc->w_data : (const char *) (weightpack + desc->w_offset);
+    const float * scale = desc->has_scale != 0 ?
+        (use_direct_weights ? desc->scale_data : (const float *) (weightpack + desc->scale_offset)) : nullptr;
+    if (w == nullptr || (desc->has_scale != 0 && scale == nullptr)) {
+        return;
+    }
+
+    const ggml_type wtype = (ggml_type) desc->w_type;
+    const int lane = threadIdx.x & (WARP_SIZE - 1);
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int rows_per_block = max(1, blockDim.x / WARP_SIZE);
+    for (uint32_t row = blockIdx.x*rows_per_block + warp; row < n_out; row += gridDim.x*rows_per_block) {
+        float acc = 0.0f;
+        for (uint32_t col = lane; col < n_embd; col += WARP_SIZE) {
+            const float ww = qwen36_rdna3_superlayer_dequant_weight(
+                    w, wtype, (int64_t) desc->w_nb1, row, col);
+            acc += desc->x[col]*ww;
+        }
+
+        const float raw = warp_reduce_sum<WARP_SIZE>(acc);
+        if (lane == 0) {
+            if (desc->math_dst != nullptr) {
+                desc->math_dst[row] = raw;
+            }
+            const float scale_v = scale == nullptr ? 1.0f :
+                scale[desc->scale_n == 1 ? 0 : row];
+            const float v = raw*scale_v;
+            desc->out_dst[row] = v;
+            if (desc->named_dst != nullptr) {
+                desc->named_dst[row] = v;
+            }
+        }
+    }
+}
+
+__device__ __forceinline__ void qwen36_rdna3_superlayer_l0_post_attn(
+        const qwen36_superlayer_l0_post_attn_desc * desc,
+        const uint8_t * weightpack,
+        float * sums,
+        const uint32_t write_outputs) {
+    if (desc == nullptr || desc->ready == 0 || write_outputs == 0 || sums == nullptr ||
+            desc->attn == nullptr || desc->skip == nullptr || desc->residual_dst == nullptr ||
+            desc->rms_dst == nullptr || desc->norm_dst == nullptr) {
+        return;
+    }
+
+    const uint32_t ncols = desc->ncols;
+    const uint32_t nrows = desc->nrows;
+    if (ncols == 0 || nrows == 0) {
+        return;
+    }
+
+    const bool use_direct_weights = desc->use_direct_weights != 0;
+    if (desc->has_norm_w != 0 && !use_direct_weights && weightpack == nullptr) {
+        return;
+    }
+    if (desc->has_norm_w != 0 && use_direct_weights && desc->norm_w_data == nullptr) {
+        return;
+    }
+    const float * norm_w = desc->has_norm_w != 0 ?
+        (use_direct_weights ? desc->norm_w_data : (const float *) (weightpack + desc->norm_w_offset)) : nullptr;
+
+    for (uint32_t row = blockIdx.x; row < nrows; row += gridDim.x) {
+        const uint64_t row_off = (uint64_t) row*ncols;
+
+        float acc = 0.0f;
+        for (uint32_t col = threadIdx.x; col < ncols; col += blockDim.x) {
+            const uint64_t idx = row_off + col;
+            const float residual = desc->attn[idx] + desc->skip[idx];
+            desc->residual_dst[idx] = residual;
+            if (desc->residual_named_dst != nullptr) {
+                desc->residual_named_dst[idx] = residual;
+            }
+            acc += residual*residual;
+        }
+
+        sums[threadIdx.x] = acc;
+        __syncthreads();
+        for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                sums[threadIdx.x] += sums[threadIdx.x + stride];
+            }
+            __syncthreads();
+        }
+
+        const float inv_rms = rsqrtf(sums[0]/(float) ncols + desc->eps);
+        for (uint32_t col = threadIdx.x; col < ncols; col += blockDim.x) {
+            const uint64_t idx = row_off + col;
+            const float rms = desc->residual_dst[idx]*inv_rms;
+            const float norm = rms*(norm_w != nullptr ? norm_w[col] : 1.0f);
+            desc->rms_dst[idx] = rms;
+            desc->norm_dst[idx] = norm;
+            if (desc->named_dst != nullptr) {
+                desc->named_dst[idx] = norm;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+__device__ __forceinline__ void qwen36_rdna3_superlayer_l0_moe_router(
+        const qwen36_superlayer_l0_moe_router_desc * desc,
+        const uint8_t * weightpack,
+        float * sums,
+        const uint32_t write_outputs) {
+    if (blockIdx.x != 0) {
+        return;
+    }
+    if (desc == nullptr || desc->ready == 0 || write_outputs == 0 || sums == nullptr ||
+            desc->x == nullptr || desc->logits_dst == nullptr || desc->probs_dst == nullptr ||
+            desc->argsort_dst == nullptr || desc->topk_dst == nullptr || desc->weights_dst == nullptr) {
+        return;
+    }
+
+    const bool use_direct_weights = desc->use_direct_weights != 0;
+    if (!use_direct_weights && weightpack == nullptr) {
+        return;
+    }
+    if (use_direct_weights && desc->w_data == nullptr) {
+        return;
+    }
+
+    const uint32_t n_embd = desc->n_embd;
+    const uint32_t n_expert = desc->n_expert;
+    const uint32_t n_expert_used = desc->n_expert_used;
+    if (n_embd == 0 || n_expert == 0 || n_expert_used == 0 || n_expert_used > n_expert ||
+            n_expert_used > 64) {
+        return;
+    }
+
+    const char * w = use_direct_weights ? desc->w_data : (const char *) (weightpack + desc->w_offset);
+    const float * scale = desc->has_scale != 0 ?
+        (use_direct_weights ? desc->scale_data : (const float *) (weightpack + desc->scale_offset)) : nullptr;
+    if (w == nullptr || (desc->has_scale != 0 && scale == nullptr)) {
+        return;
+    }
+
+    const ggml_type wtype = (ggml_type) desc->w_type;
+    float local_max = -FLT_MAX;
+    for (uint32_t expert = threadIdx.x; expert < n_expert; expert += blockDim.x) {
+        float acc = 0.0f;
+        for (uint32_t col = 0; col < n_embd; ++col) {
+            const float ww = qwen36_rdna3_superlayer_dequant_weight(
+                    w, wtype, (int64_t) desc->w_nb1, expert, col);
+            acc += desc->x[col]*ww;
+        }
+        if (__isnanf(acc)) {
+            acc = -FLT_MAX;
+        }
+        if (desc->logits_math_dst != nullptr) {
+            desc->logits_math_dst[expert] = acc;
+        }
+        const float scale_v = scale == nullptr ? 1.0f : scale[desc->scale_n == 1 ? 0 : expert];
+        float v = acc*scale_v;
+        if (__isnanf(v)) {
+            v = -FLT_MAX;
+        }
+        desc->logits_dst[expert] = v;
+        if (desc->logits_named_dst != nullptr) {
+            desc->logits_named_dst[expert] = v;
+        }
+        local_max = fmaxf(local_max, v);
+    }
+
+    sums[threadIdx.x] = local_max;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            sums[threadIdx.x] = fmaxf(sums[threadIdx.x], sums[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+
+    const float max_logit = sums[0];
+    float local_sum = 0.0f;
+    for (uint32_t expert = threadIdx.x; expert < n_expert; expert += blockDim.x) {
+        const float p = expf(desc->logits_dst[expert] - max_logit);
+        desc->probs_dst[expert] = p;
+        local_sum += p;
+    }
+
+    sums[threadIdx.x] = local_sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            sums[threadIdx.x] += sums[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    const float inv_sum = sums[0] > 0.0f ? 1.0f/sums[0] : 0.0f;
+    for (uint32_t expert = threadIdx.x; expert < n_expert; expert += blockDim.x) {
+        desc->probs_dst[expert] *= inv_sum;
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        int32_t selected_ids[64];
+        float selected_weights[64];
+        for (uint32_t k = 0; k < n_expert_used; ++k) {
+            int32_t best_id = -1;
+            float best_val = -FLT_MAX;
+            for (uint32_t expert = 0; expert < n_expert; ++expert) {
+                bool used = false;
+                for (uint32_t prev = 0; prev < k; ++prev) {
+                    used = used || selected_ids[prev] == (int32_t) expert;
+                }
+                if (used) {
+                    continue;
+                }
+                const float v = desc->logits_dst[expert];
+                if (best_id < 0 || v > best_val || (v == best_val && expert < (uint32_t) best_id)) {
+                    best_val = v;
+                    best_id = (int32_t) expert;
+                }
+            }
+            selected_ids[k] = best_id;
+            const float weight = best_id >= 0 ? desc->probs_dst[best_id] : 0.0f;
+            selected_weights[k] = weight;
+            desc->argsort_dst[k] = best_id;
+            desc->topk_dst[k] = best_id;
+            desc->weights_dst[k] = weight;
+        }
+
+        float weight_sum = 0.0f;
+        for (uint32_t k = 0; k < n_expert_used; ++k) {
+            weight_sum += selected_weights[k];
+        }
+        if (desc->weights_sum_dst != nullptr) {
+            desc->weights_sum_dst[0] = weight_sum;
+        }
+
+        const float clamped_sum = fmaxf(weight_sum, desc->clamp_min);
+        if (desc->weights_sum_clamped_dst != nullptr) {
+            desc->weights_sum_clamped_dst[0] = clamped_sum;
+        }
+
+        for (uint32_t k = 0; k < n_expert_used; ++k) {
+            const float norm = desc->has_weights_norm != 0 && clamped_sum > 0.0f ?
+                selected_weights[k]/clamped_sum : selected_weights[k];
+            if (desc->weights_norm_dst != nullptr) {
+                desc->weights_norm_dst[k] = norm;
+            }
+            if (desc->weights_scaled_dst != nullptr) {
+                desc->weights_scaled_dst[k] = norm*desc->weights_scale;
+            }
+        }
+    }
+}
+
+__device__ __forceinline__ void qwen36_rdna3_superlayer_l0_moe_gate_up(
+        const qwen36_superlayer_l0_moe_gate_up_desc * desc,
+        const uint8_t * weightpack,
+        const uint32_t write_outputs) {
+    if (desc == nullptr || desc->ready == 0 || write_outputs == 0 ||
+            desc->x == nullptr || desc->ids == nullptr || desc->swiglu_dst == nullptr) {
+        return;
+    }
+
+    const bool use_direct_weights = desc->use_direct_weights != 0;
+    if (!use_direct_weights && weightpack == nullptr) {
+        return;
+    }
+    if (use_direct_weights && desc->w_data == nullptr) {
+        return;
+    }
+
+    const uint32_t n_embd = desc->n_embd;
+    const uint32_t n_ff = desc->n_ff;
+    const uint32_t n_expert = desc->n_expert;
+    const uint32_t n_expert_used = desc->n_expert_used;
+    if (n_embd == 0 || n_ff == 0 || n_expert == 0 || n_expert_used == 0) {
+        return;
+    }
+
+    const char * w = use_direct_weights ? desc->w_data : (const char *) (weightpack + desc->w_offset);
+    if (w == nullptr) {
+        return;
+    }
+
+    const ggml_type wtype = (ggml_type) desc->w_type;
+    const uint64_t total = (uint64_t) n_ff*n_expert_used;
+    const uint64_t stride = (uint64_t) blockDim.x*gridDim.x;
+    for (uint64_t idx = (uint64_t) blockIdx.x*blockDim.x + threadIdx.x; idx < total; idx += stride) {
+        const uint32_t expert_slot = (uint32_t) (idx / n_ff);
+        const uint32_t row = (uint32_t) (idx - (uint64_t) expert_slot*n_ff);
+        const int32_t expert = desc->ids[expert_slot];
+        if (expert < 0 || (uint32_t) expert >= n_expert) {
+            continue;
+        }
+
+        const char * w_expert = w + (uint64_t) expert*desc->w_nb2;
+        float gate_acc = 0.0f;
+        float up_acc = 0.0f;
+        for (uint32_t col = 0; col < n_embd; ++col) {
+            const float x = desc->x[col];
+            gate_acc += x*qwen36_rdna3_superlayer_dequant_weight(
+                    w_expert, wtype, (int64_t) desc->w_nb1, row, col);
+            up_acc += x*qwen36_rdna3_superlayer_dequant_weight(
+                    w_expert, wtype, (int64_t) desc->w_nb1, row + n_ff, col);
+        }
+
+        if (__isnanf(gate_acc)) {
+            gate_acc = 0.0f;
+        }
+        if (__isnanf(up_acc)) {
+            up_acc = 0.0f;
+        }
+
+        const float silu = gate_acc/(1.0f + expf(-gate_acc));
+        const float out = silu*up_acc;
+
+        if (desc->gate_up_dst != nullptr) {
+            char * gate_up_base = (char *) desc->gate_up_dst + (uint64_t) expert_slot*desc->gate_up_nb1;
+            ((float *) gate_up_base)[row] = gate_acc;
+            ((float *) gate_up_base)[row + n_ff] = up_acc;
+        }
+        if (desc->gate_dst != nullptr) {
+            char * gate_base = (char *) desc->gate_dst + (uint64_t) expert_slot*desc->gate_nb1;
+            ((float *) gate_base)[row] = gate_acc;
+        }
+        if (desc->up_dst != nullptr) {
+            char * up_base = (char *) desc->up_dst + (uint64_t) expert_slot*desc->up_nb1;
+            ((float *) up_base)[row] = up_acc;
+        }
+        char * swiglu_base = (char *) desc->swiglu_dst + (uint64_t) expert_slot*desc->swiglu_nb1;
+        ((float *) swiglu_base)[row] = out;
+    }
+}
+
+__device__ __forceinline__ void qwen36_rdna3_superlayer_l0_moe_down(
+        const qwen36_superlayer_l0_moe_down_desc * desc,
+        const uint8_t * weightpack,
+        const uint32_t write_outputs) {
+    if (desc == nullptr || desc->ready == 0 || write_outputs == 0 ||
+            desc->x == nullptr || desc->ids == nullptr || desc->weights == nullptr ||
+            desc->down_dst == nullptr || desc->weighted_dst == nullptr || desc->out_dst == nullptr) {
+        return;
+    }
+
+    const bool use_direct_weights = desc->use_direct_weights != 0;
+    if (!use_direct_weights && weightpack == nullptr) {
+        return;
+    }
+    if (use_direct_weights && desc->w_data == nullptr) {
+        return;
+    }
+
+    const uint32_t n_ff = desc->n_ff;
+    const uint32_t n_embd = desc->n_embd;
+    const uint32_t n_expert = desc->n_expert;
+    const uint32_t n_expert_used = desc->n_expert_used;
+    if (n_ff == 0 || n_embd == 0 || n_expert == 0 || n_expert_used == 0) {
+        return;
+    }
+
+    const char * w = use_direct_weights ? desc->w_data : (const char *) (weightpack + desc->w_offset);
+    if (w == nullptr) {
+        return;
+    }
+
+    const ggml_type wtype = (ggml_type) desc->w_type;
+    const int lane = threadIdx.x & (WARP_SIZE - 1);
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int rows_per_block = max(1, blockDim.x / WARP_SIZE);
+    for (uint32_t row = blockIdx.x*rows_per_block + warp; row < n_embd; row += gridDim.x*rows_per_block) {
+        float final_acc = 0.0f;
+
+        for (uint32_t expert_slot = 0; expert_slot < n_expert_used; ++expert_slot) {
+            const int32_t expert = desc->ids[expert_slot];
+            if (expert < 0 || (uint32_t) expert >= n_expert) {
+                continue;
+            }
+
+            const char * w_expert = w + (uint64_t) expert*desc->w_nb2;
+            const char * x_expert = (const char *) desc->x + (uint64_t) expert_slot*desc->x_nb1;
+            float acc = 0.0f;
+            for (uint32_t col = lane; col < n_ff; col += WARP_SIZE) {
+                const float x = ((const float *) x_expert)[col];
+                const float ww = qwen36_rdna3_superlayer_dequant_weight(
+                        w_expert, wtype, (int64_t) desc->w_nb1, row, col);
+                acc += x*ww;
+            }
+
+            const float raw0 = warp_reduce_sum<WARP_SIZE>(acc);
+            if (lane == 0) {
+                const float raw = __isnanf(raw0) ? 0.0f : raw0;
+                const float weight =
+                    *((const float *) ((const char *) desc->weights + (uint64_t) expert_slot*desc->weights_nb1));
+                const float weighted = raw*weight;
+
+                char * down_base = (char *) desc->down_dst + (uint64_t) expert_slot*desc->down_nb1;
+                ((float *) down_base)[row] = raw;
+                char * weighted_base = (char *) desc->weighted_dst + (uint64_t) expert_slot*desc->weighted_nb1;
+                ((float *) weighted_base)[row] = weighted;
+                final_acc += weighted;
+            }
+        }
+
+        if (lane == 0) {
+            desc->out_dst[row] = final_acc;
+        }
+    }
+}
+
 __global__ void qwen36_rdna3_superlayer_contract_kernel(
         qwen36_superlayer_contract_state * state,
         const uint8_t * weightpack,
@@ -3899,6 +6265,12 @@ __global__ void qwen36_rdna3_superlayer_contract_kernel(
         const qwen36_superlayer_l0_ssm_desc * l0_ssm,
         const qwen36_superlayer_l0_l2_desc * l0_l2,
         const qwen36_superlayer_l0_gdn_desc * l0_gdn,
+        const qwen36_superlayer_l0_gated_norm_desc * l0_gated_norm,
+        const qwen36_superlayer_l0_attn_out_desc * l0_attn_out,
+        const qwen36_superlayer_l0_post_attn_desc * l0_post_attn,
+        const qwen36_superlayer_l0_moe_router_desc * l0_moe_router,
+        const qwen36_superlayer_l0_moe_gate_up_desc * l0_moe_gate_up,
+        const qwen36_superlayer_l0_moe_down_desc * l0_moe_down,
         uint8_t * scratch,
         const uint64_t scratch_bytes,
         const uint64_t weightpack_bytes,
@@ -4009,6 +6381,40 @@ __global__ void qwen36_rdna3_superlayer_contract_kernel(
     const bool l0_gdn_ready =
         (l0_stage_mask & 0x100u) != 0 &&
         l0_gdn != nullptr && l0_gdn->ready != 0;
+    const bool l0_gated_norm_ready =
+        (l0_stage_mask & 0x200u) != 0 &&
+        l0_gated_norm != nullptr && l0_gated_norm->ready != 0 &&
+        (l0_gated_norm->norm_w_data == nullptr ||
+         l0_gated_norm->use_direct_weights != 0 ||
+         weightpack != nullptr);
+    const bool l0_attn_out_ready =
+        (l0_stage_mask & 0x400u) != 0 &&
+        l0_attn_out != nullptr && l0_attn_out->ready != 0 &&
+        (l0_attn_out->use_direct_weights != 0 || weightpack != nullptr) &&
+        (l0_attn_out->has_scale == 0 ||
+         l0_attn_out->use_direct_weights != 0 ||
+         weightpack != nullptr);
+    const bool l0_post_attn_ready =
+        (l0_stage_mask & 0x800u) != 0 &&
+        l0_post_attn != nullptr && l0_post_attn->ready != 0 &&
+        (l0_post_attn->has_norm_w == 0 ||
+         l0_post_attn->use_direct_weights != 0 ||
+         weightpack != nullptr);
+    const bool l0_moe_router_ready =
+        (l0_stage_mask & 0x1000u) != 0 &&
+        l0_moe_router != nullptr && l0_moe_router->ready != 0 &&
+        (l0_moe_router->use_direct_weights != 0 || weightpack != nullptr) &&
+        (l0_moe_router->has_scale == 0 ||
+         l0_moe_router->use_direct_weights != 0 ||
+         weightpack != nullptr);
+    const bool l0_moe_gate_up_ready =
+        (l0_stage_mask & 0x2000u) != 0 &&
+        l0_moe_gate_up != nullptr && l0_moe_gate_up->ready != 0 &&
+        (l0_moe_gate_up->use_direct_weights != 0 || weightpack != nullptr);
+    const bool l0_moe_down_ready =
+        (l0_stage_mask & 0x4000u) != 0 &&
+        l0_moe_down != nullptr && l0_moe_down->ready != 0 &&
+        (l0_moe_down->use_direct_weights != 0 || weightpack != nullptr);
 
     if (l0_norm_ready) {
         qwen36_rdna3_superlayer_l0_rms_norm(
@@ -4032,6 +6438,30 @@ __global__ void qwen36_rdna3_superlayer_contract_kernel(
     if (l0_gdn_ready) {
         qwen36_rdna3_superlayer_l0_gdn(l0_gdn, l0_rms_sums, l0_stage_mask & 0x100u);
     }
+    if (l0_gated_norm_ready) {
+        qwen36_rdna3_superlayer_l0_gated_norm(
+                l0_gated_norm, weightpack, l0_rms_sums, l0_stage_mask & 0x200u);
+    }
+    if (l0_attn_out_ready) {
+        qwen36_rdna3_superlayer_l0_attn_out(
+                l0_attn_out, weightpack, l0_stage_mask & 0x400u);
+    }
+    if (l0_post_attn_ready) {
+        qwen36_rdna3_superlayer_l0_post_attn(
+                l0_post_attn, weightpack, l0_rms_sums, l0_stage_mask & 0x800u);
+    }
+    if (l0_moe_router_ready) {
+        qwen36_rdna3_superlayer_l0_moe_router(
+                l0_moe_router, weightpack, l0_rms_sums, l0_stage_mask & 0x1000u);
+    }
+    if (l0_moe_gate_up_ready) {
+        qwen36_rdna3_superlayer_l0_moe_gate_up(
+                l0_moe_gate_up, weightpack, l0_stage_mask & 0x2000u);
+    }
+    if (l0_moe_down_ready) {
+        qwen36_rdna3_superlayer_l0_moe_down(
+                l0_moe_down, weightpack, l0_stage_mask & 0x4000u);
+    }
 
     if (lane == 0) {
         state->fingerprint ^= 0x7900'0110'0036'0001ull;
@@ -4042,7 +6472,13 @@ __global__ void qwen36_rdna3_superlayer_contract_kernel(
             (l0_proj_ready ? 0x40'0000'0000ull : 0ull) ^
             (l0_ssm_ready ? 0x80'0000'0000ull : 0ull) ^
             (l0_l2_ready ? 0x100'0000'0000ull : 0ull) ^
-            (l0_gdn_ready ? 0x200'0000'0000ull : 0ull);
+            (l0_gdn_ready ? 0x200'0000'0000ull : 0ull) ^
+            (l0_gated_norm_ready ? 0x400'0000'0000ull : 0ull) ^
+            (l0_attn_out_ready ? 0x800'0000'0000ull : 0ull) ^
+            (l0_post_attn_ready ? 0x1000'0000'0000ull : 0ull) ^
+            (l0_moe_router_ready ? 0x2000'0000'0000ull : 0ull) ^
+            (l0_moe_gate_up_ready ? 0x4000'0000'0000ull : 0ull) ^
+            (l0_moe_down_ready ? 0x8000'0000'0000ull : 0ull);
         state->n_blocks = gridDim.x;
         state->touched_layers = 40;
         state->active_lanes = gridDim.x*blockDim.x;
@@ -4068,6 +6504,9 @@ static bool qwen36_superlayer_final_physical_l0_requested() {
 }
 
 static bool qwen36_superlayer_l0_env_requested() {
+    if (qwen36_superlayer_final_requested()) {
+        return true;
+    }
     if (qwen36_superlayer_final_physical_l0_requested()) {
         return true;
     }
@@ -4083,12 +6522,17 @@ static bool qwen36_superlayer_l0_env_requested() {
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_SSM") ||
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_L2") ||
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_GDN") ||
+        qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_GATED_NORM") ||
+        qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_ATTN_OUT") ||
+        qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_POST_ATTN") ||
+        qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_MOE_ROUTER") ||
+        qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_MOE_GATE_UP") ||
+        qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0_MOE_DOWN") ||
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_SINGLE_L0_DISPATCH");
 }
 
 static bool qwen36_superlayer_replace_l0_all_requested() {
-    return qwen36_superlayer_final_physical_l0_requested() ||
-        qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REPLACE_L0", 0) != 0 ||
+    return qwen36_superlayer_replace_l0_all_stages_requested() ||
         qwen36_superlayer_env_i64("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_SINGLE_L0_DISPATCH", 0) != 0;
 }
 
@@ -4148,18 +6592,47 @@ static bool qwen36_superlayer_replace_l0_gdn_requested() {
     return qwen36_superlayer_l0_gdn_requested();
 }
 
+static bool qwen36_superlayer_replace_l0_gated_norm_requested() {
+    return qwen36_superlayer_l0_gated_norm_requested();
+}
+
+static bool qwen36_superlayer_replace_l0_attn_out_requested() {
+    return qwen36_superlayer_l0_attn_out_requested();
+}
+
+static bool qwen36_superlayer_replace_l0_post_attn_requested() {
+    return qwen36_superlayer_l0_post_attn_requested();
+}
+
+static bool qwen36_superlayer_replace_l0_moe_router_requested() {
+    return qwen36_superlayer_l0_moe_router_requested();
+}
+
+static bool qwen36_superlayer_replace_l0_moe_gate_up_requested() {
+    return qwen36_superlayer_l0_moe_gate_up_requested();
+}
+
+static bool qwen36_superlayer_replace_l0_moe_down_requested() {
+    return qwen36_superlayer_l0_moe_down_requested();
+}
+
 static bool qwen36_superlayer_replace_l0_any_requested() {
     return qwen36_superlayer_replace_l0_rms_requested() ||
         qwen36_superlayer_replace_l0_qkv_requested() ||
         qwen36_superlayer_replace_l0_proj_requested() ||
         qwen36_superlayer_replace_l0_ssm_requested() ||
         qwen36_superlayer_replace_l0_l2_requested() ||
-        qwen36_superlayer_replace_l0_gdn_requested();
+        qwen36_superlayer_replace_l0_gdn_requested() ||
+        qwen36_superlayer_replace_l0_gated_norm_requested() ||
+        qwen36_superlayer_replace_l0_attn_out_requested() ||
+        qwen36_superlayer_replace_l0_post_attn_requested() ||
+        qwen36_superlayer_replace_l0_moe_router_requested() ||
+        qwen36_superlayer_replace_l0_moe_gate_up_requested() ||
+        qwen36_superlayer_replace_l0_moe_down_requested();
 }
 
 static uint32_t qwen36_superlayer_l0_stage_mask() {
-    if (qwen36_superlayer_final_physical_l0_requested() ||
-            qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_RUN_L0")) {
+    if (qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_RUN_L0")) {
         return 0x1fu;
     }
 
@@ -4191,6 +6664,24 @@ static uint32_t qwen36_superlayer_l0_stage_mask() {
     if (qwen36_superlayer_replace_l0_gdn_requested()) {
         mask |= 0x100u;
     }
+    if (qwen36_superlayer_replace_l0_gated_norm_requested()) {
+        mask |= 0x200u;
+    }
+    if (qwen36_superlayer_replace_l0_attn_out_requested()) {
+        mask |= 0x400u;
+    }
+    if (qwen36_superlayer_replace_l0_post_attn_requested()) {
+        mask |= 0x800u;
+    }
+    if (qwen36_superlayer_replace_l0_moe_router_requested()) {
+        mask |= 0x1000u;
+    }
+    if (qwen36_superlayer_replace_l0_moe_gate_up_requested()) {
+        mask |= 0x2000u;
+    }
+    if (qwen36_superlayer_replace_l0_moe_down_requested()) {
+        mask |= 0x4000u;
+    }
     return mask;
 }
 
@@ -4212,7 +6703,8 @@ static bool qwen36_superlayer_contract_weightpack_requested() {
 }
 
 static bool qwen36_superlayer_contract_dispatch_enabled() {
-    return qwen36_superlayer_final_physical_l0_requested() ||
+    return qwen36_superlayer_final_requested() ||
+        qwen36_superlayer_final_physical_l0_requested() ||
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_DISPATCH") ||
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_SMOKE") ||
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER") ||
@@ -4222,7 +6714,8 @@ static bool qwen36_superlayer_contract_dispatch_enabled() {
 }
 
 static bool qwen36_superlayer_requested() {
-    return qwen36_superlayer_final_physical_l0_requested() ||
+    return qwen36_superlayer_final_requested() ||
+        qwen36_superlayer_final_physical_l0_requested() ||
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER") ||
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_REQUIRED") ||
         qwen36_superlayer_env_enabled("GGML_CUDA_RDNA3_QWEN36_SUPERLAYER_CONTRACT") ||
@@ -4337,6 +6830,42 @@ bool ggml_cuda_rdna3_qwen36_superlayer_replace_l0_gdn_enabled(const int device) 
         qwen36_superlayer_replace_l0_gdn_requested();
 }
 
+bool ggml_cuda_rdna3_qwen36_superlayer_replace_l0_gated_norm_enabled(const int device) {
+    return ggml_cuda_rdna3_qwen36_superlayer_enabled(device) &&
+        qwen36_superlayer_contract_dispatch_enabled() &&
+        qwen36_superlayer_replace_l0_gated_norm_requested();
+}
+
+bool ggml_cuda_rdna3_qwen36_superlayer_replace_l0_attn_out_enabled(const int device) {
+    return ggml_cuda_rdna3_qwen36_superlayer_enabled(device) &&
+        qwen36_superlayer_contract_dispatch_enabled() &&
+        qwen36_superlayer_replace_l0_attn_out_requested();
+}
+
+bool ggml_cuda_rdna3_qwen36_superlayer_replace_l0_post_attn_enabled(const int device) {
+    return ggml_cuda_rdna3_qwen36_superlayer_enabled(device) &&
+        qwen36_superlayer_contract_dispatch_enabled() &&
+        qwen36_superlayer_replace_l0_post_attn_requested();
+}
+
+bool ggml_cuda_rdna3_qwen36_superlayer_replace_l0_moe_router_enabled(const int device) {
+    return ggml_cuda_rdna3_qwen36_superlayer_enabled(device) &&
+        qwen36_superlayer_contract_dispatch_enabled() &&
+        qwen36_superlayer_replace_l0_moe_router_requested();
+}
+
+bool ggml_cuda_rdna3_qwen36_superlayer_replace_l0_moe_gate_up_enabled(const int device) {
+    return ggml_cuda_rdna3_qwen36_superlayer_enabled(device) &&
+        qwen36_superlayer_contract_dispatch_enabled() &&
+        qwen36_superlayer_replace_l0_moe_gate_up_requested();
+}
+
+bool ggml_cuda_rdna3_qwen36_superlayer_replace_l0_moe_down_enabled(const int device) {
+    return ggml_cuda_rdna3_qwen36_superlayer_enabled(device) &&
+        qwen36_superlayer_contract_dispatch_enabled() &&
+        qwen36_superlayer_replace_l0_moe_down_requested();
+}
+
 bool ggml_cuda_rdna3_qwen36_superlayer_prepare(
         ggml_backend_cuda_context * cuda_ctx,
         const ggml_cgraph * cgraph,
@@ -4428,7 +6957,10 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
         const ggml_cgraph * cgraph,
         std::string * blocker,
         const uint32_t forced_l0_stage_mask) {
-    if (qwen36_superlayer_final_requested() && !qwen36_superlayer_final_numeric_ready()) {
+    const uint32_t l0_stage_mask_arg =
+        forced_l0_stage_mask == UINT32_MAX ? qwen36_superlayer_l0_stage_mask() : forced_l0_stage_mask;
+    if (qwen36_superlayer_final_requested() && !qwen36_superlayer_final_numeric_ready() &&
+            l0_stage_mask_arg == 0) {
         if (blocker != nullptr) {
             *blocker = qwen36_superlayer_final_blocker();
         }
@@ -4477,8 +7009,6 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
         }
         return false;
     }
-    const uint32_t l0_stage_mask_arg =
-        forced_l0_stage_mask == UINT32_MAX ? qwen36_superlayer_l0_stage_mask() : forced_l0_stage_mask;
     const uint32_t direct_l0_stage_mask = qwen36_superlayer_direct_l0_stage_mask();
     const uint32_t l0_weighted_stage_mask = l0_stage_mask_arg & ~0x180u;
     const bool l0_weightpack_required = (l0_weighted_stage_mask & ~direct_l0_stage_mask) != 0;
@@ -4528,6 +7058,12 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
     qwen36_superlayer_l0_ssm_desc * l0_ssm_arg = device_pack.l0_ssm;
     qwen36_superlayer_l0_l2_desc * l0_l2_arg = device_pack.l0_l2;
     qwen36_superlayer_l0_gdn_desc * l0_gdn_arg = device_pack.l0_gdn;
+    qwen36_superlayer_l0_gated_norm_desc * l0_gated_norm_arg = device_pack.l0_gated_norm;
+    qwen36_superlayer_l0_attn_out_desc * l0_attn_out_arg = device_pack.l0_attn_out;
+    qwen36_superlayer_l0_post_attn_desc * l0_post_attn_arg = device_pack.l0_post_attn;
+    qwen36_superlayer_l0_moe_router_desc * l0_moe_router_arg = device_pack.l0_moe_router;
+    qwen36_superlayer_l0_moe_gate_up_desc * l0_moe_gate_up_arg = device_pack.l0_moe_gate_up;
+    qwen36_superlayer_l0_moe_down_desc * l0_moe_down_arg = device_pack.l0_moe_down;
     uint8_t * scratch_arg = (uint8_t *) device_pack.scratch;
     const uint64_t scratch_bytes_arg = (uint64_t) device_pack.runtime.scratch_bytes;
     const uint64_t weightpack_bytes_arg = (uint64_t) device_pack.bytes;
@@ -4543,6 +7079,12 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
         (void *) &l0_ssm_arg,
         (void *) &l0_l2_arg,
         (void *) &l0_gdn_arg,
+        (void *) &l0_gated_norm_arg,
+        (void *) &l0_attn_out_arg,
+        (void *) &l0_post_attn_arg,
+        (void *) &l0_moe_router_arg,
+        (void *) &l0_moe_gate_up_arg,
+        (void *) &l0_moe_down_arg,
         (void *) &scratch_arg,
         (void *) &scratch_bytes_arg,
         (void *) &weightpack_bytes_arg,
@@ -4563,9 +7105,10 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
                 "rdna3_qwen36_superlayer: %s fingerprint=%s blocks=%d threads=%d"
                 " weightpack_tensors=%zu runtime_bindings=%zu weightpack_bytes=%zu scratch_bytes=%zu"
                 " l0_stage_mask=0x%x l0_rms_norm=%s l0_qkv=%s l0_projection=%s replace_l0=%d"
-                " l0_proj_z=%s l0_proj_z_math_only=%s l0_proj_beta=%s l0_proj_alpha=%s l0_ssm=%s l0_l2=%s l0_gdn=%s"
+                " l0_proj_z=%s l0_proj_z_math_only=%s l0_proj_beta=%s l0_proj_alpha=%s"
+                " l0_ssm=%s l0_l2=%s l0_gdn=%s l0_gated_norm=%s l0_attn_out=%s l0_post_attn=%s l0_moe_router=%s l0_moe_gate_up=%s l0_moe_down=%s"
                 " direct_l0_weights=%d direct_l0_norm_weights=%d direct_l0_qkv_weights=%d"
-                " direct_l0_proj_weights=%d direct_l0_ssm_weights=%d"
+                " direct_l0_proj_weights=%d direct_l0_ssm_weights=%d direct_l0_out_weights=%d direct_l0_moe_weights=%d"
                 " weightpack_required=%d final_requested=%d numeric_layers=%d/40"
                 " note=%s\n",
                 final_requested ? "final-kernel-launched" : "contract-kernel-launched",
@@ -4583,14 +7126,22 @@ bool ggml_cuda_rdna3_qwen36_superlayer_maybe_launch_contract(
                 (l0_stage_mask_arg & 0x40u) != 0 ? "on" : "off",
                 (l0_stage_mask_arg & 0x80u) != 0 ? "on" : "off",
                 (l0_stage_mask_arg & 0x100u) != 0 ? "on" : "off",
+                (l0_stage_mask_arg & 0x200u) != 0 ? "on" : "off",
+                (l0_stage_mask_arg & 0x400u) != 0 ? "on" : "off",
+                (l0_stage_mask_arg & 0x800u) != 0 ? "on" : "off",
+                (l0_stage_mask_arg & 0x1000u) != 0 ? "on" : "off",
+                (l0_stage_mask_arg & 0x2000u) != 0 ? "on" : "off",
+                (l0_stage_mask_arg & 0x4000u) != 0 ? "on" : "off",
                 qwen36_superlayer_direct_l0_weights_requested() ? 1 : 0,
                 qwen36_superlayer_direct_l0_norm_weights_requested() ? 1 : 0,
                 qwen36_superlayer_direct_l0_qkv_weights_requested() ? 1 : 0,
                 qwen36_superlayer_direct_l0_proj_weights_requested() ? 1 : 0,
                 qwen36_superlayer_direct_l0_ssm_weights_requested() ? 1 : 0,
+                qwen36_superlayer_direct_l0_out_weights_requested() ? 1 : 0,
+                qwen36_superlayer_direct_l0_moe_weights_requested() ? 1 : 0,
                 device_weightpack_required ? 1 : 0,
                 final_requested ? 1 : 0,
-                l0_stage_mask_arg == 0x1fu ? 1 : 0,
+                l0_stage_mask_arg != 0 ? 1 : 0,
                 final_requested ?
                     (l0_stage_mask_arg != 0 ?
                         "final physical L0 cooperative dispatch; 40-layer dataflow must replace scaffold" :
